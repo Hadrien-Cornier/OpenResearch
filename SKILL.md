@@ -24,8 +24,8 @@ expands on the why; these are the non-negotiables.
    a run establishes its baseline or tests its hypothesis — that includes the
    root — and freezing is permanent: a disappointing result is still a result.
    Until then it is **provisional**: seeding it, fixing its deps, and making it
-   run all happen on its own branch (`orx-experiment-tree`). To try an idea,
-   branch a **child** and edit the child.
+   run all happen on its own branch (`orx-experiment-tree`). To test a new
+   hypothesis, branch a **child** and edit the child.
 2. **The run command *and* the environment are a fixed contract — identical on
    every node.** A child inherits its parent's run command verbatim; leave it
    alone. Do **not** give nodes different start commands, and do **not** vary
