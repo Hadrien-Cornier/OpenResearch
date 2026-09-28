@@ -52,6 +52,19 @@ export function markdownTargetUrl(url: string, target: MarkdownTarget): string {
   return `${url}${target.query ? `&${target.query}` : ""}${target.hash}`;
 }
 
+/** Split a cited `path:42`, `path:42:7`, `path:42-50`, or `path#L42-L50` into
+ * the path and its first line. */
+export function splitLineSuffix(target: string): { path: string; line?: number } {
+  const match = /^(.+?)(?::(\d+)(?:[:-]\d+)?|#L(\d+)(?:C\d+)?(?:-L?\d+(?:C\d+)?)?)$/.exec(target);
+  if (!match) return { path: target };
+  return { path: match[1], line: Number(match[2] ?? match[3]) };
+}
+
+/** First line of a `<file lines=…>` value: "20", "20-40", or "L20-L40". */
+export function firstCitedLine(lines: string): number | undefined {
+  return Number.parseInt(lines.replace(/^L/i, ""), 10) || undefined;
+}
+
 export function isWindowsDrivePath(src: string): boolean {
   return /^[a-z]:[\\/]/i.test(src);
 }

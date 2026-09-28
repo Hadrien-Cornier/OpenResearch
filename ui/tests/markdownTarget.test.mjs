@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   chatImageTarget,
+  firstCitedLine,
   isExternalMarkdownTarget,
   markdownTargetUrl,
   resolveMarkdownTarget,
+  splitLineSuffix,
 } from "../src/markdownTarget.ts";
 
 test("repository markdown resolves images relative to the document", () => {
@@ -79,4 +81,22 @@ test("chat image URLs discard injected query parameters and preserve SVG fragmen
   });
   assert.equal(chatImageTarget("figures/100%25.png").path, "figures/100%.png");
   assert.equal(chatImageTarget(String.raw`C:\papers\figure.png`).path, "C:/papers/figure.png");
+});
+
+test("file citations split off their line suffix", () => {
+  assert.deepEqual(splitLineSuffix("src/foo.py:42"), { path: "src/foo.py", line: 42 });
+  assert.deepEqual(splitLineSuffix("foo.py:42:7"), { path: "foo.py", line: 42 });
+  assert.deepEqual(splitLineSuffix("foo.py:42-50"), { path: "foo.py", line: 42 });
+  assert.deepEqual(splitLineSuffix("src/foo.py#L42"), { path: "src/foo.py", line: 42 });
+  assert.deepEqual(splitLineSuffix("src/foo.py#L42C3-L50C1"), { path: "src/foo.py", line: 42 });
+  assert.deepEqual(splitLineSuffix("src/foo.py"), { path: "src/foo.py" });
+  assert.deepEqual(splitLineSuffix("docs/guide.md#setup"), { path: "docs/guide.md#setup" });
+  assert.deepEqual(splitLineSuffix("C:/repo/foo.py"), { path: "C:/repo/foo.py" });
+});
+
+test("cited line ranges resolve to their first line", () => {
+  assert.equal(firstCitedLine("20"), 20);
+  assert.equal(firstCitedLine("20-40"), 20);
+  assert.equal(firstCitedLine("L20-L40"), 20);
+  assert.equal(firstCitedLine("x"), undefined);
 });

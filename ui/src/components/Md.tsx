@@ -25,7 +25,7 @@ import { normalizeMarkdownForRendering } from "../markdownNormalization";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { Button, IconButton, IconButtonLink } from "./ui";
 import { absoluteFileUrl, artifactUrl, projectFileUrl } from "../api";
-import { chatImageTarget, isWindowsDrivePath } from "../markdownTarget";
+import { chatImageTarget, firstCitedLine, isWindowsDrivePath, splitLineSuffix } from "../markdownTarget";
 
 const ImageResolverContext = createContext<((src: string, fallback?: boolean) => string | null) | undefined>(undefined);
 
@@ -279,8 +279,11 @@ function rehypeSafeUrls() {
       for (const key of ["href", "src"]) {
         if (node.properties && Object.hasOwn(node.properties, key)) {
           const value = String(node.properties[key] || "");
+          // `foo.py:42` would otherwise read as an unknown `foo.py:` protocol.
+          const cited = key === "href" ? splitLineSuffix(value) : null;
           node.properties[key] = key === "src" && node.tagName === "img" && isWindowsDrivePath(value)
-            ? value : defaultUrlTransform(value);
+            ? value
+            : cited?.line != null && defaultUrlTransform(cited.path) === cited.path ? value : defaultUrlTransform(value);
         }
       }
       node.children?.forEach(visit);
@@ -291,12 +294,12 @@ function rehypeSafeUrls() {
 
 function FileChip({
   path,
-  lines,
+  line,
   exp,
   onOpenFile,
 }: {
   path: string;
-  lines?: string;
+  line?: number;
   /** Experiment id this file was cited from, if any (`<file exp=…>`). */
   exp?: string;
   onOpenFile?: (
@@ -308,8 +311,6 @@ function FileChip({
   ) => void;
 }) {
   const name = path.split("/").pop() || path;
-  // `lines` may be a single line or a range ("20-40"); show the first.
-  const line = lines ? Number.parseInt(lines, 10) || undefined : undefined;
   const label = line != null ? `${name}:${line}` : name;
   return (
     <button
@@ -428,9 +429,11 @@ export const Md = memo(function Md({
   const chatImageSrc = useContext(ImageResolverContext);
   const imageSrc = resolveImageSrc ?? chatImageSrc;
   const components: Record<string, (props: any) => ReactNode> = useMemo(() => ({
-    "file-mention": (props) => (
-      <FileChip path={props.path} lines={props.lines} exp={props.exp} onOpenFile={onOpenFile} />
-    ),
+    "file-mention": (props) => {
+      const cited = splitLineSuffix(props.path);
+      const line = props.lines ? firstCitedLine(props.lines) : cited.line;
+      return <FileChip path={cited.path} line={line} exp={props.exp} onOpenFile={onOpenFile} />;
+    },
     "run-mention": (props) => (
       <RunChip id={props.id} label={props.label} onOpenRun={onOpenRun} />
     ),
@@ -446,15 +449,16 @@ export const Md = memo(function Md({
       }
       // Agents sometimes link files as plain markdown links; open those as
       // file tabs instead of navigating the dashboard away.
-      if (href && isFileHref(href) && onOpenFile) {
+      const cited = href ? splitLineSuffix(href) : null;
+      if (cited && isFileHref(cited.path) && onOpenFile) {
         let decoded: string;
         try {
-          decoded = decodeURI(href);
+          decoded = decodeURI(cited.path);
         } catch {
           return <span>{children}</span>;
         }
         const path = resolveFilePath ? resolveFilePath(decoded) : decoded;
-        return path ? <FileChip path={path} onOpenFile={onOpenFile} /> : <span>{children}</span>;
+        return path ? <FileChip path={path} line={cited.line} onOpenFile={onOpenFile} /> : <span>{children}</span>;
       }
       return (
         <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>
