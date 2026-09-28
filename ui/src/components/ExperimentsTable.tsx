@@ -7,11 +7,12 @@ import { fmtNumber, runDisplayStatus, timeAgo, type Experiment, type Run } from 
 import { StatusBadge } from "./StatusBadge";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { Button } from "./ui";
-import { ArchiveMenu } from "./ArchiveMenu";
+import { ArchiveMenu, type ArchiveActions } from "./ArchiveMenu";
 
 export function ExperimentsTable({
   runs,
   experiments,
+  archiveActions,
   emptyHint,
   onOpen,
   onOpenLogs,
@@ -21,11 +22,12 @@ export function ExperimentsTable({
 }: {
   runs: Run[];
   experiments: Experiment[];
+  archiveActions: Map<string, ArchiveActions>;
   emptyHint?: string;
   onOpen: (experiment: Experiment, intent: TabOpenIntent) => void;
   onOpenLogs: (experimentId: string, runId: string, intent: TabOpenIntent) => void;
   onOpenCode: (experimentId: string, intent: TabOpenIntent) => void;
-  onArchive: (id: string, direction: "up" | "down", archived: boolean) => void;
+  onArchive: (id: string, direction: "ancestors" | "descendants" | "only", archived: boolean) => void;
   onCancel: (runId: string) => Promise<void>;
 }) {
   const [pendingCancellation, setPendingCancellation] = useState<ReadonlySet<string>>(new Set());
@@ -166,17 +168,10 @@ export function ExperimentsTable({
                   <FolderTree size={15} />
                   {m.experiments_table_code()}
                 </Button>
-                <ArchiveMenu
-                  id={experiment.id}
-                  name={experiment.title || experiment.slug}
-                  hasParent={Boolean(experiment.parentExperimentId)}
-                  onArchive={onArchive}
-                />
                 {liveRun && (
                   <Button
                     size="small"
                     variant="danger"
-                    className="[@container((max-width:_560px))]:ms-auto"
                     disabled={cancelling}
                     title={cancelling ? m.experiments_stop_requested() : m.experiments_stop_run()}
                     onClick={() => void requestCancel(liveRun.id)}
@@ -185,6 +180,12 @@ export function ExperimentsTable({
                     {cancelling ? m.common_stopping() : m.common_stop()}
                   </Button>
                 )}
+                <ArchiveMenu
+                  id={experiment.id}
+                  name={experiment.title || experiment.slug}
+                  actions={archiveActions.get(experiment.id)!}
+                  onArchive={onArchive}
+                />
               </div>
             </div>
           );

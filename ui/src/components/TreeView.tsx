@@ -12,9 +12,10 @@ import {
   type NodeProps,
   type Viewport,
 } from "@xyflow/react";
-import { Ellipsis, FolderTree, Terminal } from "lucide-react";
+import { Archive, Ellipsis, FolderTree, Terminal } from "lucide-react";
+import { createPortal } from "react-dom";
 import { GitHubMark } from "./BackendLogos";
-import { memo, useMemo, useRef } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import {
   githubBranchUrl,
   fmtNumber,
@@ -27,7 +28,9 @@ import {
 import type { ExperimentView } from "./DetailDrawer";
 import type { CodeView } from "./CodeTab";
 import { ExpHoverCard, dismissTreeHoverCards, useHoverIntent } from "./ExpHoverCard";
-import { ArchiveMenu } from "./ArchiveMenu";
+import { ArchiveMenu, type ArchiveActions } from "./ArchiveMenu";
+import { usePopover } from "./ModelPicker";
+import { MenuItem } from "./ui";
 import { statusLabel, StatusBadge } from "./StatusBadge";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 
@@ -48,6 +51,8 @@ const MAX_SQUARES = 8;
 // Keep in sync with the inline `.elided-node` classes below.
 const ELIDED_W = 148;
 const ELIDED_H = 44;
+const ARCHIVED_W = 160;
+const ARCHIVED_GAP_Y = 64;
 
 type ExpNodeData = {
   exp: Experiment;
@@ -64,28 +69,35 @@ type ExpNodeData = {
     view: CodeView,
     intent: TabOpenIntent,
   ) => void;
-  onArchive: (id: string, direction: "up" | "down", archived: boolean) => void;
+  onArchive: (id: string, direction: "ancestors" | "descendants" | "only", archived: boolean) => void;
+  actions: ArchiveActions;
 };
 type ExpFlowNode = Node<ExpNodeData, "exp">;
 
+type ArchivedNodeData = {
+  rootId: string;
+  count: number;
+  onRestoreRegion: (id: string) => void;
+};
+type ArchivedFlowNode = Node<ArchivedNodeData, "archived">;
+
 type ElidedNodeData = {
   count: number;
-  archived: boolean;
-  onRevealHidden: (archived: boolean) => void;
+  onShowProjectScope: () => void;
 };
 type ElidedFlowNode = Node<ElidedNodeData, "elided">;
-type FlowNode = ExpFlowNode | ElidedFlowNode;
+type FlowNode = ExpFlowNode | ArchivedFlowNode | ElidedFlowNode;
 
 interface TreeNode {
   exp: Experiment;
   children: TreeNode[];
 }
 
-/** What the layout actually draws: real experiments plus "…" placeholders
- * standing in for experiments from other tasks (Current task scope only). */
+/** What the layout draws: experiment cards and hidden-region pills. */
 type DisplayNode =
   | { kind: "exp"; exp: Experiment; children: DisplayNode[] }
-  | { kind: "elided"; id: string; count: number; archived: boolean; children: DisplayNode[] };
+  | { kind: "archived"; id: string; rootId: string; count: number; children: DisplayNode[] }
+  | { kind: "elided"; id: string; count: number; children: DisplayNode[] };
 
 function buildForest(experiments: Experiment[]): TreeNode[] {
   const byId = new Map(experiments.map((e) => [e.id, { exp: e, children: [] as TreeNode[] }]));
@@ -109,7 +121,7 @@ function buildForest(experiments: Experiment[]): TreeNode[] {
 /** Keep the nodes `mine` accepts, collapse each maximal rejected region on the
  * path to them into one "…" pill, and drop rejected subtrees that lead
  * nowhere. Elided ids key off the region root, so they're stable across renders. */
-function elideHiddenRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean, isArchivedHidden: (n: TreeNode) => boolean): DisplayNode[] {
+function elideHiddenRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean): DisplayNode[] {
   // Memoized so the pass stays linear on deep chains.
   const sizes = new Map<TreeNode, number>();
   const size = (n: TreeNode): number => {
@@ -123,23 +135,13 @@ function elideHiddenRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean, i
     mines.set(n, memo);
     return memo;
   };
-  const archived = new Map<TreeNode, boolean>();
-  const hasArchived = (n: TreeNode): boolean => {
-    const memo = archived.get(n) ?? (isArchivedHidden(n) || n.children.some(hasArchived));
-    archived.set(n, memo);
-    return memo;
-  };
   function visit(node: TreeNode): DisplayNode[] {
     if (mine(node)) {
       const children: DisplayNode[] = [];
       let foreignCount = 0;
-      let foreignArchived = false;
       for (const c of node.children) {
         if (hasMine(c)) children.push(...visit(c));
-        else {
-          foreignCount += size(c);
-          foreignArchived ||= hasArchived(c);
-        }
+        else foreignCount += size(c);
       }
       // The pill goes after the real children (not createdAt-sorted) so the
       // placeholder stays out of the chronological left-to-right reading.
@@ -148,37 +150,54 @@ function elideHiddenRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean, i
           kind: "elided",
           id: `el-${node.exp.id}`,
           count: foreignCount,
-          archived: foreignArchived,
           children: [],
         });
       return [{ kind: "exp", exp: node.exp, children }];
     }
     if (!hasMine(node)) return [];
     let count = 0;
-    let regionArchived = false;
     const mineChildren: DisplayNode[] = [];
     // Walk the foreign region rooted here, tallying every node in it and
     // recursing out through each kept descendant; `size(c)` swallows whole
     // foreign subtrees that contain nothing kept.
     (function absorb(n: TreeNode) {
       count += 1;
-      regionArchived ||= isArchivedHidden(n);
       for (const c of n.children) {
         if (mine(c)) mineChildren.push(...visit(c));
         else if (hasMine(c)) absorb(c);
-        else {
-          count += size(c);
-          regionArchived ||= hasArchived(c);
-        }
+        else count += size(c);
       }
     })(node);
-    return [{ kind: "elided", id: `el-${node.exp.id}`, count, archived: regionArchived, children: mineChildren }];
+    return [{ kind: "elided", id: `el-${node.exp.id}`, count, children: mineChildren }];
   }
   return roots.flatMap(visit);
 }
 
+function collapseArchivedRegions(roots: DisplayNode[]): DisplayNode[] {
+  function visit(node: DisplayNode): DisplayNode {
+    if (node.kind !== "exp" || !node.exp.archived)
+      return { ...node, children: node.children.map(visit) };
+    let count = 0;
+    const children: DisplayNode[] = [];
+    function absorb(archived: DisplayNode & { kind: "exp" }) {
+      count += 1;
+      for (const child of archived.children) {
+        if (child.kind === "exp" && child.exp.archived) absorb(child);
+        else children.push(visit(child));
+      }
+    }
+    absorb(node);
+    return { kind: "archived", id: `ar-${node.exp.id}`, rootId: node.exp.id, count, children };
+  }
+  return roots.map(visit);
+}
+
 function nodeWidth(node: DisplayNode): number {
-  return node.kind === "exp" ? NODE_W : ELIDED_W;
+  return node.kind === "exp" ? NODE_W : node.kind === "archived" ? ARCHIVED_W : ELIDED_W;
+}
+
+function nodeHeight(node: DisplayNode): number {
+  return node.kind === "exp" ? NODE_H : ELIDED_H;
 }
 
 function nodeId(node: DisplayNode): string {
@@ -201,7 +220,7 @@ function runSquareClass(status: string): string {
 
 const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   useLocale();
-  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCode, onArchive } = data;
+  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCode, onArchive, actions } = data;
   const status = latestRun ? runDisplayStatus(latestRun) : undefined;
   const live = status === "running" || status === "starting" || status === "cancelling";
   const kind = isBaseline ? m.tree_baseline() : live ? m.tree_running() : m.tree_experiment();
@@ -283,10 +302,9 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           <FolderTree size={13} />
           {m.tree_view_code()}
         </button>
-        <ArchiveMenu id={exp.id} name={exp.slug} hasParent={Boolean(exp.parentExperimentId)} onArchive={onArchive} compact />
         {/* Icon-only: labeled actions + the link overflow the card's fixed width. */}
         {githubOwner && githubRepo && <a
-          className="node-action node-action-ext"
+          className="node-action"
           title={m.a11y_open_on_github({ name: ltr(exp.branchName) })}
           aria-label={m.a11y_open_on_github({ name: ltr(exp.branchName) })}
           href={githubBranchUrl(githubOwner, githubRepo, exp.branchName)}
@@ -296,6 +314,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
         >
           <GitHubMark size={13} />
         </a>}
+        <ArchiveMenu id={exp.id} name={exp.slug} actions={actions} onArchive={onArchive} compact />
       </div>
       <Handle type="source" position={Position.Bottom} />
       {/* Node and card share one leave handler — React's enter/leave pairing
@@ -319,9 +338,55 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   );
 });
 
+const ArchivedNode = memo(function ArchivedNode({ data }: NodeProps<ArchivedFlowNode>) {
+  useLocale();
+  const { rootId, count, onRestoreRegion } = data;
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menu = usePopover(triggerRef);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  const toggle = () => {
+    if (!menu.open && triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect();
+      const below = window.innerHeight - rect.bottom >= 44;
+      setPosition({
+        top: below ? rect.bottom + 4 : Math.max(4, rect.top - 44),
+        left: Math.max(4, Math.min(rect.left, window.innerWidth - 232)),
+      });
+    }
+    menu.setOpen((open) => !open);
+  };
+  return (
+    <div className="archived-node w-40 h-11">
+      <Handle type="target" position={Position.Top} />
+      <button
+        type="button"
+        ref={triggerRef}
+        className="nodrag w-full h-full flex items-center justify-center gap-2 px-3 border border-border rounded-full bg-background text-text text-sm font-medium whitespace-nowrap transition-[background-color,border-color] duration-120 ease-standard hover:bg-surface hover:border-text"
+        aria-haspopup="menu"
+        aria-expanded={menu.open}
+        onClick={toggle}
+      >
+        <Archive size={15} className="shrink-0 text-subtext" aria-hidden="true" />
+        <span>{m.tree_archived_count({ count: fmtNumber(count) })}</span>
+      </button>
+      <Handle type="source" position={Position.Bottom} />
+      {menu.open && createPortal(
+        <div ref={menu.ref} className="option-menu fixed z-50 min-w-56 rounded-lg border border-border bg-background p-1.5 shadow-menu" style={position}>
+          <MenuItem onClick={() => {
+            menu.setOpen(false);
+            onRestoreRegion(rootId);
+          }}>
+            {count === 1 ? m.tree_restore_only() : m.tree_restore_archived_count({ count: fmtNumber(count) })}
+          </MenuItem>
+        </div>, document.body,
+      )}
+    </div>
+  );
+});
+
 const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>) {
   useLocale();
-  const { count, archived, onRevealHidden } = data;
+  const { count, onShowProjectScope } = data;
   // A div, not a <button>: ReactFlow's <Handle> renders divs, which are
   // invalid inside button elements. tabIndex opts the pill back into the tab
   // order that nodesFocusable={false} removes — it's the only node whose whole
@@ -331,12 +396,12 @@ const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>)
       className="elided-node w-37 h-11 flex items-center gap-2 py-1.5 px-2.5 border border-dashed border-border rounded-md bg-hover-faint text-muted text-sm font-medium text-start transition-[border-color,color] duration-120 ease-standard [&:hover]:border-text [&:hover]:text-text [&_.elided-node-label]:flex [&_.elided-node-label]:flex-col [&_.elided-node-label]:leading-[1.3] [&_.elided-node-sub]:text-muted"
       role="button"
       tabIndex={0}
-      title={m.tree_reveal_hidden_experiments()}
-      onClick={() => onRevealHidden(archived)}
+      title={m.tree_view_switch_to_entire_project_to_see_all_experiments()}
+      onClick={onShowProjectScope}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onRevealHidden(archived);
+          onShowProjectScope();
         }
       }}
     >
@@ -351,7 +416,7 @@ const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>)
   );
 });
 
-const nodeTypes = { exp: ExpNode, elided: ElidedNode };
+const nodeTypes = { exp: ExpNode, archived: ArchivedNode, elided: ElidedNode };
 
 const defaultEdgeOptions = {
   type: "default", // bezier
@@ -363,21 +428,22 @@ const elidedEdgeStyle = { ...defaultEdgeOptions.style, strokeDasharray: "4 4" };
 
 export function TreeView({
   experiments,
-  hasArchivedExperiments,
-  allExperiments,
+  archiveActions,
+  showArchived,
   runs,
   project,
   onOpenView,
   onOpenCode,
   onArchive,
   agentSessionId,
-  onRevealHidden,
+  onShowProjectScope,
+  onRestoreRegion,
   viewport,
   onViewportChange,
 }: {
   experiments: Experiment[];
-  hasArchivedExperiments: boolean;
-  allExperiments: Experiment[];
+  archiveActions: Map<string, ArchiveActions>;
+  showArchived: boolean;
   runs: Run[];
   /** Owning project — supplies owner/repo for the GitHub branch links. */
   project: Project;
@@ -390,12 +456,13 @@ export function TreeView({
     view: CodeView,
     intent: TabOpenIntent,
   ) => void;
-  onArchive: (id: string, direction: "up" | "down", archived: boolean) => void;
+  onArchive: (id: string, direction: "ancestors" | "descendants" | "only", archived: boolean) => void;
   /** Current task scope: show only this chat session's experiments, eliding the rest.
    * Null = Entire project scope (the whole forest). */
   agentSessionId: string | null;
-  /** Reveal archived or other-task nodes from an elided pill. */
-  onRevealHidden: (archived: boolean) => void;
+  /** Leave Current task scope from an elided pill. */
+  onShowProjectScope: () => void;
+  onRestoreRegion: (id: string) => void;
   /** Preserve the canvas transform while the experiments pane is unmounted. */
   viewport: Viewport | null;
   onViewportChange: (viewport: Viewport) => void;
@@ -411,12 +478,11 @@ export function TreeView({
 
     const nodes: FlowNode[] = [];
     const edges: Edge[] = [];
-    const visibleIds = new Set(experiments.map((experiment) => experiment.id));
-    const hiddenArchivedIds = new Set(allExperiments.filter((experiment) => experiment.archived && !visibleIds.has(experiment.id)).map((experiment) => experiment.id));
     const isMine = (n: TreeNode) =>
-      visibleIds.has(n.exp.id) && (!agentSessionId || n.exp.chatSessionId === agentSessionId);
-    const roots = elideHiddenRegions(buildForest(allExperiments), isMine, (n) => hiddenArchivedIds.has(n.exp.id));
-    const slugById = new Map(allExperiments.map((e) => [e.id, e.slug]));
+      !agentSessionId || n.exp.chatSessionId === agentSessionId;
+    const scopedRoots = elideHiddenRegions(buildForest(experiments), isMine);
+    const roots = showArchived ? scopedRoots : collapseArchivedRegions(scopedRoots);
+    const slugById = new Map(experiments.map((e) => [e.id, e.slug]));
 
     function layout(node: DisplayNode, cx: number, y: number) {
       const x = cx - nodeWidth(node) / 2;
@@ -439,15 +505,22 @@ export function TreeView({
             onOpenView,
             onOpenCode,
             onArchive,
+            actions: archiveActions.get(node.exp.id)!,
           },
         });
+      } else if (node.kind === "archived") {
+        nodes.push({
+          id: node.id,
+          type: "archived",
+          position: { x, y },
+          data: { rootId: node.rootId, count: node.count, onRestoreRegion },
+        });
       } else {
-        // Pills are shorter than cards; center them within the row.
         nodes.push({
           id: node.id,
           type: "elided",
-          position: { x, y: y + (NODE_H - ELIDED_H) / 2 },
-          data: { count: node.count, archived: node.archived, onRevealHidden },
+          position: { x, y },
+          data: { count: node.count, onShowProjectScope },
         });
       }
       if (node.children.length === 0) return;
@@ -457,14 +530,14 @@ export function TreeView({
       let childX = cx - totalW / 2;
       for (const child of node.children) {
         const cw = subtreeWidth(child);
-        const elided = node.kind === "elided" || child.kind === "elided";
+        const elided = node.kind !== "exp" || child.kind !== "exp" || node.exp.archived || child.exp.archived;
         edges.push({
           id: `e-${nodeId(node)}-${nodeId(child)}`,
           source: nodeId(node),
           target: nodeId(child),
           ...(elided ? { style: elidedEdgeStyle } : {}),
         });
-        layout(child, childX + cw / 2, y + NODE_H + GAP_Y);
+        layout(child, childX + cw / 2, y + nodeHeight(node) + (child.kind === "archived" ? ARCHIVED_GAP_Y : GAP_Y));
         childX += cw + GAP_X;
       }
     }
@@ -478,7 +551,8 @@ export function TreeView({
     return { nodes, edges };
   }, [
     experiments,
-    allExperiments,
+    archiveActions,
+    showArchived,
     runs,
     onOpenView,
     onOpenCode,
@@ -487,14 +561,15 @@ export function TreeView({
     project.githubRepo,
     project.githubEnabled,
     agentSessionId,
-    onRevealHidden,
+    onShowProjectScope,
+    onRestoreRegion,
   ]);
 
   if (experiments.length === 0) {
     return (
       <div className={EMPTY_STATE_CLASS_NAME}>
-        <p className="empty-state-title">{hasArchivedExperiments ? m.tree_all_experiments_archived() : m.tree_view_no_experiments_yet()}</p>
-        {!hasArchivedExperiments && <p className="empty-state-hint">{m.tree_view_ask_the_agent_in_chat_to_create_and()}</p>}
+        <p className="empty-state-title">{m.tree_view_no_experiments_yet()}</p>
+        <p className="empty-state-hint">{m.tree_view_ask_the_agent_in_chat_to_create_and()}</p>
       </div>
     );
   }
@@ -503,15 +578,15 @@ export function TreeView({
   if (nodes.length === 0 && agentSessionId) {
     return (
       <div className={EMPTY_STATE_CLASS_NAME}>
-        <p className="empty-state-title">{hasArchivedExperiments ? m.tree_all_experiments_archived() : m.tree_view_no_experiments_from_the_current_task_yet()}</p>
-        {!hasArchivedExperiments && <p className="empty-state-hint">{m.tree_view_ask_in_this_task_to_create_one_or()}</p>}
+        <p className="empty-state-title">{m.tree_view_no_experiments_from_the_current_task_yet()}</p>
+        <p className="empty-state-hint">{m.tree_view_ask_in_this_task_to_create_one_or()}</p>
       </div>
     );
   }
 
   return (
     <ReactFlow
-      className="[&_.react-flow\_\_node.react-flow\_\_node-exp.selectable]:cursor-default [&_.react-flow\_\_node.react-flow\_\_node-elided.selectable]:cursor-pointer [&_.react-flow\_\_handle]:opacity-0 [&_.react-flow\_\_handle]:pointer-events-none [&_.react-flow\_\_attribution]:hidden!"
+      className="[&_.react-flow\_\_node.react-flow\_\_node-exp.selectable]:cursor-default [&_.react-flow\_\_node.react-flow\_\_node-archived.selectable]:cursor-pointer [&_.react-flow\_\_node.react-flow\_\_node-elided.selectable]:cursor-pointer [&_.react-flow\_\_handle]:opacity-0 [&_.react-flow\_\_handle]:pointer-events-none [&_.react-flow\_\_attribution]:hidden!"
       // Saved viewports initialize on mount; a new scope needs its own canvas.
       key={agentSessionId ?? "project"}
       nodes={nodes}

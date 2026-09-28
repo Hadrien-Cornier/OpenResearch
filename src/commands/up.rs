@@ -1960,9 +1960,15 @@ async fn set_experiment_archive(
     Json(request): Json<ArchiveExperimentRequest>,
 ) -> ApiResult {
     let direction = match request.direction.as_str() {
-        "up" => local::experiments::ArchiveDirection::Up,
-        "down" => local::experiments::ArchiveDirection::Down,
-        _ => return Err(bad_request("direction must be up or down")),
+        "ancestors" => local::experiments::ArchiveDirection::Ancestors,
+        "descendants" => local::experiments::ArchiveDirection::Descendants,
+        "only" => local::experiments::ArchiveDirection::Only,
+        "region" => local::experiments::ArchiveDirection::Region,
+        _ => {
+            return Err(bad_request(
+                "direction must be ancestors, descendants, only, or region",
+            ))
+        }
     };
     let mut store = Store::open()?;
     if store.get_local_experiment(&id)?.is_none() {

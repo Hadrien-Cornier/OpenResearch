@@ -401,25 +401,35 @@ pub struct ExpArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ExpCommand {
-    /// Hide ancestors of an experiment, or the experiment and its descendants.
+    /// Hide ancestors, the selected experiment, or descendants.
     /// A later no-parent create starts a new baseline if all roots are archived.
+    #[command(group(clap::ArgGroup::new("archive_scope").required(true)))]
     Archive {
         exp_id: String,
-        /// Archive ancestors above the selected experiment (exclusive).
-        #[arg(long, conflicts_with = "down")]
-        up: bool,
-        /// Archive the selected experiment and descendants (default).
-        #[arg(long)]
-        down: bool,
+        /// Archive ancestors, excluding the selected experiment.
+        #[arg(long, group = "archive_scope")]
+        ancestors: bool,
+        /// Archive only the selected experiment.
+        #[arg(long, group = "archive_scope")]
+        only: bool,
+        /// Archive descendants, excluding the selected experiment.
+        #[arg(long, group = "archive_scope")]
+        descendants: bool,
     },
 
-    /// Restore archived experiments using the same directional selection.
+    /// Restore archived experiments using the same scopes.
+    #[command(group(clap::ArgGroup::new("unarchive_scope").required(true)))]
     Unarchive {
         exp_id: String,
-        #[arg(long, conflicts_with = "down")]
-        up: bool,
-        #[arg(long)]
-        down: bool,
+        /// Restore ancestors, excluding the selected experiment.
+        #[arg(long, group = "unarchive_scope")]
+        ancestors: bool,
+        /// Restore only the selected experiment.
+        #[arg(long, group = "unarchive_scope")]
+        only: bool,
+        /// Restore descendants, excluding the selected experiment.
+        #[arg(long, group = "unarchive_scope")]
+        descendants: bool,
     },
 
     /// Show the experiment's status, run command, and latest run.

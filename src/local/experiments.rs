@@ -66,8 +66,10 @@ pub fn legacy_root_warning(project: &LocalProject, experiment: &LocalExperiment)
 
 #[derive(Clone, Copy)]
 pub enum ArchiveDirection {
-    Up,
-    Down,
+    Ancestors,
+    Descendants,
+    Only,
+    Region,
 }
 
 pub fn set_archived(
@@ -90,7 +92,40 @@ fn archive_ids(
     direction: ArchiveDirection,
 ) -> Vec<String> {
     match direction {
-        ArchiveDirection::Up => {
+        ArchiveDirection::Only => vec![selected.id.clone()],
+        ArchiveDirection::Region => {
+            if !selected.archived {
+                return Vec::new();
+            }
+            let by_id: HashMap<_, _> = experiments.iter().map(|e| (e.id.as_str(), e)).collect();
+            let mut root = selected;
+            while let Some(parent) = root
+                .parent_experiment_id
+                .as_deref()
+                .and_then(|id| by_id.get(id))
+            {
+                if !parent.archived {
+                    break;
+                }
+                root = parent;
+            }
+            let mut children: HashMap<&str, Vec<&LocalExperiment>> = HashMap::new();
+            for experiment in experiments {
+                if let Some(parent) = experiment.parent_experiment_id.as_deref() {
+                    children.entry(parent).or_default().push(experiment);
+                }
+            }
+            let mut ids = Vec::new();
+            let mut stack = vec![root];
+            while let Some(experiment) = stack.pop() {
+                ids.push(experiment.id.clone());
+                if let Some(next) = children.get(experiment.id.as_str()) {
+                    stack.extend(next.iter().copied().filter(|child| child.archived));
+                }
+            }
+            ids
+        }
+        ArchiveDirection::Ancestors => {
             let by_id: HashMap<_, _> = experiments.iter().map(|e| (e.id.as_str(), e)).collect();
             let mut ids = Vec::new();
             let mut parent = selected.parent_experiment_id.as_deref();
@@ -103,14 +138,14 @@ fn archive_ids(
             }
             ids
         }
-        ArchiveDirection::Down => {
+        ArchiveDirection::Descendants => {
             let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
             for experiment in experiments {
                 if let Some(parent) = experiment.parent_experiment_id.as_deref() {
                     children.entry(parent).or_default().push(&experiment.id);
                 }
             }
-            let mut ids = vec![selected.id.clone()];
+            let mut ids = Vec::new();
             let mut stack = vec![selected.id.as_str()];
             while let Some(id) = stack.pop() {
                 if let Some(next) = children.get(id) {
@@ -273,11 +308,45 @@ mod tests {
         let mut sibling = experiment(Some("root"), "sibling");
         sibling.id = "sibling".into();
         let all = [root, selected.clone(), child, sibling];
-        assert_eq!(archive_ids(&all, &selected, ArchiveDirection::Up), ["root"]);
         assert_eq!(
-            archive_ids(&all, &selected, ArchiveDirection::Down),
-            ["selected", "child"]
+            archive_ids(&all, &selected, ArchiveDirection::Ancestors),
+            ["root"]
         );
+        assert_eq!(
+            archive_ids(&all, &selected, ArchiveDirection::Only),
+            ["selected"]
+        );
+        assert_eq!(
+            archive_ids(&all, &selected, ArchiveDirection::Descendants),
+            ["child"]
+        );
+    }
+
+    #[test]
+    fn archive_region_stops_at_active_nodes() {
+        let mut root = experiment(None, "root");
+        root.id = "root".into();
+        root.archived = true;
+        let mut selected = experiment(Some("root"), "selected");
+        selected.id = "selected".into();
+        selected.archived = true;
+        let mut sibling = experiment(Some("root"), "sibling");
+        sibling.id = "sibling".into();
+        sibling.archived = true;
+        let mut active = experiment(Some("selected"), "active");
+        active.id = "active".into();
+        let mut separate = experiment(Some("active"), "separate");
+        separate.id = "separate".into();
+        separate.archived = true;
+        let ids = archive_ids(
+            &[root, selected.clone(), sibling, active, separate],
+            &selected,
+            ArchiveDirection::Region,
+        );
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&"root".to_string()));
+        assert!(ids.contains(&"selected".to_string()));
+        assert!(ids.contains(&"sibling".to_string()));
     }
 
     #[test]

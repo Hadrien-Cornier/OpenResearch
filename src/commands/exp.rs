@@ -4,8 +4,8 @@
 //!   orx exp run    <expId> …          launch a local orx-supervised run
 //!   orx exp cancel <expId>            cancel the in-flight run
 //!   orx exp wake   <expId>            resume this agent when the run succeeds or fails
-//!   orx exp archive <expId> --up|--down   hide ancestors or the selected subtree
-//!   orx exp unarchive <expId> --up|--down restore the same nodes
+//!   orx exp archive <expId> --ancestors|--only|--descendants   hide the chosen scope
+//!   orx exp unarchive <expId> --ancestors|--only|--descendants restore the same nodes
 //!
 //! Unlike the project-scoped data commands, every verb here takes an
 //! *experiment* id from `orx project view <projectId>`.
@@ -20,8 +20,20 @@ use crate::ExpCommand;
 pub async fn run(args: crate::ExpArgs) -> Result<()> {
     let mut store = Store::open()?;
     match args.command {
-        ExpCommand::Archive { exp_id, up, .. } => archive(&mut store, &exp_id, up, true),
-        ExpCommand::Unarchive { exp_id, up, .. } => archive(&mut store, &exp_id, up, false),
+        ExpCommand::Archive {
+            exp_id,
+            ancestors,
+            only,
+            descendants,
+            ..
+        } => archive(&mut store, &exp_id, ancestors, only, descendants, true),
+        ExpCommand::Unarchive {
+            exp_id,
+            ancestors,
+            only,
+            descendants,
+            ..
+        } => archive(&mut store, &exp_id, ancestors, only, descendants, false),
         ExpCommand::Status { exp_id, scheduler } => {
             crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
@@ -51,11 +63,22 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
     }
 }
 
-fn archive(store: &mut Store, id: &str, up: bool, archived: bool) -> Result<()> {
-    let direction = if up {
-        crate::local::experiments::ArchiveDirection::Up
+fn archive(
+    store: &mut Store,
+    id: &str,
+    ancestors: bool,
+    only: bool,
+    descendants: bool,
+    archived: bool,
+) -> Result<()> {
+    let direction = if ancestors {
+        crate::local::experiments::ArchiveDirection::Ancestors
+    } else if only {
+        crate::local::experiments::ArchiveDirection::Only
+    } else if descendants {
+        crate::local::experiments::ArchiveDirection::Descendants
     } else {
-        crate::local::experiments::ArchiveDirection::Down
+        unreachable!("clap requires an archive scope")
     };
     let ids = crate::local::experiments::set_archived(store, id, direction, archived)?;
     println!(

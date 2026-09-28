@@ -115,6 +115,7 @@ import { UpdateBanner, useUpdateStatus } from "./components/UpdateBanner";
 import { OfflineBanner } from "./components/OfflineBanner";
 import { NewProjectDialog } from "./components/ProjectsHome";
 import { ExperimentsTable } from "./components/ExperimentsTable";
+import { archiveActionsByExperiment } from "./components/ArchiveMenu";
 import { Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { DemoWelcomeModal } from "./components/Tour";
@@ -370,15 +371,12 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (effectiveScope !== "agent") return experiments;
     return experiments.filter((experiment) => experiment.chatSessionId === activeSessionId);
   }, [experiments, effectiveScope, activeSessionId]);
-  const visibleExperiments = useMemo(
-    () => experiments.filter((experiment) => showArchivedExperiments || !experiment.archived),
-    [experiments, showArchivedExperiments],
-  );
   const visibleScopedExperiments = useMemo(
     () => scopedExperiments.filter((experiment) => showArchivedExperiments || !experiment.archived),
     [scopedExperiments, showArchivedExperiments],
   );
-  const archiveExperiment = useCallback(async (id: string, direction: "up" | "down", archived: boolean) => {
+  const archiveActions = useMemo(() => archiveActionsByExperiment(experiments), [experiments]);
+  const archiveExperiment = useCallback(async (id: string, direction: "ancestors" | "descendants" | "only" | "region", archived: boolean) => {
     try {
       await setExperimentArchived(id, direction, archived);
       await queryClient.invalidateQueries({ queryKey: listExperimentsQuery(projectId).queryKey });
@@ -386,6 +384,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       showAlert(error instanceof Error ? error.message : String(error), "error");
     }
   }, [projectId]);
+  const restoreArchivedRegion = useCallback((id: string) => {
+    void archiveExperiment(id, "region", false);
+  }, [archiveExperiment]);
   // Runs are scoped by their experiment's owner, not by which session launched them.
   const scopedRuns = useMemo(() => {
     if (effectiveScope !== "agent") return runs;
@@ -1770,10 +1771,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                 <div className="pane-toolbar flex shrink-0 flex-wrap items-center gap-2 bg-background px-3 pt-2.5 pb-2">
                   <span className="flex-1" />
                   <div className="experiments-toolbar-controls inline-flex items-center gap-[5px]">
-                    <label className="inline-flex items-center gap-1 text-sm text-subtext">
-                      <input type="checkbox" checked={showArchivedExperiments} onChange={(event) => setShowArchivedExperiments(event.target.checked)} />
-                      {m.app_show_archived_experiments()}
-                    </label>
                     <div className="option-picker relative inline-flex" ref={scopeMenuRef}>
                       <IconButton size="small"
                         ref={scopeTriggerRef}
@@ -1816,6 +1813,17 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                             <span>{m.app_entire_project()}</span>
                             {effectiveScope === "project" && <Check size={13} />}
                           </MenuItem>
+                          <div className="my-1 border-t border-border-variant" />
+                          <MenuItem
+                            aria-pressed={showArchivedExperiments}
+                            onClick={() => {
+                              setShowArchivedExperiments((show) => !show);
+                              setScopeMenuOpen(false);
+                            }}
+                          >
+                            <span>{m.app_show_archived_experiments()}</span>
+                            {showArchivedExperiments && <Check size={13} />}
+                          </MenuItem>
                         </div>
                       )}
                     </div>
@@ -1845,25 +1853,24 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                   {view === "tree" ? (
                     activeProject && (
                       <TreeView
-                        experiments={visibleExperiments}
-                        allExperiments={experiments}
-                        hasArchivedExperiments={scopedExperiments.length > 0 && visibleScopedExperiments.length === 0}
+                        experiments={experiments}
+                        archiveActions={archiveActions}
+                        showArchived={showArchivedExperiments}
                         runs={scopedRuns}
                         project={activeProject}
                         onOpenView={openExperimentTab}
                         onOpenCode={openCodeTabForExperiment}
                         onArchive={archiveExperiment}
                         agentSessionId={effectiveScope === "agent" ? activeSessionId : null}
-                        onRevealHidden={(archived) => {
-                          if (archived) setShowArchivedExperiments(true);
-                          showProjectScope();
-                        }}
+                        onShowProjectScope={showProjectScope}
+                        onRestoreRegion={restoreArchivedRegion}
                         viewport={treeViewport}
                         onViewportChange={setTreeViewport}
                       />
                     )
                   ) : (
                     <ExperimentsTable
+                      archiveActions={archiveActions}
                       runs={scopedRuns}
                       emptyHint={
                         !showArchivedExperiments && scopedExperiments.length > 0 && visibleScopedExperiments.length === 0
