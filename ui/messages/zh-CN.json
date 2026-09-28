@@ -1231,5 +1231,14 @@
   "ssh_run_in": "运行位置",
   "ssh_direct_host": "直接在主机上",
   "ssh_existing_container": "现有容器",
-  "ssh_container_reference": "容器名称或 ID"
+  "ssh_container_reference": "容器名称或 ID",
+  "app_show_archived_experiments": "显示已归档",
+  "tree_archived": "已归档",
+  "tree_archive_manage_experiment": "管理 {name}",
+  "tree_archive_manage": "管理",
+  "tree_archive_above": "归档上方节点",
+  "tree_archive_down": "归档此节点及下方节点",
+  "tree_restore_above": "恢复上方节点",
+  "tree_restore_down": "恢复此节点及下方节点",
+  "tree_all_experiments_archived": "所有实验均已归档。开启“显示已归档”即可查看。"
 }

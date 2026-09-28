@@ -467,6 +467,7 @@ fn seed_at(
         created_at: ago(seeded_at, 240, 0),
         updated_at: ago(seeded_at, 9, 0),
         chat_session_id: Some(SESSION_ID.into()),
+        archived: false,
     };
     let lr_probe = LocalExperiment {
             id: LR_PROBE_EXPERIMENT_ID.into(),
@@ -487,6 +488,7 @@ fn seed_at(
             created_at: ago(seeded_at, 8, 0),
             updated_at: ago(seeded_at, 8, 0),
             chat_session_id: None,
+            archived: false,
         };
     let vocab_probe = LocalExperiment {
             id: VOCAB_PROBE_EXPERIMENT_ID.into(),
@@ -507,6 +509,7 @@ fn seed_at(
             created_at: ago(seeded_at, 6, 0),
             updated_at: ago(seeded_at, 6, 0),
             chat_session_id: None,
+            archived: false,
         };
     // created_at and run_ended_at must stay RUN_LOG_SPAN_MIN apart.
     let run_ended_at = ago(seeded_at, 10, 0);

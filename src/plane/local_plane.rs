@@ -100,7 +100,7 @@ impl LocalPlane {
         })
     }
 
-    pub async fn view_project(&self) -> Result<()> {
+    pub async fn view_project(&self, all: bool) -> Result<()> {
         let store = &self.store;
         let project = self.project()?;
         println!("{} (local)", project.name);
@@ -119,7 +119,11 @@ impl LocalPlane {
             ),
         }
 
-        let experiments = store.list_experiments_by_project(&project.id)?;
+        let experiments: Vec<_> = store
+            .list_experiments_by_project(&project.id)?
+            .into_iter()
+            .filter(|e| all || !e.archived)
+            .collect();
         println!("\nExperiments");
         if experiments.is_empty() {
             println!("  (none)");
@@ -131,10 +135,11 @@ impl LocalPlane {
                     ""
                 };
                 println!(
-                    "  {}  {}{}  ({})",
+                    "  {}  {}{}{}  ({})",
                     e.id,
                     e.display_name(),
                     root,
+                    if e.archived { " [archived]" } else { "" },
                     e.branch_name
                 );
             }
@@ -180,6 +185,9 @@ impl LocalPlane {
         println!("{}  ({})  [local]", exp.display_name(), exp.agent_status);
         println!("  id:       {}", exp.id);
         println!("  branch:   {}", exp.branch_name);
+        if exp.archived {
+            println!("  archived: yes");
+        }
         match &exp.parent_experiment_id {
             Some(parent_id) => match store.get_local_experiment(parent_id)? {
                 Some(parent) => {

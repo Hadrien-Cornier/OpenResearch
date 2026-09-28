@@ -1231,5 +1231,14 @@
   "ssh_run_in": "यहाँ चलाएँ",
   "ssh_direct_host": "सीधे होस्ट पर",
   "ssh_existing_container": "मौजूदा कंटेनर",
-  "ssh_container_reference": "कंटेनर का नाम या ID"
+  "ssh_container_reference": "कंटेनर का नाम या ID",
+  "app_show_archived_experiments": "संग्रहीत दिखाएँ",
+  "tree_archived": "संग्रहीत",
+  "tree_archive_manage_experiment": "{name} प्रबंधित करें",
+  "tree_archive_manage": "प्रबंधित करें",
+  "tree_archive_above": "ऊपर के नोड संग्रहीत करें",
+  "tree_archive_down": "यहाँ से नीचे संग्रहीत करें",
+  "tree_restore_above": "ऊपर के नोड पुनर्स्थापित करें",
+  "tree_restore_down": "यहाँ से नीचे पुनर्स्थापित करें",
+  "tree_all_experiments_archived": "सभी प्रयोग संग्रहीत हैं। उन्हें देखने के लिए संग्रहीत दिखाएँ चालू करें।"
 }

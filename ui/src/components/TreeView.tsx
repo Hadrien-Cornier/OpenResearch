@@ -27,6 +27,7 @@ import {
 import type { ExperimentView } from "./DetailDrawer";
 import type { CodeView } from "./CodeTab";
 import { ExpHoverCard, dismissTreeHoverCards, useHoverIntent } from "./ExpHoverCard";
+import { ArchiveMenu } from "./ArchiveMenu";
 import { statusLabel, StatusBadge } from "./StatusBadge";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 
@@ -63,6 +64,7 @@ type ExpNodeData = {
     view: CodeView,
     intent: TabOpenIntent,
   ) => void;
+  onArchive: (id: string, direction: "up" | "down", archived: boolean) => void;
 };
 type ExpFlowNode = Node<ExpNodeData, "exp">;
 
@@ -184,7 +186,7 @@ function runSquareClass(status: string): string {
 
 const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   useLocale();
-  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCode } = data;
+  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCode, onArchive } = data;
   const status = latestRun ? runDisplayStatus(latestRun) : undefined;
   const live = status === "running" || status === "starting" || status === "cancelling";
   const kind = isBaseline ? m.tree_baseline() : live ? m.tree_running() : m.tree_experiment();
@@ -200,7 +202,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   return (
     <div
       ref={rootRef}
-      className={`exp-node w-66 border border-border rounded-md bg-background py-2.5 px-3 shadow-tree text-sm transition-[box-shadow] duration-120 ease-standard [&:hover]:shadow-tree-hover [&.live]:border-accent-teal [&.live]:shadow-tree-live [&_.node-overview-link]:block [&_.node-overview-link]:w-full [&_.node-overview-link]:p-0 [&_.node-overview-link]:border-0 [&_.node-overview-link]:bg-transparent [&_.node-overview-link]:text-inherit [&_.node-overview-link]:[font:inherit] [&_.node-overview-link]:text-start [&_.node-overview-link]:cursor-pointer [&_.node-overview-link:hover_.node-slug]:underline [&_.node-overview-link:hover_.node-slug]:underline-offset-[3px] [&_.node-overview-link:focus-visible]:outline-2 [&_.node-overview-link:focus-visible]:outline-solid [&_.node-overview-link:focus-visible]:outline-accent [&_.node-overview-link:focus-visible]:outline-offset-4 [&_.node-overview-link:focus-visible]:rounded-xs [&_.node-eyebrow]:flex [&_.node-eyebrow]:items-center [&_.node-eyebrow]:justify-between [&_.node-eyebrow]:gap-2 [&_.node-eyebrow]:mb-1.5 [&_.node-eyebrow]:text-xs [&_.node-eyebrow]:font-medium [&_.node-eyebrow]:text-muted [&_.node-head]:flex [&_.node-head]:items-center [&_.node-head]:gap-[7px] [&_.node-head]:min-w-0 [&_.node-status]:w-2 [&_.node-status]:h-2 [&_.node-status]:rounded-full [&_.node-status]:shrink-0 [&_.node-slug]:text-sm [&_.node-slug]:font-semibold [&_.node-slug]:text-text [&_.node-slug]:flex-1 [&_.node-slug]:min-w-0 [&_.node-slug]:overflow-hidden [&_.node-slug]:text-ellipsis [&_.node-slug]:whitespace-nowrap [&_.node-title]:mt-1 [&_.node-title]:text-text [&_.node-title]:text-sm [&_.node-title]:line-clamp-2 [&_.node-meta]:mt-2 [&_.node-meta]:flex [&_.node-meta]:items-center [&_.node-meta]:gap-2 [&_.node-meta]:text-xs [&_.node-meta]:text-muted [&_.node-actions]:mt-2 [&_.node-actions]:pt-1.5 [&_.node-actions]:border-t [&_.node-actions]:border-t-border-variant [&_.node-actions]:flex [&_.node-actions]:items-center [&_.node-actions]:gap-[3px] [&_.node-action]:inline-flex [&_.node-action]:items-center [&_.node-action]:gap-[5px] [&_.node-action]:py-[3px] [&_.node-action]:px-1.5 [&_.node-action]:text-sm [&_.node-action]:font-medium [&_.node-action]:text-text [&_.node-action]:rounded-sm [&_.node-action]:no-underline [&_.node-action:hover]:text-text [&_.node-action:hover]:bg-surface [&_.node-action-ext]:ms-auto [&_.node-action-ext]:py-[3px] [&_.node-action-ext]:px-[5px] ${live ? "live" : ""}`}
+      className={`exp-node w-66 border border-border rounded-md bg-background py-2.5 px-3 shadow-tree text-sm transition-[box-shadow] duration-120 ease-standard [&:hover]:shadow-tree-hover [&.live]:border-accent-teal [&.live]:shadow-tree-live [&_.node-overview-link]:block [&_.node-overview-link]:w-full [&_.node-overview-link]:p-0 [&_.node-overview-link]:border-0 [&_.node-overview-link]:bg-transparent [&_.node-overview-link]:text-inherit [&_.node-overview-link]:[font:inherit] [&_.node-overview-link]:text-start [&_.node-overview-link]:cursor-pointer [&_.node-overview-link:hover_.node-slug]:underline [&_.node-overview-link:hover_.node-slug]:underline-offset-[3px] [&_.node-overview-link:focus-visible]:outline-2 [&_.node-overview-link:focus-visible]:outline-solid [&_.node-overview-link:focus-visible]:outline-accent [&_.node-overview-link:focus-visible]:outline-offset-4 [&_.node-overview-link:focus-visible]:rounded-xs [&_.node-eyebrow]:flex [&_.node-eyebrow]:items-center [&_.node-eyebrow]:justify-between [&_.node-eyebrow]:gap-2 [&_.node-eyebrow]:mb-1.5 [&_.node-eyebrow]:text-xs [&_.node-eyebrow]:font-medium [&_.node-eyebrow]:text-muted [&_.node-head]:flex [&_.node-head]:items-center [&_.node-head]:gap-[7px] [&_.node-head]:min-w-0 [&_.node-status]:w-2 [&_.node-status]:h-2 [&_.node-status]:rounded-full [&_.node-status]:shrink-0 [&_.node-slug]:text-sm [&_.node-slug]:font-semibold [&_.node-slug]:text-text [&_.node-slug]:flex-1 [&_.node-slug]:min-w-0 [&_.node-slug]:overflow-hidden [&_.node-slug]:text-ellipsis [&_.node-slug]:whitespace-nowrap [&_.node-title]:mt-1 [&_.node-title]:text-text [&_.node-title]:text-sm [&_.node-title]:line-clamp-2 [&_.node-meta]:mt-2 [&_.node-meta]:flex [&_.node-meta]:items-center [&_.node-meta]:gap-2 [&_.node-meta]:text-xs [&_.node-meta]:text-muted [&_.node-actions]:mt-2 [&_.node-actions]:pt-1.5 [&_.node-actions]:border-t [&_.node-actions]:border-t-border-variant [&_.node-actions]:flex [&_.node-actions]:items-center [&_.node-actions]:gap-[3px] [&_.node-action]:inline-flex [&_.node-action]:items-center [&_.node-action]:gap-[5px] [&_.node-action]:py-[3px] [&_.node-action]:px-1.5 [&_.node-action]:text-sm [&_.node-action]:font-medium [&_.node-action]:text-text [&_.node-action]:rounded-sm [&_.node-action]:no-underline [&_.node-action:hover]:text-text [&_.node-action:hover]:bg-surface [&_.node-action-ext]:ms-auto [&_.node-action-ext]:py-[3px] [&_.node-action-ext]:px-[5px] ${live ? "live" : ""} ${exp.archived ? "opacity-80" : ""}`}
       onMouseEnter={hover.onMouseEnter}
       onMouseLeave={hover.onMouseLeave}
     >
@@ -214,7 +216,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
         )}
       >
         <div className="node-eyebrow">
-          <span>{kind}</span>
+          <span>{exp.archived ? m.tree_archived() : kind}</span>
           <StatusBadge status={status ?? "idle"} />
         </div>
         <div className="node-head">
@@ -266,6 +268,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           <FolderTree size={13} />
           {m.tree_view_code()}
         </button>
+        <ArchiveMenu id={exp.id} name={exp.slug} hasParent={Boolean(exp.parentExperimentId)} onArchive={onArchive} compact />
         {/* Icon-only: labeled actions + the link overflow the card's fixed width. */}
         {githubOwner && githubRepo && <a
           className="node-action node-action-ext"
@@ -345,16 +348,21 @@ const elidedEdgeStyle = { ...defaultEdgeOptions.style, strokeDasharray: "4 4" };
 
 export function TreeView({
   experiments,
+  hasArchivedExperiments,
+  allExperiments,
   runs,
   project,
   onOpenView,
   onOpenCode,
+  onArchive,
   agentSessionId,
   onShowProjectScope,
   viewport,
   onViewportChange,
 }: {
   experiments: Experiment[];
+  hasArchivedExperiments: boolean;
+  allExperiments: Experiment[];
   runs: Run[];
   /** Owning project — supplies owner/repo for the GitHub branch links. */
   project: Project;
@@ -367,6 +375,7 @@ export function TreeView({
     view: CodeView,
     intent: TabOpenIntent,
   ) => void;
+  onArchive: (id: string, direction: "up" | "down", archived: boolean) => void;
   /** Current task scope: show only this chat session's experiments, eliding the rest.
    * Null = Entire project scope (the whole forest). */
   agentSessionId: string | null;
@@ -392,7 +401,7 @@ export function TreeView({
     const isMine = (n: TreeNode) =>
       !agentSessionId || n.exp.chatSessionId === agentSessionId;
     const roots = elideForeignRegions(buildForest(experiments), isMine);
-    const slugById = new Map(experiments.map((e) => [e.id, e.slug]));
+    const slugById = new Map(allExperiments.map((e) => [e.id, e.slug]));
 
     function layout(node: DisplayNode, cx: number, y: number) {
       const x = cx - nodeWidth(node) / 2;
@@ -414,6 +423,7 @@ export function TreeView({
             githubRepo: project.githubEnabled ? project.githubRepo : "",
             onOpenView,
             onOpenCode,
+            onArchive,
           },
         });
       } else {
@@ -453,9 +463,11 @@ export function TreeView({
     return { nodes, edges };
   }, [
     experiments,
+    allExperiments,
     runs,
     onOpenView,
     onOpenCode,
+    onArchive,
     project.githubOwner,
     project.githubRepo,
     project.githubEnabled,
@@ -466,8 +478,8 @@ export function TreeView({
   if (experiments.length === 0) {
     return (
       <div className={EMPTY_STATE_CLASS_NAME}>
-        <p className="empty-state-title">{m.tree_view_no_experiments_yet()}</p>
-        <p className="empty-state-hint">{m.tree_view_ask_the_agent_in_chat_to_create_and()}</p>
+        <p className="empty-state-title">{hasArchivedExperiments ? m.tree_all_experiments_archived() : m.tree_view_no_experiments_yet()}</p>
+        {!hasArchivedExperiments && <p className="empty-state-hint">{m.tree_view_ask_the_agent_in_chat_to_create_and()}</p>}
       </div>
     );
   }
@@ -476,10 +488,8 @@ export function TreeView({
   if (nodes.length === 0 && agentSessionId) {
     return (
       <div className={EMPTY_STATE_CLASS_NAME}>
-        <p className="empty-state-title">{m.tree_view_no_experiments_from_the_current_task_yet()}</p>
-        <p className="empty-state-hint">
-          {m.tree_view_ask_in_this_task_to_create_one_or()}
-        </p>
+        <p className="empty-state-title">{hasArchivedExperiments ? m.tree_all_experiments_archived() : m.tree_view_no_experiments_from_the_current_task_yet()}</p>
+        {!hasArchivedExperiments && <p className="empty-state-hint">{m.tree_view_ask_in_this_task_to_create_one_or()}</p>}
       </div>
     );
   }

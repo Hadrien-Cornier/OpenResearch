@@ -4,6 +4,8 @@
 //!   orx exp run    <expId> …          launch a local orx-supervised run
 //!   orx exp cancel <expId>            cancel the in-flight run
 //!   orx exp wake   <expId>            resume this agent when the run succeeds or fails
+//!   orx exp archive <expId> --up|--down   hide ancestors or the selected subtree
+//!   orx exp unarchive <expId> --up|--down restore the same nodes
 //!
 //! Unlike the project-scoped data commands, every verb here takes an
 //! *experiment* id from `orx project view <projectId>`.
@@ -16,8 +18,10 @@ use crate::store::Store;
 use crate::ExpCommand;
 
 pub async fn run(args: crate::ExpArgs) -> Result<()> {
-    let store = Store::open()?;
+    let mut store = Store::open()?;
     match args.command {
+        ExpCommand::Archive { exp_id, up, .. } => archive(&mut store, &exp_id, up, true),
+        ExpCommand::Unarchive { exp_id, up, .. } => archive(&mut store, &exp_id, up, false),
         ExpCommand::Status { exp_id, scheduler } => {
             crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
@@ -45,6 +49,21 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
             interval,
         } => wait(store, exp_id, project, timeout, interval).await,
     }
+}
+
+fn archive(store: &mut Store, id: &str, up: bool, archived: bool) -> Result<()> {
+    let direction = if up {
+        crate::local::experiments::ArchiveDirection::Up
+    } else {
+        crate::local::experiments::ArchiveDirection::Down
+    };
+    let ids = crate::local::experiments::set_archived(store, id, direction, archived)?;
+    println!(
+        "{} {} experiment(s).",
+        if archived { "Archived" } else { "Restored" },
+        ids.len()
+    );
+    Ok(())
 }
 
 fn wake(store: &Store, exp_id: &str) -> Result<()> {

@@ -1231,5 +1231,14 @@
   "ssh_run_in": "Run in",
   "ssh_direct_host": "Direct host",
   "ssh_existing_container": "Existing container",
-  "ssh_container_reference": "Container name or ID"
+  "ssh_container_reference": "Container name or ID",
+  "app_show_archived_experiments": "Show archived",
+  "tree_archived": "Archived",
+  "tree_archive_manage_experiment": "Manage {name}",
+  "tree_archive_manage": "Manage",
+  "tree_archive_above": "Archive above",
+  "tree_archive_down": "Archive from here down",
+  "tree_restore_above": "Restore above",
+  "tree_restore_down": "Restore from here down",
+  "tree_all_experiments_archived": "All experiments are archived. Turn on Show archived to view them."
 }

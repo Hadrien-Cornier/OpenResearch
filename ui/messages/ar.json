@@ -1231,5 +1231,14 @@
   "ssh_run_in": "التشغيل في",
   "ssh_direct_host": "المضيف مباشرة",
   "ssh_existing_container": "حاوية موجودة",
-  "ssh_container_reference": "اسم الحاوية أو معرّفها"
+  "ssh_container_reference": "اسم الحاوية أو معرّفها",
+  "app_show_archived_experiments": "إظهار المؤرشف",
+  "tree_archived": "مؤرشف",
+  "tree_archive_manage_experiment": "إدارة {name}",
+  "tree_archive_manage": "إدارة",
+  "tree_archive_above": "أرشفة العقد أعلاه",
+  "tree_archive_down": "الأرشفة من هنا إلى الأسفل",
+  "tree_restore_above": "استعادة العقد أعلاه",
+  "tree_restore_down": "الاستعادة من هنا إلى الأسفل",
+  "tree_all_experiments_archived": "جميع التجارب مؤرشفة. فعّل إظهار المؤرشف لعرضها."
 }

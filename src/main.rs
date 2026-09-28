@@ -215,7 +215,12 @@ pub struct ProjectArgs {
 #[derive(Subcommand, Debug)]
 pub enum ProjectCommand {
     /// Show a local project's details and experiment tree.
-    View { project_id: String },
+    View {
+        project_id: String,
+        /// Include archived experiments in the listing.
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Edit a local project's name or run command.
     Edit {
@@ -405,6 +410,27 @@ pub struct ExpArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ExpCommand {
+    /// Hide ancestors of an experiment, or the experiment and its descendants.
+    /// A later no-parent create starts a new baseline if all roots are archived.
+    Archive {
+        exp_id: String,
+        /// Archive ancestors above the selected experiment (exclusive).
+        #[arg(long, conflicts_with = "down")]
+        up: bool,
+        /// Archive the selected experiment and descendants (default).
+        #[arg(long)]
+        down: bool,
+    },
+
+    /// Restore archived experiments using the same directional selection.
+    Unarchive {
+        exp_id: String,
+        #[arg(long, conflicts_with = "down")]
+        up: bool,
+        #[arg(long)]
+        down: bool,
+    },
+
     /// Show the experiment's status, run command, and latest run.
     Status {
         exp_id: String,

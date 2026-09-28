@@ -17,6 +17,7 @@ import {
 
 import { listChatSessionsQuery, getChatMessagesQuery } from "./queries/chat";
 import { listProjectsQuery, getUiStateQuery, listRunsQuery, listExperimentsQuery } from "./queries/projects";
+import { setExperimentArchived } from "./api";
 import { getArtifactsQuery } from "./queries/files";
 import { useBlocker, useRouter, useRouterState } from "@tanstack/react-router";
 import {
@@ -355,6 +356,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const artifacts = artifactsQuery.data ?? null;
 
   const [view, setView] = useState<ExperimentsView>("table");
+  const [showArchivedExperiments, setShowArchivedExperiments] = useState(false);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
   // Falls back to "project" whenever there is no usable experiment attribution.
   const [scope, setScope] = useState<"agent" | "project">("project");
@@ -368,6 +370,22 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (effectiveScope !== "agent") return experiments;
     return experiments.filter((experiment) => experiment.chatSessionId === activeSessionId);
   }, [experiments, effectiveScope, activeSessionId]);
+  const visibleExperiments = useMemo(
+    () => experiments.filter((experiment) => showArchivedExperiments || !experiment.archived),
+    [experiments, showArchivedExperiments],
+  );
+  const visibleScopedExperiments = useMemo(
+    () => scopedExperiments.filter((experiment) => showArchivedExperiments || !experiment.archived),
+    [scopedExperiments, showArchivedExperiments],
+  );
+  const archiveExperiment = useCallback(async (id: string, direction: "up" | "down", archived: boolean) => {
+    try {
+      await setExperimentArchived(id, direction, archived);
+      await queryClient.invalidateQueries({ queryKey: listExperimentsQuery(projectId).queryKey });
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : String(error), "error");
+    }
+  }, [projectId]);
   // Runs are scoped by their experiment's owner, not by which session launched them.
   const scopedRuns = useMemo(() => {
     if (effectiveScope !== "agent") return runs;
@@ -1752,6 +1770,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                 <div className="pane-toolbar flex shrink-0 flex-wrap items-center gap-2 bg-background px-3 pt-2.5 pb-2">
                   <span className="flex-1" />
                   <div className="experiments-toolbar-controls inline-flex items-center gap-[5px]">
+                    <label className="inline-flex items-center gap-1 text-sm text-subtext">
+                      <input type="checkbox" checked={showArchivedExperiments} onChange={(event) => setShowArchivedExperiments(event.target.checked)} />
+                      {m.app_show_archived_experiments()}
+                    </label>
                     <div className="option-picker relative inline-flex" ref={scopeMenuRef}>
                       <IconButton size="small"
                         ref={scopeTriggerRef}
@@ -1823,11 +1845,14 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                   {view === "tree" ? (
                     activeProject && (
                       <TreeView
-                        experiments={experiments}
+                        experiments={visibleExperiments}
+                        allExperiments={experiments}
+                        hasArchivedExperiments={scopedExperiments.length > 0 && visibleScopedExperiments.length === 0}
                         runs={scopedRuns}
                         project={activeProject}
                         onOpenView={openExperimentTab}
                         onOpenCode={openCodeTabForExperiment}
+                        onArchive={archiveExperiment}
                         agentSessionId={effectiveScope === "agent" ? activeSessionId : null}
                         onShowProjectScope={showProjectScope}
                         viewport={treeViewport}
@@ -1838,11 +1863,13 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                     <ExperimentsTable
                       runs={scopedRuns}
                       emptyHint={
-                        effectiveScope === "agent" && experiments.length > 0
+                        !showArchivedExperiments && scopedExperiments.length > 0 && visibleScopedExperiments.length === 0
+                          ? m.tree_all_experiments_archived()
+                          : effectiveScope === "agent" && experiments.length > 0
                           ? m.app_no_task_experiments()
                           : undefined
                       }
-                      experiments={scopedExperiments}
+                      experiments={visibleScopedExperiments}
                       onOpen={(experiment, intent) => {
                         openExperimentTab(experiment.id, "overview", intent);
                       }}
@@ -1859,6 +1886,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                             intent,
                           );
                       }}
+                      onArchive={archiveExperiment}
                       onCancel={cancelRun}
                     />
                   )}

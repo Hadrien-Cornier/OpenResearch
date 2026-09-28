@@ -453,6 +453,7 @@ impl Store {
                 created_at           INTEGER NOT NULL,
                 updated_at           INTEGER NOT NULL,
                 chat_session_id      TEXT,
+                archived             INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(project_id, slug)
             );
             DROP TABLE IF EXISTS local_reports;
@@ -608,6 +609,7 @@ impl Store {
             "ALTER TABLE local_projects ADD COLUMN github_sync_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE local_projects ADD COLUMN workspace_state_json TEXT",
             "ALTER TABLE local_experiments ADD COLUMN chat_session_id TEXT",
+            "ALTER TABLE local_experiments ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE ssh_host_tests ADD COLUMN tools_found INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE ssh_host_tests ADD COLUMN missing_tools TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE chat_run_wakeups ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'",
@@ -1524,7 +1526,7 @@ impl Store {
         }
         for experiment in experiments {
             tx.execute(
-                &format!("INSERT INTO local_experiments ({EXPERIMENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+                &format!("INSERT INTO local_experiments ({EXPERIMENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
                 params![
                     experiment.id,
                     experiment.project_id,
@@ -1538,6 +1540,7 @@ impl Store {
                     experiment.created_at,
                     experiment.updated_at,
                     experiment.chat_session_id,
+                    experiment.archived,
                 ],
             )?;
         }
@@ -1743,11 +1746,11 @@ impl Store {
 
     pub fn create_local_experiment(&self, e: &LocalExperiment) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO local_experiments ({EXPERIMENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            &format!("INSERT INTO local_experiments ({EXPERIMENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
             params![
                 e.id, e.project_id, e.parent_experiment_id, e.slug, e.branch_name,
                 e.title, e.description, e.run_command, e.agent_status, e.created_at, e.updated_at,
-                e.chat_session_id,
+                e.chat_session_id, e.archived,
             ],
         )?;
         Ok(())
@@ -1788,6 +1791,26 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn set_experiments_archived(
+        &mut self,
+        ids: &[String],
+        archived: bool,
+    ) -> Result<Vec<String>> {
+        let tx = self.conn.transaction()?;
+        let mut changed = Vec::new();
+        for id in ids {
+            let rows = tx.execute(
+                "UPDATE local_experiments SET archived = ?2, updated_at = MAX(updated_at + 1, ?3) WHERE id = ?1 AND archived != ?2",
+                params![id, archived, now_ms()],
+            )?;
+            if rows > 0 {
+                changed.push(id.clone());
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     // --- chat sessions / messages ------------------------------------------
@@ -3123,7 +3146,7 @@ const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, github_sy
 
 const EXPERIMENT_COLS: &str = "id, project_id, parent_experiment_id, slug, branch_name, \
                                title, description, run_command, agent_status, created_at, \
-                               updated_at, chat_session_id";
+                               updated_at, chat_session_id, archived";
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> std::result::Result<StoredRun, rusqlite::Error> {
     Ok(StoredRun {
@@ -5053,6 +5076,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             chat_session_id: chat_session_id.map(str::to_string),
+            archived: false,
         }
     }
 
