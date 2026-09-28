@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   chatImageTarget,
   firstCitedLine,
+  isCitedFileHref,
   isExternalMarkdownTarget,
   markdownTargetUrl,
   resolveMarkdownTarget,
@@ -91,7 +92,9 @@ test("file citations split off their line suffix", () => {
   assert.deepEqual(splitLineSuffix("src/foo.py#L42C3-L50C1"), { path: "src/foo.py", line: 42 });
   assert.deepEqual(splitLineSuffix("src/foo.py"), { path: "src/foo.py" });
   assert.deepEqual(splitLineSuffix("docs/guide.md#setup"), { path: "docs/guide.md#setup" });
+  assert.deepEqual(splitLineSuffix("C:/repo/foo.py"), { path: "C:/repo/foo.py" });
   assert.deepEqual(splitLineSuffix("C:/repo/foo.py:42"), { path: "C:/repo/foo.py", line: 42 });
+  assert.deepEqual(splitLineSuffix("foo.py:0"), { path: "foo.py" });
   assert.deepEqual(splitLineSuffix("#L42"), { path: "#L42" });
 });
 
@@ -107,4 +110,13 @@ test("cited line ranges resolve to their first line", () => {
   assert.equal(firstCitedLine("L20-L40"), 20);
   assert.equal(firstCitedLine("x"), undefined);
   assert.equal(firstCitedLine("-5"), undefined);
+});
+
+test("the sanitizer keeps cited file hrefs but not unsafe schemes", () => {
+  assert.equal(isCitedFileHref("foo.py:42"), true);
+  assert.equal(isCitedFileHref("src/foo.py#L42"), true);
+  assert.equal(isCitedFileHref("foo.py"), false);
+  assert.equal(isCitedFileHref("javascript:1"), false);
+  assert.equal(isCitedFileHref("javascript:x.y:1"), false);
+  assert.equal(isCitedFileHref("data:a.b:1"), false);
 });

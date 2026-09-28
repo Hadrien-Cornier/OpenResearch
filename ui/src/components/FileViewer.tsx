@@ -530,8 +530,11 @@ export function FileViewer({
       }
       else if (!conflict && current.conflict) updateEditState({ ...current, conflict: null });
     }
-    // Also reseeds a buffer reverted to clean after a conflict, still on the old version.
-    if ((!current || (!isDirtyFileBuffer(current) && current.version !== next.file.version)) && next.source === "checkout" &&
+    // Reseeding only a lagging clean buffer lets this rerun on editState (a clean
+    // revert after a conflict) without looping.
+    const behind = !current || (!isDirtyFileBuffer(current)
+      && (current.version !== next.file.version || current.path !== next.file.path));
+    if (behind && next.source === "checkout" &&
       !next.file.notFound && !next.file.binary && !next.file.truncated && typeof next.file.version === "string") {
       updateEditState(createFileBuffer(next.file.path, next.file.content, next.file.version));
       setSaveError(null);

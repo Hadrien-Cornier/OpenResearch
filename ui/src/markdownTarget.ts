@@ -1,3 +1,5 @@
+import { defaultUrlTransform } from "react-markdown";
+
 export interface MarkdownTarget {
   path: string;
   query: string;
@@ -58,7 +60,15 @@ export function splitLineSuffix(target: string): { path: string; line?: number }
   const match = /^(.+?)(?::(\d+)(?:[:-]\d+)?|#L(\d+)(?:C\d+)?(?:-L?\d+(?:C\d+)?)?)$/.exec(target);
   // Without a `.` or `/` the prefix is a scheme or bare host (`tel:`, `localhost:3000`).
   if (!match || !/[./]/.test(match[1])) return { path: target };
-  return { path: match[1], line: Number(match[2] ?? match[3]) };
+  const line = Number(match[2] ?? match[3]);
+  return line > 0 ? { path: match[1], line } : { path: match[1] };
+}
+
+/** A cited `foo.py:42` href, which the sanitizer would read as an unknown
+ * `foo.py:` protocol; safe only when the path alone already passes it. */
+export function isCitedFileHref(href: string): boolean {
+  const cited = splitLineSuffix(href);
+  return cited.line != null && defaultUrlTransform(cited.path) === cited.path;
 }
 
 /** First line of a `<file lines=…>` value: "20", "20-40", or "L20-L40". */

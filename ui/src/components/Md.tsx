@@ -25,7 +25,7 @@ import { normalizeMarkdownForRendering } from "../markdownNormalization";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { Button, IconButton, IconButtonLink } from "./ui";
 import { absoluteFileUrl, artifactUrl, projectFileUrl } from "../api";
-import { chatImageTarget, firstCitedLine, isWindowsDrivePath, splitLineSuffix } from "../markdownTarget";
+import { chatImageTarget, firstCitedLine, isCitedFileHref, isWindowsDrivePath, splitLineSuffix } from "../markdownTarget";
 
 const ImageResolverContext = createContext<((src: string, fallback?: boolean) => string | null) | undefined>(undefined);
 
@@ -279,10 +279,8 @@ function rehypeSafeUrls() {
       for (const key of ["href", "src"]) {
         if (node.properties && Object.hasOwn(node.properties, key)) {
           const value = String(node.properties[key] || "");
-          // `foo.py:42` would otherwise read as an unknown `foo.py:` protocol.
-          const cited = key === "href" ? splitLineSuffix(value) : null;
           const keepRaw = (key === "src" && node.tagName === "img" && isWindowsDrivePath(value))
-            || (cited?.line != null && defaultUrlTransform(cited.path) === cited.path);
+            || (key === "href" && isCitedFileHref(value));
           node.properties[key] = keepRaw ? value : defaultUrlTransform(value);
         }
       }
