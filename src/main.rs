@@ -215,7 +215,12 @@ pub struct ProjectArgs {
 #[derive(Subcommand, Debug)]
 pub enum ProjectCommand {
     /// Show a local project's details and experiment tree.
-    View { project_id: String },
+    View {
+        project_id: String,
+        /// Include archived experiments in the listing.
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Edit a local project's name or run command.
     Edit {
@@ -396,6 +401,37 @@ pub struct ExpArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ExpCommand {
+    /// Hide ancestors, the selected experiment, or descendants.
+    /// A later no-parent create starts a new baseline if all roots are archived.
+    #[command(group(clap::ArgGroup::new("archive_scope").required(true)))]
+    Archive {
+        exp_id: String,
+        /// Archive ancestors, excluding the selected experiment.
+        #[arg(long, group = "archive_scope")]
+        ancestors: bool,
+        /// Archive only the selected experiment.
+        #[arg(long, group = "archive_scope")]
+        only: bool,
+        /// Archive descendants, excluding the selected experiment.
+        #[arg(long, group = "archive_scope")]
+        descendants: bool,
+    },
+
+    /// Restore archived experiments using the same scopes.
+    #[command(group(clap::ArgGroup::new("unarchive_scope").required(true)))]
+    Unarchive {
+        exp_id: String,
+        /// Restore ancestors, excluding the selected experiment.
+        #[arg(long, group = "unarchive_scope")]
+        ancestors: bool,
+        /// Restore only the selected experiment.
+        #[arg(long, group = "unarchive_scope")]
+        only: bool,
+        /// Restore descendants, excluding the selected experiment.
+        #[arg(long, group = "unarchive_scope")]
+        descendants: bool,
+    },
+
     /// Show the experiment's status, run command, and latest run.
     Status {
         exp_id: String,

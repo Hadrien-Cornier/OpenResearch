@@ -86,6 +86,7 @@ export interface Experiment {
   updatedAt: number;
   /** Chat session that created this experiment; null for dashboard/legacy rows. */
   chatSessionId?: string | null;
+  archived: boolean;
 }
 
 export type RunStatus = "starting" | "running" | "done" | "failed" | "cancelled";
@@ -372,6 +373,9 @@ export const listExperiments = (projectId: string, signal?: AbortSignal) =>
   get<{ experiments: Experiment[] }>(`/api/projects/${projectId}/experiments`, signal).then(
     (r) => r.experiments,
   );
+
+export const setExperimentArchived = (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) =>
+  patch<{ ids: string[] }>(`/api/experiments/${id}/archive`, { direction, archived });
 
 export const listRuns = (projectId: string, signal?: AbortSignal) =>
   get<{ runs: Run[] }>(`/api/projects/${projectId}/runs`, signal).then((r) => r.runs);

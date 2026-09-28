@@ -350,44 +350,125 @@ mod instance {
 /// forward, and exits.
 #[cfg(all(desktop_app, target_os = "linux"))]
 mod instance {
+    use std::fs::{File, OpenOptions, TryLockError};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     /// `None` when the socket couldn't be bound: the app still runs, just
     /// without the one-instance guard.
     pub(super) struct FocusRequests(Option<UnixListener>);
 
-    fn socket_path() -> PathBuf {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+    /// Where the lock and socket live, and their name. Private to the user: in a
+    /// shared directory another user could hold the lock or create the socket first.
+    fn claim_paths() -> Option<(PathBuf, String)> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .filter(|dir| dir.is_absolute() && is_private(dir));
+        if let Some(dir) = runtime {
+            return Some((dir, "openresearch-app".to_string()));
+        }
+        // A home on NFS is shared across machines, and so would be a lock in it.
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
+        let dir = dirs::cache_dir()?.join("openresearch");
+        Some((dir, format!("openresearch-app-{}", host.trim())))
+    }
+
+    /// Owned by this user and writable by no one else, as the XDG spec requires
+    /// of `XDG_RUNTIME_DIR` and some containers ignore.
+    fn is_private(dir: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
         // SAFETY: getuid has no failure mode.
-        dir.join(format!("openresearch-app-{}.sock", unsafe {
-            libc::getuid()
-        }))
+        let uid = unsafe { libc::getuid() };
+        std::fs::metadata(dir).is_ok_and(|meta| meta.uid() == uid && meta.mode() & 0o022 == 0)
     }
 
     /// Claims the app for this process. `None` means another instance has it
     /// and was asked to come forward.
     pub(super) fn claim() -> Option<FocusRequests> {
-        let path = socket_path();
-        // The running app takes the connection itself as the request.
-        if UnixStream::connect(&path).is_ok() {
-            return None;
-        }
-        // Nothing answered, so a file there is left from an app that didn't
-        // exit cleanly (or one that exec'd itself into an update).
-        let _ = std::fs::remove_file(&path);
-        match UnixListener::bind(&path) {
-            Ok(listener) => Some(FocusRequests(Some(listener))),
+        let Some((dir, name)) = claim_paths() else {
+            eprintln!(
+                "openresearch app: found no private directory for the app lock; a second \
+                 launch will open another window"
+            );
+            return Some(FocusRequests(None));
+        };
+        claim_at(&dir, &name, Duration::from_secs(5))
+    }
+
+    fn claim_at(dir: &Path, name: &str, wait: Duration) -> Option<FocusRequests> {
+        let socket = dir.join(format!("{name}.sock"));
+        let lock_path = dir.join(format!("{name}.lock"));
+        let lock = std::fs::create_dir_all(dir)
+            .and_then(|()| {
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&lock_path)
+            })
+            .and_then(|file| take_lock(file, &socket, wait));
+        let lock = match lock {
+            Ok(Some(file)) => Some(file),
+            Ok(None) => return None,
+            Err(error) => {
+                eprintln!(
+                    "openresearch app: could not lock {}: {error}; two launches at once may \
+                     both open a window",
+                    lock_path.display()
+                );
+                // Unguarded, so only the socket can say whether an app is running.
+                if UnixStream::connect(&socket).is_ok() {
+                    return None;
+                }
+                None
+            }
+        };
+        // The lock (or, unguarded, the failed connect) says no app is listening, so a
+        // file there is left from one that didn't exit cleanly or exec'd into an update.
+        let _ = std::fs::remove_file(&socket);
+        match UnixListener::bind(&socket) {
+            Ok(listener) => {
+                // Held until exit, or the exec into an update: files are close-on-exec.
+                std::mem::forget(lock);
+                Some(FocusRequests(Some(listener)))
+            }
+            // The lock drops here, so a later launch opens a window rather than
+            // waiting on a socket that will never answer.
             Err(error) => {
                 eprintln!(
                     "openresearch app: could not bind {}: {error}; a second launch will open \
                      another window",
-                    path.display()
+                    socket.display()
                 );
                 Some(FocusRequests(None))
             }
+        }
+    }
+
+    /// The lock, or `None` once the app holding it was asked to come forward (or
+    /// never answered). Retries both: when two launch together, the winner may not
+    /// have bound its socket yet, or may give the lock up because it can't.
+    fn take_lock(file: File, socket: &Path, wait: Duration) -> std::io::Result<Option<File>> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(file)),
+                Err(TryLockError::Error(error)) => return Err(error),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            // The running app takes the connection itself as the request.
+            if UnixStream::connect(socket).is_ok() {
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "openresearch app: OpenResearch is already running but did not answer at {}",
+                    socket.display()
+                );
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -404,6 +485,45 @@ mod instance {
                     }
                 }
             });
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{claim_at, is_private};
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::time::Duration;
+
+        fn private_dir() -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("orx-instance-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        }
+
+        #[test]
+        fn a_second_launch_defers_to_the_running_app() {
+            let dir = private_dir();
+            let first = claim_at(&dir, "app", Duration::ZERO).expect("the first launch is the app");
+            assert!(first.0.is_some());
+            assert!(claim_at(&dir, "app", Duration::from_secs(1)).is_none());
+        }
+
+        #[test]
+        fn an_app_that_cannot_bind_leaves_the_next_launch_free() {
+            let dir = private_dir();
+            // Past sun_path's 108 bytes, so the bind fails after the lock is taken.
+            let name = "x".repeat(120);
+            let first = claim_at(&dir, &name, Duration::ZERO).expect("still runs");
+            assert!(first.0.is_none());
+            assert!(claim_at(&dir, &name, Duration::ZERO).is_some());
+        }
+
+        #[test]
+        fn only_a_directory_no_one_else_can_write_is_private() {
+            assert!(is_private(&private_dir()));
+            assert!(!is_private(Path::new("/tmp")));
         }
     }
 }

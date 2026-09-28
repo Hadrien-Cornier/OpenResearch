@@ -17,6 +17,7 @@ import {
 
 import { listChatSessionsQuery, getChatMessagesQuery } from "./queries/chat";
 import { listProjectsQuery, getUiStateQuery, listRunsQuery, listExperimentsQuery } from "./queries/projects";
+import { setExperimentArchived } from "./api";
 import { getArtifactsQuery } from "./queries/files";
 import { useBlocker, useRouter, useRouterState } from "@tanstack/react-router";
 import {
@@ -114,6 +115,7 @@ import { UpdateBanner, useUpdateStatus } from "./components/UpdateBanner";
 import { OfflineBanner } from "./components/OfflineBanner";
 import { NewProjectDialog } from "./components/ProjectsHome";
 import { ExperimentsTable } from "./components/ExperimentsTable";
+import { archiveActionsByExperiment } from "./components/ArchiveMenu";
 import { Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { DemoWelcomeModal } from "./components/Tour";
@@ -358,6 +360,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const artifacts = artifactsQuery.data ?? null;
 
   const [view, setView] = useState<ExperimentsView>("table");
+  const [showArchivedExperiments, setShowArchivedExperiments] = useState(false);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
   // Falls back to "project" whenever there is no usable experiment attribution.
   const [scope, setScope] = useState<"agent" | "project">("project");
@@ -371,6 +374,22 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (effectiveScope !== "agent") return experiments;
     return experiments.filter((experiment) => experiment.chatSessionId === activeSessionId);
   }, [experiments, effectiveScope, activeSessionId]);
+  const visibleScopedExperiments = useMemo(
+    () => scopedExperiments.filter((experiment) => showArchivedExperiments || !experiment.archived),
+    [scopedExperiments, showArchivedExperiments],
+  );
+  const archiveActions = useMemo(() => archiveActionsByExperiment(experiments), [experiments]);
+  const archiveExperiment = useCallback(async (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) => {
+    try {
+      await setExperimentArchived(id, direction, archived);
+      await queryClient.invalidateQueries({ queryKey: listExperimentsQuery(projectId).queryKey });
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : String(error), "error");
+    }
+  }, [projectId]);
+  const restoreArchivedRegion = useCallback((id: string) => {
+    void archiveExperiment(id, effectiveScope === "agent" ? "taskRegion" : "region", false);
+  }, [archiveExperiment, effectiveScope]);
   // Runs are scoped by their experiment's owner, not by which session launched them.
   const scopedRuns = useMemo(() => {
     if (effectiveScope !== "agent") return runs;
@@ -1797,6 +1816,17 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                             <span>{m.app_entire_project()}</span>
                             {effectiveScope === "project" && <Check size={13} />}
                           </MenuItem>
+                          <div className="my-1 border-t border-border-variant" />
+                          <MenuItem
+                            aria-pressed={showArchivedExperiments}
+                            onClick={() => {
+                              setShowArchivedExperiments((show) => !show);
+                              setScopeMenuOpen(false);
+                            }}
+                          >
+                            <span>{m.app_show_archived_experiments()}</span>
+                            {showArchivedExperiments && <Check size={13} />}
+                          </MenuItem>
                         </div>
                       )}
                     </div>
@@ -1827,25 +1857,32 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                     activeProject && (
                       <TreeView
                         experiments={experiments}
+                        archiveActions={archiveActions}
+                        showArchived={showArchivedExperiments}
                         runs={scopedRuns}
                         project={activeProject}
                         onOpenView={openExperimentTab}
                         onOpenCode={openCodeTabForExperiment}
+                        onArchive={archiveExperiment}
                         agentSessionId={effectiveScope === "agent" ? activeSessionId : null}
                         onShowProjectScope={showProjectScope}
+                        onRestoreRegion={restoreArchivedRegion}
                         viewport={treeViewport}
                         onViewportChange={setTreeViewport}
                       />
                     )
                   ) : (
                     <ExperimentsTable
+                      archiveActions={archiveActions}
                       runs={scopedRuns}
                       emptyHint={
-                        effectiveScope === "agent" && experiments.length > 0
+                        !showArchivedExperiments && scopedExperiments.length > 0 && visibleScopedExperiments.length === 0
+                          ? m.tree_all_experiments_archived()
+                          : effectiveScope === "agent" && experiments.length > 0
                           ? m.app_no_task_experiments()
                           : undefined
                       }
-                      experiments={scopedExperiments}
+                      experiments={visibleScopedExperiments}
                       onOpen={(experiment, intent) => {
                         openExperimentTab(experiment.id, "overview", intent);
                       }}
@@ -1862,6 +1899,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                             intent,
                           );
                       }}
+                      onArchive={archiveExperiment}
                       onCancel={cancelRun}
                     />
                   )}

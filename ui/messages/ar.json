@@ -513,6 +513,7 @@
   "tree_view_no_runs": "لا عمليات تشغيل",
   "tree_view_open_logs": "فتح السجلات",
   "tree_view_other_tasks": "مهام أخرى",
+  "tree_hidden_experiments": "مخفية",
   "tree_view_runs": "عمليات التشغيل",
   "tree_view_switch_to_entire_project_to_see_all_experiments": "بدّل إلى «المشروع بالكامل» لرؤية جميع التجارب",
   "update_banner_dismiss": "تجاهل",
@@ -1234,5 +1235,18 @@
   "ssh_run_in": "التشغيل في",
   "ssh_direct_host": "المضيف مباشرة",
   "ssh_existing_container": "حاوية موجودة",
-  "ssh_container_reference": "اسم الحاوية أو معرّفها"
+  "ssh_container_reference": "اسم الحاوية أو معرّفها",
+  "app_show_archived_experiments": "إظهار المؤرشف",
+  "tree_archived": "مؤرشف",
+  "tree_archived_count": "{count} مؤرشفة",
+  "tree_restore_archived_count": "استعادة {count} تجارب مؤرشفة",
+  "tree_archive_manage_experiment": "إدارة {name}",
+  "tree_archive_manage": "إدارة",
+  "tree_archive_only": "أرشفة هذه التجربة",
+  "tree_archive_above": "أرشفة الأسلاف",
+  "tree_archive_down": "أرشفة الفروع التابعة",
+  "tree_restore_only": "استعادة هذه التجربة",
+  "tree_restore_above": "استعادة الأسلاف المؤرشفين",
+  "tree_restore_down": "استعادة الفروع التابعة",
+  "tree_all_experiments_archived": "جميع التجارب مؤرشفة. فعّل إظهار المؤرشف لعرضها."
 }

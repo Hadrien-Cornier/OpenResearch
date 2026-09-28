@@ -510,6 +510,7 @@
   "tree_view_no_runs": "بدون اجرا",
   "tree_view_open_logs": "باز کردن گزارش‌ها",
   "tree_view_other_tasks": "وظایف دیگر",
+  "tree_hidden_experiments": "پنهان",
   "tree_view_runs": "اجراها",
   "tree_view_switch_to_entire_project_to_see_all_experiments": "برای دیدن همهٔ آزمایش‌ها به «کل پروژه» بروید",
   "update_banner_dismiss": "بستن",
@@ -1234,5 +1235,18 @@
   "ssh_run_in": "اجرا در",
   "ssh_direct_host": "مستقیماً روی میزبان",
   "ssh_existing_container": "کانتینر موجود",
-  "ssh_container_reference": "نام یا شناسهٔ کانتینر"
+  "ssh_container_reference": "نام یا شناسهٔ کانتینر",
+  "app_show_archived_experiments": "نمایش بایگانی‌شده‌ها",
+  "tree_archived": "بایگانی‌شده",
+  "tree_archived_count": "{count} بایگانی‌شده",
+  "tree_restore_archived_count": "بازیابی {count} آزمایش بایگانی‌شده",
+  "tree_archive_manage_experiment": "مدیریت {name}",
+  "tree_archive_manage": "مدیریت",
+  "tree_archive_only": "بایگانی این آزمایش",
+  "tree_archive_above": "بایگانی نیاکان",
+  "tree_archive_down": "بایگانی نوادگان",
+  "tree_restore_only": "بازیابی این آزمایش",
+  "tree_restore_above": "بازیابی نیاکان بایگانی‌شده",
+  "tree_restore_down": "بازیابی نوادگان",
+  "tree_all_experiments_archived": "همه آزمایش‌ها بایگانی شده‌اند. برای دیدنشان نمایش بایگانی‌شده‌ها را فعال کنید."
 }

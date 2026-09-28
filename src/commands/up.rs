@@ -510,6 +510,10 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/runs/{id}/logs", get(run_logs))
         .route("/api/runs/{id}/diff", get(run_diff))
         .route("/api/experiments/{id}/diff", get(experiment_diff))
+        .route(
+            "/api/experiments/{id}/archive",
+            axum::routing::patch(set_experiment_archive),
+        )
         .route("/api/experiments/{id}/commits", get(experiment_commits))
         .route(
             "/api/experiments/{id}/commits/{sha}/diff",
@@ -1942,6 +1946,37 @@ async fn list_experiments(Path(id): Path<String>) -> ApiResult {
         .ok_or_else(|| not_found("project"))?;
     let experiments = store.list_experiments_by_project(&id)?;
     Ok(Json(json!({ "experiments": experiments })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveExperimentRequest {
+    direction: String,
+    archived: bool,
+}
+
+async fn set_experiment_archive(
+    Path(id): Path<String>,
+    Json(request): Json<ArchiveExperimentRequest>,
+) -> ApiResult {
+    let direction = match request.direction.as_str() {
+        "ancestors" => local::experiments::ArchiveDirection::Ancestors,
+        "descendants" => local::experiments::ArchiveDirection::Descendants,
+        "only" => local::experiments::ArchiveDirection::Only,
+        "region" => local::experiments::ArchiveDirection::Region,
+        "taskRegion" => local::experiments::ArchiveDirection::TaskRegion,
+        _ => {
+            return Err(bad_request(
+                "direction must be ancestors, descendants, only, region, or taskRegion",
+            ))
+        }
+    };
+    let mut store = Store::open()?;
+    if store.get_local_experiment(&id)?.is_none() {
+        return Err(not_found("experiment"));
+    }
+    let ids = local::experiments::set_archived(&mut store, &id, direction, request.archived)?;
+    Ok(Json(json!({ "ids": ids })))
 }
 
 async fn list_project_runs(Path(id): Path<String>) -> ApiResult {
