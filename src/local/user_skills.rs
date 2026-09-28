@@ -785,19 +785,13 @@ pub fn write_into_session(worktree: &Path, skills_dir_rel: &str) -> Result<()> {
 
 fn write_into_session_in(root: &Path, worktree: &Path, skills_dir_rel: &str) -> Result<()> {
     let base = worktree.join(skills_dir_rel);
-    // No manifest at all — the agent can delete it — is the one case where a
-    // destination that already matches its source can be taken as ours, which is
-    // how that heals. While a manifest exists it is the whole truth about what
-    // we own, so a dir it doesn't name is the project's and stays unprunable.
-    let recorded = previously_managed(&base);
-    let adoptable = recorded.is_none();
-    let previous = recorded.unwrap_or_default();
+    let previous = previously_managed(&base).unwrap_or_default();
     let mut managed: Vec<String> = Vec::new();
     for (name, src) in source_dirs(root, &[]) {
         let src_tally = tally_all(&src);
         let dest = base.join(&name);
         let current = dest_matches_source(&src, src_tally, &dest);
-        if dest.exists() && !previous.contains(&name) && !(adoptable && current) {
+        if dest.exists() && !previous.contains(&name) {
             continue; // the project ships a skill by this name — it wins, untouched
         }
         if !current {
@@ -843,21 +837,37 @@ fn previously_managed(base: &Path) -> Option<Vec<String>> {
 
 /// Whether `dest` already holds this skill, so the turn can skip a full re-copy.
 /// Timestamps are no witness — macOS's `fs::copy` carries the source's mtime
-/// across and Linux's doesn't — so the comparison is the source's [`Tally`] plus
-/// a byte-identical `SKILL.md`. That misses an edit to a supporting file that
-/// preserves its length; `SKILL.md` is the file worth reading in full because it
-/// is the one an edit almost always touches.
+/// across and Linux's doesn't. Compare contents so supporting-file edits refresh.
 fn dest_matches_source(src: &Path, src_tally: Tally, dest: &Path) -> bool {
     if !dest.is_dir() || tally_all(dest) != src_tally {
         return false;
     }
-    match (
-        fs::read(src.join("SKILL.md")),
-        fs::read(dest.join("SKILL.md")),
-    ) {
-        (Ok(from), Ok(to)) => from == to,
-        _ => false,
-    }
+    let (Ok(from), Ok(to)) = (fs::read_dir(src), fs::read_dir(dest)) else {
+        return false;
+    };
+    let entries = |dir: fs::ReadDir| -> Option<Vec<fs::DirEntry>> {
+        let mut entries = dir.collect::<std::io::Result<Vec<_>>>().ok()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        Some(entries)
+    };
+    let (Some(from), Some(to)) = (entries(from), entries(to)) else {
+        return false;
+    };
+    from.len() == to.len()
+        && from.iter().zip(to.iter()).all(|(a, b)| {
+            if a.file_name() != b.file_name() {
+                return false;
+            }
+            match (a.file_type(), b.file_type()) {
+                (Ok(x), Ok(y)) if x.is_dir() && y.is_dir() => {
+                    dest_matches_source(&a.path(), tally_all(&a.path()), &b.path())
+                }
+                (Ok(x), Ok(y)) if x.is_file() && y.is_file() => {
+                    matches!((fs::read(a.path()), fs::read(b.path())), (Ok(x), Ok(y)) if x == y)
+                }
+                _ => false,
+            }
+        })
 }
 
 /// The tally of a folder we're about to mirror, or `None` when it blows the same
@@ -868,21 +878,77 @@ fn within_budget(dir: &Path) -> Option<Tally> {
 }
 
 /// Reference the selected skill without injecting its body.
-pub fn instructions(name: &str, harness: Option<&str>) -> Option<String> {
-    instructions_in(&root(), &native_skills(harness), name)
+pub fn instructions(
+    name: &str,
+    harness: Option<&str>,
+    worktree: Option<&Path>,
+    project_repo: Option<&Path>,
+) -> Option<String> {
+    let skills_dir = harness
+        .and_then(super::harness::chat_harness)
+        .and_then(|agent| agent.session_skills_dir());
+    let session_file = skills_dir
+        .and_then(|dir| worktree.map(|worktree| worktree.join(dir).join(name).join("SKILL.md")));
+    let project_file = skills_dir
+        .and_then(|dir| project_repo.map(|repo| repo.join(dir).join(name).join("SKILL.md")));
+    instructions_in(
+        &root(),
+        &native_skills(harness),
+        name,
+        session_file.as_deref(),
+        project_file.as_deref(),
+    )
 }
 
-fn instructions_in(root: &Path, mirrored: &[Mirrored], name: &str) -> Option<String> {
+fn instructions_in(
+    root: &Path,
+    mirrored: &[Mirrored],
+    name: &str,
+    session_file: Option<&Path>,
+    project_file: Option<&Path>,
+) -> Option<String> {
     source_dirs(root, mirrored)
         .into_iter()
         .find(|(n, ..)| n == name)
-        .map(|(name, dir)| {
+        .and_then(|(name, dir)| {
+            if dir == store_dir(root).join(&name) {
+                let source_file = dir.join("SKILL.md");
+                let selected = if let Some(session_file) = session_file {
+                    let target = session_file.parent()?;
+                    let base = target.parent()?;
+                    let owned = previously_managed(base)
+                        .is_some_and(|names| names.contains(&name));
+                    if target.exists() && !owned {
+                        return Some(format!(
+                            "Source collision for `{name}`: an upload and a project skill at `{}` share this name. Stop and report the collision; do not read or apply either skill.",
+                            session_file.display()
+                        ));
+                    }
+                    if !target.exists() && project_file.is_some_and(Path::exists) {
+                        return Some(format!(
+                            "Source collision for `{name}`: an upload and a project skill at `{}` share this name. Stop and report the collision; do not read or apply either skill.",
+                            project_file?.display()
+                        ));
+                    }
+                    if owned && dest_matches_source(&dir, tally_all(&dir), target) {
+                        session_file
+                    } else {
+                        source_file.as_path()
+                    }
+                } else {
+                    source_file.as_path()
+                };
+                return Some(format!(
+                    "Use the uploaded `{name}` skill at `{}`. Read that SKILL.md and follow it.",
+                    selected.display()
+                ));
+            }
             let native_name = mirrored
                 .iter()
                 .find(|skill| skill.dir == dir && skill.plugin)
                 .map(|skill| format!("{}:{name}", skill.origin))
                 .unwrap_or(name);
-            format!("Use the `{native_name}` skill.")
+            Some(format!("Use the `{native_name}` skill."))
         })
 }
 
@@ -1289,6 +1355,12 @@ mod tests {
         assert_eq!(list_in(&root, &mirrored).len(), 2);
         let dup = fs::read_to_string(wt.join(".claude/skills/dup/SKILL.md")).unwrap();
         assert!(dup.contains("UPLOADED"), "upload must shadow the mirror");
+        let session_file = wt.join(".claude/skills/dup/SKILL.md");
+        assert!(
+            instructions_in(&root, &mirrored, "dup", Some(&session_file), None)
+                .unwrap()
+                .contains(&session_file.display().to_string())
+        );
         assert!(
             !wt.join(".claude/skills/dup/extra.txt").exists(),
             "a shadowing upload must not keep the mirrored skill's files"
@@ -1329,7 +1401,7 @@ mod tests {
         assert!(!wt.join(".claude/skills/foreign/SKILL.md").exists());
         // Discovery remains independent of provisioning.
         assert_eq!(list_in(&root, &mirrored).len(), 2);
-        assert!(instructions_in(&root, &mirrored, "native").is_some());
+        assert!(instructions_in(&root, &mirrored, "native", None, None).is_some());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&agent_dir);
         let _ = fs::remove_dir_all(&wt);
@@ -1340,15 +1412,18 @@ mod tests {
         let root = temp_root();
         save_skill_md_in(&root, skill_md("greeter").as_bytes()).unwrap();
         assert_eq!(
-            instructions_in(&root, &[], "greeter").unwrap(),
-            "Use the `greeter` skill."
+            instructions_in(&root, &[], "greeter", None, None).unwrap(),
+            format!(
+                "Use the uploaded `greeter` skill at `{}`. Read that SKILL.md and follow it.",
+                store_dir(&root).join("greeter/SKILL.md").display()
+            )
         );
         assert_eq!(
             content_in(&root, &[], "greeter").unwrap(),
             "# greeter\nbody\n"
         );
         assert!(content_in(&root, &[], "../../etc/passwd").is_none());
-        assert!(instructions_in(&root, &[], "unknown").is_none());
+        assert!(instructions_in(&root, &[], "unknown", None, None).is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1466,7 +1541,26 @@ mod tests {
         fs::write(committed.join("SKILL.md"), "REPO COPY").unwrap();
         save_skill_md_in(&root, skill_md("code-review").as_bytes()).unwrap();
 
+        let pending = wt.join("new-session/.claude/skills/code-review/SKILL.md");
+        assert!(instructions_in(
+            &root,
+            &[],
+            "code-review",
+            Some(&pending),
+            Some(&committed.join("SKILL.md"))
+        )
+        .unwrap()
+        .contains("Source collision"));
         write_into_session_in(&root, &wt, rel).unwrap();
+        assert!(instructions_in(
+            &root,
+            &[],
+            "code-review",
+            Some(&committed.join("SKILL.md")),
+            None
+        )
+        .unwrap()
+        .contains("Source collision"));
         assert_eq!(
             fs::read_to_string(committed.join("SKILL.md")).unwrap(),
             "REPO COPY",
@@ -1480,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn a_matching_dir_is_adopted_only_when_the_manifest_is_gone() {
+    fn a_matching_project_skill_is_never_adopted() {
         let root = temp_root();
         let wt = temp_root();
         let rel = ".claude/skills";
@@ -1500,12 +1594,11 @@ mod tests {
             "a dir the manifest never claimed must not become prunable"
         );
 
-        // With no manifest at all we can't tell ours from theirs, so a dir that
-        // matches its source is taken as ours — that heals a deleted manifest.
+        // A missing manifest does not transfer ownership of a project skill.
         save_skill_md_in(&root, skill_md("shared").as_bytes()).unwrap();
         fs::remove_file(wt.join(rel).join(MANAGED_MANIFEST)).unwrap();
         write_into_session_in(&root, &wt, rel).unwrap();
-        assert!(previously_managed(&wt.join(rel))
+        assert!(!previously_managed(&wt.join(rel))
             .unwrap()
             .contains(&"shared".to_string()));
         let _ = fs::remove_dir_all(&root);
@@ -1541,6 +1634,24 @@ mod tests {
         assert!(fs::read_to_string(&written)
             .unwrap()
             .contains("something else"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn a_same_size_supporting_file_edit_refreshes_the_session_copy() {
+        let root = temp_root();
+        let wt = temp_root();
+        save_skill_md_in(&root, skill_md("updated").as_bytes()).unwrap();
+        let source = store_dir(&root).join("updated/reference.txt");
+        fs::write(&source, "old").unwrap();
+        write_into_session_in(&root, &wt, ".agents/skills").unwrap();
+        fs::write(&source, "new").unwrap();
+        write_into_session_in(&root, &wt, ".agents/skills").unwrap();
+        assert_eq!(
+            fs::read_to_string(wt.join(".agents/skills/updated/reference.txt")).unwrap(),
+            "new"
+        );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&wt);
     }
@@ -1644,7 +1755,7 @@ mod tests {
         write_into_session_in(&root, &wt, ".agents/skills").unwrap();
         assert!(!wt.join(".agents/skills/flash").exists());
         assert_eq!(
-            instructions_in(&root, &mirrored, "flash").unwrap(),
+            instructions_in(&root, &mirrored, "flash", None, None).unwrap(),
             "Use the `runpod:flash` skill."
         );
         let _ = fs::remove_dir_all(&root);
@@ -1694,7 +1805,7 @@ mod tests {
             source_dirs(&root, &[]),
             vec![("alpha".to_string(), root.join("global/alpha"))]
         );
-        assert!(instructions_in(&root, &[], "alpha").is_some());
+        assert!(instructions_in(&root, &[], "alpha", None, None).is_some());
         assert!(delete_in(&root, "alpha").is_ok());
         let _ = fs::remove_dir_all(&root);
     }
