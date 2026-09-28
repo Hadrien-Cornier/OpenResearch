@@ -1419,7 +1419,7 @@ mod tests {
             instructions_in(&root, &[], "greeter", None, None).unwrap(),
             format!(
                 "Use the uploaded `greeter` skill at `{}`. Read that SKILL.md and follow it.",
-                store_dir(&root).join("greeter/SKILL.md").display()
+                store_dir(&root).join("greeter").join("SKILL.md").display()
             )
         );
         assert_eq!(
@@ -1621,7 +1621,8 @@ mod tests {
         let upload = instructions_in(&root, &[], "shared", Some(&session_file), None).unwrap();
         assert!(upload.contains(
             &store_dir(&root)
-                .join("shared/SKILL.md")
+                .join("shared")
+                .join("SKILL.md")
                 .display()
                 .to_string()
         ));
