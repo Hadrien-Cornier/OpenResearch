@@ -371,7 +371,7 @@ const ArchivedNode = memo(function ArchivedNode({ data }: NodeProps<ArchivedFlow
       </button>
       <Handle type="source" position={Position.Bottom} />
       {menu.open && createPortal(
-        <div ref={menu.ref} className="option-menu fixed z-50 min-w-56 rounded-lg border border-border bg-background p-1.5 shadow-menu" style={position}>
+        <div ref={menu.ref} className="option-menu fixed z-70 min-w-56 rounded-lg border border-border bg-background p-1.5 shadow-menu" style={position}>
           <MenuItem onClick={() => {
             menu.setOpen(false);
             onRestoreRegion(rootId);

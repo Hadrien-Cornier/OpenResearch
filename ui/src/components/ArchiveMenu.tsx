@@ -116,7 +116,7 @@ export function ArchiveMenu({ id, name, actions, onArchive, compact = false }: {
         </button>
       )}
       {menu.open && createPortal(
-        <div ref={menu.ref} className="option-menu fixed z-50 min-w-44 rounded-lg border border-border bg-background p-1.5 shadow-menu" style={position}>
+        <div ref={menu.ref} className="option-menu fixed z-70 min-w-44 rounded-lg border border-border bg-background p-1.5 shadow-menu" style={position}>
           {actions.archiveAbove && <MenuItem onClick={() => choose("ancestors", true)}>{m.tree_archive_above()}</MenuItem>}
           {actions.archiveOnly && <MenuItem onClick={() => choose("only", true)}>{m.tree_archive_only()}</MenuItem>}
           {actions.archiveDown && <MenuItem onClick={() => choose("descendants", true)}>{m.tree_archive_down()}</MenuItem>}
