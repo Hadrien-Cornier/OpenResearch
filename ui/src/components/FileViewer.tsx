@@ -211,9 +211,6 @@ export function FileViewer({
   const fileQuery = useQuery({ ...fileOptions, enabled: !bufferSession.saving });
   const loaded = fileQuery.data ?? null;
   const error = fileQuery.error?.message ?? null;
-  // A reopened file renders its cached copy while it refetches; jumping then
-  // would land on that stale copy's line N and consume the request.
-  const lineRequest = fileQuery.isFetching ? undefined : lineScrollRequest;
   const setLoaded = (value: React.SetStateAction<LoadedFile | null>) => {
     setScopedQueryData(fileOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
   };
@@ -313,6 +310,11 @@ export function FileViewer({
   const draft = editState?.draft ?? normalizedFileContent(data?.content ?? "");
   const baseline = editState?.baseline ?? normalizedFileContent(data?.content ?? "");
   const dirty = editable && editState !== null && isDirtyFileBuffer(editState);
+  // A reopened file shows its cached copy (or clean buffer) until the refetch
+  // lands and reseeds it; jumping before then spends the request on stale lines.
+  const staleBuffer = editState !== null && !isDirtyFileBuffer(editState)
+    && typeof data?.version === "string" && editState.version !== data.version;
+  const settledLineScrollRequest = fileQuery.isFetching || staleBuffer ? undefined : lineScrollRequest;
 
   const save = async (expectedVersion?: string): Promise<boolean> => {
     const savingState = bufferSession.getSnapshot();
@@ -844,7 +846,7 @@ export function FileViewer({
             readOnly={showingUnsafeDraft}
             path={path}
             highlightLine={line}
-            scrollRequest={lineRequest}
+            scrollRequest={settledLineScrollRequest}
             onScrollRequestHandled={onLineScrollRequestHandled}
             scrollPosition={scrollPositionRef.current}
             onScrollPositionChange={(position) => {
@@ -915,7 +917,7 @@ export function FileViewer({
                 text={data.content}
                 path={path}
                 highlightLine={line}
-                scrollRequest={lineRequest}
+                scrollRequest={settledLineScrollRequest}
                 onScrollRequestHandled={onLineScrollRequestHandled}
               />
             </div>

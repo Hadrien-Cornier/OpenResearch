@@ -52,11 +52,12 @@ export function markdownTargetUrl(url: string, target: MarkdownTarget): string {
   return `${url}${target.query ? `&${target.query}` : ""}${target.hash}`;
 }
 
-/** Split a cited `path:42`, `path:42:7`, `path:42-50`, or `path#L42-L50` into
- * the path and its first line. */
+/** Split a cited `path:42`, `path:42:7`, `path:42-50`, or GitHub-style
+ * `path#L42[C3][-L50[C1]]` into the path and its first line. */
 export function splitLineSuffix(target: string): { path: string; line?: number } {
   const match = /^(.+?)(?::(\d+)(?:[:-]\d+)?|#L(\d+)(?:C\d+)?(?:-L?\d+(?:C\d+)?)?)$/.exec(target);
-  if (!match) return { path: target };
+  // Without a `.` or `/` the prefix is a scheme or host (`tel:`, `localhost:3000`).
+  if (!match || !/[./]/.test(match[1])) return { path: target };
   return { path: match[1], line: Number(match[2] ?? match[3]) };
 }
 

@@ -92,6 +92,13 @@ test("file citations split off their line suffix", () => {
   assert.deepEqual(splitLineSuffix("src/foo.py"), { path: "src/foo.py" });
   assert.deepEqual(splitLineSuffix("docs/guide.md#setup"), { path: "docs/guide.md#setup" });
   assert.deepEqual(splitLineSuffix("C:/repo/foo.py"), { path: "C:/repo/foo.py" });
+  assert.deepEqual(splitLineSuffix("#L42"), { path: "#L42" });
+});
+
+test("schemes and hosts are not mistaken for cited files", () => {
+  assert.deepEqual(splitLineSuffix("javascript:1"), { path: "javascript:1" });
+  assert.deepEqual(splitLineSuffix("tel:5551234"), { path: "tel:5551234" });
+  assert.deepEqual(splitLineSuffix("localhost:3000"), { path: "localhost:3000" });
 });
 
 test("cited line ranges resolve to their first line", () => {

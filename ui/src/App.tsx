@@ -263,9 +263,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const [lineJump, setLineJump] = useState(0);
   // The href and the jump bump can both land before the pane carrying the new
   // line, so keying on them alone spends the request on the previous line.
-  const paneKey = JSON.stringify(pane ?? null);
-  const lineVisit = useRef({ href: "", paneKey: "", jump: 0, value: 0 });
-  if (lineVisit.current.href !== location.href || lineVisit.current.paneKey !== paneKey || lineVisit.current.jump !== lineJump) lineVisit.current = { href: location.href, paneKey, jump: lineJump, value: lineVisit.current.value + 1 };
+  const visitKey = `${location.href}\n${JSON.stringify(pane ?? null)}\n${lineJump}`;
+  const lineVisit = useRef({ key: "", value: 0 });
+  if (lineVisit.current.key !== visitKey) lineVisit.current = { key: visitKey, value: lineVisit.current.value + 1 };
   const rightTab = useMemo<RightTab>(() => {
     const tab = pane ? paneTab(pane) : "experiments";
     return typeof tab === "object" && "path" in tab && tab.line && consumedLine !== lineVisit.current.value

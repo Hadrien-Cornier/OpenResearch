@@ -3,9 +3,9 @@ import { ltr } from "../i18n";
 import { useLocale } from "../locale";
 // Chat markdown with evidence mentions, mirroring openresearch.sh's
 // MarkdownContent: `<file path="..." lines="20-40"/>` tags (and plain relative
-// links) render as chips that open the file as a right-pane tab, and
-// `<run id="..."/>` tags render as chips that open a run's logs — so the agent
-// can cite the code and the run behind a claim.
+// links, with any `:42` or `#L42` line) render as chips that open the file as a
+// right-pane tab, and `<run id="..."/>` tags render as chips that open a run's
+// logs — so the agent can cite the code and the run behind a claim.
 
 import { Check, Copy, FileCode, PanelRight, ScrollText, X, Download, Minus, Plus } from "lucide-react";
 import { createContext, memo, useContext, useEffect, useMemo, useRef, useState, type ImgHTMLAttributes, type ReactNode } from "react";
@@ -281,9 +281,9 @@ function rehypeSafeUrls() {
           const value = String(node.properties[key] || "");
           // `foo.py:42` would otherwise read as an unknown `foo.py:` protocol.
           const cited = key === "href" ? splitLineSuffix(value) : null;
-          node.properties[key] = key === "src" && node.tagName === "img" && isWindowsDrivePath(value)
-            ? value
-            : cited?.line != null && defaultUrlTransform(cited.path) === cited.path ? value : defaultUrlTransform(value);
+          const keepRaw = (key === "src" && node.tagName === "img" && isWindowsDrivePath(value))
+            || (cited?.line != null && defaultUrlTransform(cited.path) === cited.path);
+          node.properties[key] = keepRaw ? value : defaultUrlTransform(value);
         }
       }
       node.children?.forEach(visit);
@@ -431,7 +431,7 @@ export const Md = memo(function Md({
   const components: Record<string, (props: any) => ReactNode> = useMemo(() => ({
     "file-mention": (props) => {
       const cited = splitLineSuffix(props.path);
-      const line = props.lines ? firstCitedLine(props.lines) : cited.line;
+      const line = (props.lines && firstCitedLine(props.lines)) || cited.line;
       return <FileChip path={cited.path} line={line} exp={props.exp} onOpenFile={onOpenFile} />;
     },
     "run-mention": (props) => (
