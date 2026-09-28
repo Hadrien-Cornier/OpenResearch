@@ -1964,9 +1964,10 @@ async fn set_experiment_archive(
         "descendants" => local::experiments::ArchiveDirection::Descendants,
         "only" => local::experiments::ArchiveDirection::Only,
         "region" => local::experiments::ArchiveDirection::Region,
+        "taskRegion" => local::experiments::ArchiveDirection::TaskRegion,
         _ => {
             return Err(bad_request(
-                "direction must be ancestors, descendants, only, or region",
+                "direction must be ancestors, descendants, only, region, or taskRegion",
             ))
         }
     };

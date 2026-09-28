@@ -70,6 +70,7 @@ pub enum ArchiveDirection {
     Descendants,
     Only,
     Region,
+    TaskRegion,
 }
 
 pub fn set_archived(
@@ -93,8 +94,13 @@ fn archive_ids(
 ) -> Vec<String> {
     match direction {
         ArchiveDirection::Only => vec![selected.id.clone()],
-        ArchiveDirection::Region => {
-            if !selected.archived {
+        ArchiveDirection::Region | ArchiveDirection::TaskRegion => {
+            let in_scope = |experiment: &LocalExperiment| {
+                !matches!(direction, ArchiveDirection::TaskRegion)
+                    || selected.chat_session_id.is_some()
+                        && experiment.chat_session_id == selected.chat_session_id
+            };
+            if !selected.archived || !in_scope(selected) {
                 return Vec::new();
             }
             let by_id: HashMap<_, _> = experiments.iter().map(|e| (e.id.as_str(), e)).collect();
@@ -104,7 +110,7 @@ fn archive_ids(
                 .as_deref()
                 .and_then(|id| by_id.get(id))
             {
-                if !parent.archived {
+                if !parent.archived || !in_scope(parent) {
                     break;
                 }
                 root = parent;
@@ -120,7 +126,11 @@ fn archive_ids(
             while let Some(experiment) = stack.pop() {
                 ids.push(experiment.id.clone());
                 if let Some(next) = children.get(experiment.id.as_str()) {
-                    stack.extend(next.iter().copied().filter(|child| child.archived));
+                    stack.extend(
+                        next.iter()
+                            .copied()
+                            .filter(|child| child.archived && in_scope(child)),
+                    );
                 }
             }
             ids
@@ -347,6 +357,33 @@ mod tests {
         assert!(ids.contains(&"root".to_string()));
         assert!(ids.contains(&"selected".to_string()));
         assert!(ids.contains(&"sibling".to_string()));
+    }
+
+    #[test]
+    fn task_region_does_not_restore_other_sessions() {
+        let mut foreign_root = experiment(None, "foreign-root");
+        foreign_root.archived = true;
+        foreign_root.chat_session_id = Some("other".into());
+        let mut selected = experiment(Some(&foreign_root.id), "selected");
+        selected.id = "selected".into();
+        selected.archived = true;
+        selected.chat_session_id = Some("mine".into());
+        let mut mine = experiment(Some(&selected.id), "mine");
+        mine.id = "mine".into();
+        mine.archived = true;
+        mine.chat_session_id = Some("mine".into());
+        let mut foreign_sibling = experiment(Some(&foreign_root.id), "foreign-sibling");
+        foreign_sibling.id = "foreign-sibling".into();
+        foreign_sibling.archived = true;
+        foreign_sibling.chat_session_id = Some("other".into());
+        let ids = archive_ids(
+            &[foreign_root, selected.clone(), mine, foreign_sibling],
+            &selected,
+            ArchiveDirection::TaskRegion,
+        );
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"selected".to_string()));
+        assert!(ids.contains(&"mine".to_string()));
     }
 
     #[test]

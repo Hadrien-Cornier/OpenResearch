@@ -376,7 +376,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [scopedExperiments, showArchivedExperiments],
   );
   const archiveActions = useMemo(() => archiveActionsByExperiment(experiments), [experiments]);
-  const archiveExperiment = useCallback(async (id: string, direction: "ancestors" | "descendants" | "only" | "region", archived: boolean) => {
+  const archiveExperiment = useCallback(async (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) => {
     try {
       await setExperimentArchived(id, direction, archived);
       await queryClient.invalidateQueries({ queryKey: listExperimentsQuery(projectId).queryKey });
@@ -385,8 +385,8 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     }
   }, [projectId]);
   const restoreArchivedRegion = useCallback((id: string) => {
-    void archiveExperiment(id, "region", false);
-  }, [archiveExperiment]);
+    void archiveExperiment(id, effectiveScope === "agent" ? "taskRegion" : "region", false);
+  }, [archiveExperiment, effectiveScope]);
   // Runs are scoped by their experiment's owner, not by which session launched them.
   const scopedRuns = useMemo(() => {
     if (effectiveScope !== "agent") return runs;

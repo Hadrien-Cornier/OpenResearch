@@ -374,7 +374,7 @@ export const listExperiments = (projectId: string, signal?: AbortSignal) =>
     (r) => r.experiments,
   );
 
-export const setExperimentArchived = (id: string, direction: "ancestors" | "descendants" | "only" | "region", archived: boolean) =>
+export const setExperimentArchived = (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) =>
   patch<{ ids: string[] }>(`/api/experiments/${id}/archive`, { direction, archived });
 
 export const listRuns = (projectId: string, signal?: AbortSignal) =>
