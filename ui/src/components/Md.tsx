@@ -25,7 +25,7 @@ import { normalizeMarkdownForRendering } from "../markdownNormalization";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { Button, IconButton, IconButtonLink } from "./ui";
 import { absoluteFileUrl, artifactUrl, projectFileUrl } from "../api";
-import { chatImageTarget, firstCitedLine, isCitedFileHref, isWindowsDrivePath, splitLineSuffix } from "../markdownTarget";
+import { chatImageTarget, firstCitedLine, isWindowsDrivePath, splitLineSuffix } from "../markdownTarget";
 
 const ImageResolverContext = createContext<((src: string, fallback?: boolean) => string | null) | undefined>(undefined);
 
@@ -279,9 +279,11 @@ function rehypeSafeUrls() {
       for (const key of ["href", "src"]) {
         if (node.properties && Object.hasOwn(node.properties, key)) {
           const value = String(node.properties[key] || "");
-          const keepRaw = (key === "src" && node.tagName === "img" && isWindowsDrivePath(value))
-            || (key === "href" && isCitedFileHref(value));
-          node.properties[key] = keepRaw ? value : defaultUrlTransform(value);
+          // `Makefile:42` reads as an unknown protocol and is blanked, so the chip
+          // renderer gets the cited target out of band, never as a live href.
+          if (key === "href" && splitLineSuffix(value).line != null) node.properties["data-cited-href"] = value;
+          node.properties[key] = key === "src" && node.tagName === "img" && isWindowsDrivePath(value)
+            ? value : defaultUrlTransform(value);
         }
       }
       node.children?.forEach(visit);
@@ -435,7 +437,7 @@ export const Md = memo(function Md({
     "run-mention": (props) => (
       <RunChip id={props.id} label={props.label} onOpenRun={onOpenRun} />
     ),
-    a: ({ node: _node, href, children, "data-figure-src": figureSrc, ...rest }) => {
+    a: ({ node: _node, href, children, "data-figure-src": figureSrc, "data-cited-href": citedHref, ...rest }) => {
       const figure = typeof figureSrc === "string" ? chatImageTarget(figureSrc) : null;
       if (figure && onOpenFile) {
         const localPath = figure.source === "artifact" ? `artifacts/${figure.path}` : figure.path;
@@ -447,7 +449,8 @@ export const Md = memo(function Md({
       }
       // Agents sometimes link files as plain markdown links; open those as
       // file tabs instead of navigating the dashboard away.
-      const cited = href ? splitLineSuffix(href) : null;
+      const target = typeof citedHref === "string" ? citedHref : href;
+      const cited = target ? splitLineSuffix(target) : null;
       if (cited && isFileHref(cited.path) && onOpenFile) {
         let decoded: string;
         try {

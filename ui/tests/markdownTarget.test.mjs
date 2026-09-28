@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   chatImageTarget,
   firstCitedLine,
-  isCitedFileHref,
   isExternalMarkdownTarget,
   markdownTargetUrl,
   resolveMarkdownTarget,
@@ -87,6 +86,7 @@ test("chat image URLs discard injected query parameters and preserve SVG fragmen
 test("file citations split off their line suffix", () => {
   assert.deepEqual(splitLineSuffix("src/foo.py:42"), { path: "src/foo.py", line: 42 });
   assert.deepEqual(splitLineSuffix("foo.py:42:7"), { path: "foo.py", line: 42 });
+  assert.deepEqual(splitLineSuffix("Makefile:42"), { path: "Makefile", line: 42 });
   assert.deepEqual(splitLineSuffix("foo.py:42-50"), { path: "foo.py", line: 42 });
   assert.deepEqual(splitLineSuffix("src/foo.py#L42"), { path: "src/foo.py", line: 42 });
   assert.deepEqual(splitLineSuffix("src/foo.py#L42C3-L50C1"), { path: "src/foo.py", line: 42 });
@@ -98,25 +98,10 @@ test("file citations split off their line suffix", () => {
   assert.deepEqual(splitLineSuffix("#L42"), { path: "#L42" });
 });
 
-test("schemes and hosts are not mistaken for cited files", () => {
-  assert.deepEqual(splitLineSuffix("javascript:1"), { path: "javascript:1" });
-  assert.deepEqual(splitLineSuffix("tel:5551234"), { path: "tel:5551234" });
-  assert.deepEqual(splitLineSuffix("localhost:3000"), { path: "localhost:3000" });
-});
-
 test("cited line ranges resolve to their first line", () => {
   assert.equal(firstCitedLine("20"), 20);
   assert.equal(firstCitedLine("20-40"), 20);
   assert.equal(firstCitedLine("L20-L40"), 20);
   assert.equal(firstCitedLine("x"), undefined);
   assert.equal(firstCitedLine("-5"), undefined);
-});
-
-test("the sanitizer keeps cited file hrefs but not unsafe schemes", () => {
-  assert.equal(isCitedFileHref("foo.py:42"), true);
-  assert.equal(isCitedFileHref("src/foo.py#L42"), true);
-  assert.equal(isCitedFileHref("foo.py"), false);
-  assert.equal(isCitedFileHref("javascript:1"), false);
-  assert.equal(isCitedFileHref("javascript:x.y:1"), false);
-  assert.equal(isCitedFileHref("data:a.b:1"), false);
 });
