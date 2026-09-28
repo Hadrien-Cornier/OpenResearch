@@ -845,13 +845,15 @@ fn dest_matches_source(src: &Path, src_tally: Tally, dest: &Path) -> bool {
     let (Ok(from), Ok(to)) = (fs::read_dir(src), fs::read_dir(dest)) else {
         return false;
     };
-    let entries = |dir: fs::ReadDir| -> Option<Vec<fs::DirEntry>> {
+    let entries = |dir: fs::ReadDir, source: bool| -> Option<Vec<fs::DirEntry>> {
         let mut entries = dir.collect::<std::io::Result<Vec<_>>>().ok()?;
-        entries.retain(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()));
+        if source {
+            entries.retain(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()));
+        }
         entries.sort_by_key(|entry| entry.file_name());
         Some(entries)
     };
-    let (Some(from), Some(to)) = (entries(from), entries(to)) else {
+    let (Some(from), Some(to)) = (entries(from, true), entries(to, false)) else {
         return false;
     };
     from.len() == to.len()
@@ -1650,6 +1652,12 @@ mod tests {
         std::os::unix::fs::symlink("SKILL.md", source.join("alias.md")).unwrap();
         write_into_session_in(&root, &wt, ".claude/skills").unwrap();
         assert!(dest_matches_source(
+            &source,
+            tally_all(&source),
+            &wt.join(".claude/skills/linked")
+        ));
+        std::os::unix::fs::symlink("SKILL.md", wt.join(".claude/skills/linked/alias.md")).unwrap();
+        assert!(!dest_matches_source(
             &source,
             tally_all(&source),
             &wt.join(".claude/skills/linked")
