@@ -504,7 +504,7 @@ function HarnessesTab({ remote }: { remote: boolean }) {
                 ? m.onboarding_checking()
                 : h.models.length > 0
                 ? m.settings_models_available({ count: fmtNumber(h.models.length), models: new Intl.ListFormat(getLocale()).format(h.models.slice(0, 4).map((model) => ltr(harnessModelLabel(model)))) })
-                : m.settings_none()}
+                : h.agentReady ? m.model_picker_default_model() : m.settings_none()}
             </span>
           </div>
           <RunnableNote
@@ -2647,6 +2647,7 @@ function AppearanceTab() {
 const CHANNEL_LABELS: Record<InstallChannel, () => string> = {
   installer: m.updates_channel_installer,
   "app-bundle": m.updates_channel_app,
+  appimage: m.updates_channel_appimage,
   portable: m.updates_channel_portable,
   cargo: m.updates_channel_cargo,
   homebrew: m.updates_channel_homebrew,

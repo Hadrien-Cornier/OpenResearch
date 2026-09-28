@@ -822,8 +822,8 @@ export const saveTinkerKey = (key: string) => post<TinkerSettings>("/api/setting
 
 // --- updates ------------------------------------------------------------------
 
-/** How orx was installed. `installer`, `app-bundle` and `portable` update themselves. */
-export type InstallChannel = "installer" | "app-bundle" | "portable" | "cargo" | "homebrew" | "nix" | "unknown";
+/** How orx was installed. `installer`, `app-bundle`, `appimage` and `portable` update themselves. */
+export type InstallChannel = "installer" | "app-bundle" | "appimage" | "portable" | "cargo" | "homebrew" | "nix" | "unknown";
 
 export interface UpdateStatus {
   current: string;
@@ -1502,8 +1502,7 @@ export interface HarnessModel {
    * directly.
    */
   reasoningLevels?: OptionChoice[];
-  /** The catalog's own human name ("Opus", "GPT-5.6 Sol"). Absent on
-   * statically-listed fallback models — derive from the id then. */
+  /** The catalog's own human name ("Opus", "GPT-5.6 Sol"). */
   displayName?: string;
   /** The catalog's one-line blurb. For Claude this carries the resolved
    * version ("Opus 4.8 with 1M context · …") — its aliases don't. */
@@ -1671,7 +1670,7 @@ export interface Harness {
    * queueing. Narrowed per installation (codex's legacy exec path can't). */
   supportsSteering: boolean;
   /** A snapshot answer whose model catalog is still filling in the
-   * background — `models` is the static placeholder until `harness.catalog`
+   * background — `models` stays empty until `harness.catalog`
    * arrives and a plain re-read swaps in the real list. */
   catalogPending?: boolean;
   models: HarnessModel[];

@@ -835,9 +835,9 @@ pub struct PaperArgs {
     pub full: bool,
 }
 
-// The default multi-thread runtime is load-bearing for macOS app mode: it blocks
-// the main thread in the AppKit run loop while the dashboard server runs on
-// worker threads. A `current_thread` flavor would deadlock. See commands::app.
+// The default multi-thread runtime is load-bearing for desktop app mode: it
+// blocks the main thread in the window's run loop while the dashboard server runs
+// on worker threads. A `current_thread` flavor would deadlock. See commands::app.
 #[tokio::main]
 async fn main() {
     #[cfg(windows)]
@@ -846,7 +846,7 @@ async fn main() {
         updates::remove_retired_exes();
     }
     // Double-clicked as the macOS .app? Enter GUI app mode (Dock icon, dashboard
-    // server, browser) instead of parsing CLI args. Also require an empty argv so
+    // server, window) instead of parsing CLI args. Also require an empty argv so
     // the bundled binary stays usable as a CLI (`…/MacOS/OpenResearch up`), since
     // the bundle itself launches it with no arguments. See commands::app.
     #[cfg(target_os = "macos")]
@@ -854,8 +854,14 @@ async fn main() {
         // Shell hydration may change XDG_CONFIG_HOME; settle it before telemetry or the lifecycle lock.
         commands::app::hydrate_shell_env().await;
         telemetry::set_flag(false);
-        let _session = telemetry::TelemetrySession::start_app();
-        // AppKit owns process shutdown; the durable outbox covers termination before delivery.
+        commands::app::run().await;
+        return;
+    }
+    // Started by the Windows app's launcher, OpenResearch.exe, or the Linux
+    // AppImage's AppRun. See commands::app.
+    #[cfg(all(desktop_app, not(target_os = "macos")))]
+    if commands::app::launched_with_app_arg() {
+        telemetry::set_flag(false);
         commands::app::run().await;
         return;
     }
@@ -979,7 +985,9 @@ fn owns_its_console() -> bool {
 fn show_error_dialog(message: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
-    if !owns_its_console() {
+    // The app's console is hidden, and shared with the agents it runs, so it
+    // doesn't own it.
+    if !owns_its_console() && !commands::app::launched_with_app_arg() {
         return;
     }
     let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
@@ -1010,7 +1018,31 @@ fn show_error_dialog(message: &str) {
         .output();
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// A launcher-started AppImage has no terminal to read, so show the error with
+/// whichever desktop's dialog tool is installed, as the folder picker does.
+#[cfg(all(desktop_app, target_os = "linux"))]
+fn show_error_dialog(message: &str) {
+    if !commands::app::launched_with_app_arg() {
+        return;
+    }
+    eprintln!("OpenResearch: {message}");
+    for (program, args) in [
+        (
+            "zenity",
+            &["--error", "--no-markup", "--title=OpenResearch", "--text"][..],
+        ),
+        ("kdialog", &["--title", "OpenResearch", "--error"][..]),
+    ] {
+        let mut dialog = std::process::Command::new(program);
+        dialog.args(args).arg(message);
+        local::shell_env::restore_host_gui_env(&mut dialog);
+        if dialog.status().is_ok() {
+            return;
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", all(desktop_app, target_os = "linux"))))]
 fn show_error_dialog(_message: &str) {}
 
 /// Main thread only: a worker's panic has a running dashboard to report through.

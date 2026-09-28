@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -263,10 +263,27 @@ pub async fn run(args: UpArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolves when the process is asked to stop. SIGINT everywhere; on Unix also
+/// The desktop app's quit. A stored permit covers a quit that lands before the
+/// server is waiting for one.
+static SHUTDOWN_REQUESTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(desktop_app)]
+pub(crate) fn request_shutdown() {
+    SHUTDOWN_REQUESTED.notify_one();
+}
+
+/// Resolves when the process is asked to stop: SIGINT everywhere; on Unix also
 /// SIGTERM and SIGHUP (SIGHUP is what an SSH tunnel delivers on disconnect, so
-/// a `--remote`-launched server exits with its tunnel instead of leaking).
+/// a `--remote`-launched server exits with its tunnel instead of leaking); and
+/// [`request_shutdown`].
 async fn shutdown_signal() {
+    tokio::select! {
+        _ = SHUTDOWN_REQUESTED.notified() => {}
+        _ = os_shutdown_signal() => {}
+    }
+}
+
+async fn os_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -5353,6 +5370,12 @@ fn start_pty_with_env(
         command.env("PATH", path);
     }
     local::shell_env::export_to(|key, value| command.env(key, value));
+    for (key, value) in local::shell_env::host_gui_env() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        }
+    }
     command.env("TERM", "xterm-256color");
     command.env_remove("NO_COLOR");
     command.env_remove("FORCE_COLOR");
@@ -6773,7 +6796,8 @@ async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) ->
 struct SendChatReq {
     text: String,
     client_turn_id: Option<String>,
-    model: Option<String>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    model: Option<Option<String>>,
     service_tier: Option<String>,
     permission_mode: Option<String>,
     plan_mode: Option<bool>,
@@ -6885,7 +6909,8 @@ async fn send_chat_message(
         return Err(bad_request("text is required"));
     }
     let overrides = local::chat::TurnOverrides {
-        model: req.model,
+        clear_model: req.model == Some(None),
+        model: req.model.flatten(),
         service_tier: req.service_tier,
         permission_mode: req.permission_mode,
         permission_revision: None,
@@ -7239,11 +7264,8 @@ async fn events(
     tokio::spawn(event_loop(tx.clone()));
     // Chat events ride the same stream: chat.session / chat.message / chat.busy.
     tokio::spawn(forward_chat_events(state.chat.subscribe(), tx));
-    // The guard rides the stream state, so the count drops when the response
-    // body is dropped — i.e. when the tab closes or navigates away.
-    let guard = DashboardClientGuard::new();
-    let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
-        rx.recv().await.map(|ev| (Ok(ev), (rx, guard)))
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|ev| (Ok(ev), rx))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -7276,33 +7298,6 @@ async fn forward_chat_events(
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
-    }
-}
-
-/// Whether a dashboard is open somewhere — macOS app mode asks on a Dock click,
-/// where a live tab means "raise the browser" rather than "open the URL again".
-/// Any `/api/events` consumer counts, and a connection that vanished without a
-/// FIN lingers until a keep-alive write fails.
-// Un-gated so CI's Linux runner still type-checks it; only macOS has a caller.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn has_live_dashboard_clients() -> bool {
-    LIVE_DASHBOARD_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0
-}
-
-static LIVE_DASHBOARD_CLIENTS: AtomicUsize = AtomicUsize::new(0);
-
-struct DashboardClientGuard;
-
-impl DashboardClientGuard {
-    fn new() -> Self {
-        LIVE_DASHBOARD_CLIENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for DashboardClientGuard {
-    fn drop(&mut self) {
-        LIVE_DASHBOARD_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -7573,6 +7568,15 @@ pub(crate) async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_model_distinguishes_cli_default_from_no_override() {
+        let omitted: SendChatReq = serde_json::from_value(json!({ "text": "hello" })).unwrap();
+        let default: SendChatReq =
+            serde_json::from_value(json!({ "text": "hello", "model": null })).unwrap();
+        assert_eq!(omitted.model, None);
+        assert_eq!(default.model, Some(None));
+    }
 
     #[test]
     fn harness_payload_predicates_read_the_wire_shape() {
