@@ -70,7 +70,8 @@ type ExpFlowNode = Node<ExpNodeData, "exp">;
 
 type ElidedNodeData = {
   count: number;
-  onRevealHidden: () => void;
+  archived: boolean;
+  onRevealHidden: (archived: boolean) => void;
 };
 type ElidedFlowNode = Node<ElidedNodeData, "elided">;
 type FlowNode = ExpFlowNode | ElidedFlowNode;
@@ -84,7 +85,7 @@ interface TreeNode {
  * standing in for experiments from other tasks (Current task scope only). */
 type DisplayNode =
   | { kind: "exp"; exp: Experiment; children: DisplayNode[] }
-  | { kind: "elided"; id: string; count: number; children: DisplayNode[] };
+  | { kind: "elided"; id: string; count: number; archived: boolean; children: DisplayNode[] };
 
 function buildForest(experiments: Experiment[]): TreeNode[] {
   const byId = new Map(experiments.map((e) => [e.id, { exp: e, children: [] as TreeNode[] }]));
@@ -107,10 +108,8 @@ function buildForest(experiments: Experiment[]): TreeNode[] {
 
 /** Keep the nodes `mine` accepts, collapse each maximal rejected region on the
  * path to them into one "…" pill, and drop rejected subtrees that lead
- * nowhere. An always-true predicate (Project scope) reproduces the forest
- * as-is. Elided ids key off the region root, so they're stable across
- * renders. */
-function elideForeignRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean): DisplayNode[] {
+ * nowhere. Elided ids key off the region root, so they're stable across renders. */
+function elideHiddenRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean, isArchivedHidden: (n: TreeNode) => boolean): DisplayNode[] {
   // Memoized so the pass stays linear on deep chains.
   const sizes = new Map<TreeNode, number>();
   const size = (n: TreeNode): number => {
@@ -124,13 +123,23 @@ function elideForeignRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean):
     mines.set(n, memo);
     return memo;
   };
+  const archived = new Map<TreeNode, boolean>();
+  const hasArchived = (n: TreeNode): boolean => {
+    const memo = archived.get(n) ?? (isArchivedHidden(n) || n.children.some(hasArchived));
+    archived.set(n, memo);
+    return memo;
+  };
   function visit(node: TreeNode): DisplayNode[] {
     if (mine(node)) {
       const children: DisplayNode[] = [];
       let foreignCount = 0;
+      let foreignArchived = false;
       for (const c of node.children) {
         if (hasMine(c)) children.push(...visit(c));
-        else foreignCount += size(c);
+        else {
+          foreignCount += size(c);
+          foreignArchived ||= hasArchived(c);
+        }
       }
       // The pill goes after the real children (not createdAt-sorted) so the
       // placeholder stays out of the chronological left-to-right reading.
@@ -139,25 +148,31 @@ function elideForeignRegions(roots: TreeNode[], mine: (n: TreeNode) => boolean):
           kind: "elided",
           id: `el-${node.exp.id}`,
           count: foreignCount,
+          archived: foreignArchived,
           children: [],
         });
       return [{ kind: "exp", exp: node.exp, children }];
     }
     if (!hasMine(node)) return [];
     let count = 0;
+    let regionArchived = false;
     const mineChildren: DisplayNode[] = [];
     // Walk the foreign region rooted here, tallying every node in it and
     // recursing out through each kept descendant; `size(c)` swallows whole
     // foreign subtrees that contain nothing kept.
     (function absorb(n: TreeNode) {
       count += 1;
+      regionArchived ||= isArchivedHidden(n);
       for (const c of n.children) {
         if (mine(c)) mineChildren.push(...visit(c));
         else if (hasMine(c)) absorb(c);
-        else count += size(c);
+        else {
+          count += size(c);
+          regionArchived ||= hasArchived(c);
+        }
       }
     })(node);
-    return [{ kind: "elided", id: `el-${node.exp.id}`, count, children: mineChildren }];
+    return [{ kind: "elided", id: `el-${node.exp.id}`, count, archived: regionArchived, children: mineChildren }];
   }
   return roots.flatMap(visit);
 }
@@ -306,7 +321,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
 
 const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>) {
   useLocale();
-  const { count, onRevealHidden } = data;
+  const { count, archived, onRevealHidden } = data;
   // A div, not a <button>: ReactFlow's <Handle> renders divs, which are
   // invalid inside button elements. tabIndex opts the pill back into the tab
   // order that nodesFocusable={false} removes — it's the only node whose whole
@@ -317,11 +332,11 @@ const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>)
       role="button"
       tabIndex={0}
       title={m.tree_reveal_hidden_experiments()}
-      onClick={onRevealHidden}
+      onClick={() => onRevealHidden(archived)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onRevealHidden();
+          onRevealHidden(archived);
         }
       }}
     >
@@ -380,7 +395,7 @@ export function TreeView({
    * Null = Entire project scope (the whole forest). */
   agentSessionId: string | null;
   /** Reveal archived or other-task nodes from an elided pill. */
-  onRevealHidden: () => void;
+  onRevealHidden: (archived: boolean) => void;
   /** Preserve the canvas transform while the experiments pane is unmounted. */
   viewport: Viewport | null;
   onViewportChange: (viewport: Viewport) => void;
@@ -397,9 +412,10 @@ export function TreeView({
     const nodes: FlowNode[] = [];
     const edges: Edge[] = [];
     const visibleIds = new Set(experiments.map((experiment) => experiment.id));
+    const hiddenArchivedIds = new Set(allExperiments.filter((experiment) => experiment.archived && !visibleIds.has(experiment.id)).map((experiment) => experiment.id));
     const isMine = (n: TreeNode) =>
       visibleIds.has(n.exp.id) && (!agentSessionId || n.exp.chatSessionId === agentSessionId);
-    const roots = elideForeignRegions(buildForest(allExperiments), isMine);
+    const roots = elideHiddenRegions(buildForest(allExperiments), isMine, (n) => hiddenArchivedIds.has(n.exp.id));
     const slugById = new Map(allExperiments.map((e) => [e.id, e.slug]));
 
     function layout(node: DisplayNode, cx: number, y: number) {
@@ -431,7 +447,7 @@ export function TreeView({
           id: node.id,
           type: "elided",
           position: { x, y: y + (NODE_H - ELIDED_H) / 2 },
-          data: { count: node.count, onRevealHidden },
+          data: { count: node.count, archived: node.archived, onRevealHidden },
         });
       }
       if (node.children.length === 0) return;
