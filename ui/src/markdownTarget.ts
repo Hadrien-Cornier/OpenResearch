@@ -56,14 +56,15 @@ export function markdownTargetUrl(url: string, target: MarkdownTarget): string {
  * `path#L42[C3][-L50[C1]]` into the path and its first line. */
 export function splitLineSuffix(target: string): { path: string; line?: number } {
   const match = /^(.+?)(?::(\d+)(?:[:-]\d+)?|#L(\d+)(?:C\d+)?(?:-L?\d+(?:C\d+)?)?)$/.exec(target);
-  // Without a `.` or `/` the prefix is a scheme or host (`tel:`, `localhost:3000`).
+  // Without a `.` or `/` the prefix is a scheme or bare host (`tel:`, `localhost:3000`).
   if (!match || !/[./]/.test(match[1])) return { path: target };
   return { path: match[1], line: Number(match[2] ?? match[3]) };
 }
 
 /** First line of a `<file lines=…>` value: "20", "20-40", or "L20-L40". */
 export function firstCitedLine(lines: string): number | undefined {
-  return Number.parseInt(lines.replace(/^L/i, ""), 10) || undefined;
+  const line = Number.parseInt(lines.replace(/^L/i, ""), 10);
+  return line > 0 ? line : undefined;
 }
 
 export function isWindowsDrivePath(src: string): boolean {

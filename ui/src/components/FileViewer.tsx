@@ -312,7 +312,7 @@ export function FileViewer({
   const dirty = editable && editState !== null && isDirtyFileBuffer(editState);
   // A reopened file shows its cached copy (or clean buffer) until the refetch
   // lands and reseeds it; jumping before then spends the request on stale lines.
-  const staleBuffer = editState !== null && !isDirtyFileBuffer(editState)
+  const staleBuffer = editState !== null && !hasDraft
     && typeof data?.version === "string" && editState.version !== data.version;
   const settledLineScrollRequest = fileQuery.isFetching || staleBuffer ? undefined : lineScrollRequest;
 
@@ -530,12 +530,13 @@ export function FileViewer({
       }
       else if (!conflict && current.conflict) updateEditState({ ...current, conflict: null });
     }
-    if ((!current || !isDirtyFileBuffer(current)) && next.source === "checkout" &&
+    // Also reseeds a buffer reverted to clean after a conflict, still on the old version.
+    if ((!current || (!isDirtyFileBuffer(current) && current.version !== next.file.version)) && next.source === "checkout" &&
       !next.file.notFound && !next.file.binary && !next.file.truncated && typeof next.file.version === "string") {
       updateEditState(createFileBuffer(next.file.path, next.file.content, next.file.version));
       setSaveError(null);
     }
-  }, [loaded, bufferSession, sessionId, saving, saveRevision]);
+  }, [loaded, bufferSession, sessionId, saving, saveRevision, editState]);
   const sourceKey = JSON.stringify(fileOptions.queryKey);
   const previousVersion = useRef({ sourceKey, nonce, artifactVersion, diskVersion });
   useEffect(() => {
