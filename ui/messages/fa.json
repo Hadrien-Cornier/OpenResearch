@@ -509,6 +509,8 @@
   "tree_view_no_runs": "بدون اجرا",
   "tree_view_open_logs": "باز کردن گزارش‌ها",
   "tree_view_other_tasks": "وظایف دیگر",
+  "tree_hidden_experiments": "پنهان",
+  "tree_reveal_hidden_experiments": "نمایش آزمایش‌های پنهان",
   "tree_view_runs": "اجراها",
   "tree_view_switch_to_entire_project_to_see_all_experiments": "برای دیدن همهٔ آزمایش‌ها به «کل پروژه» بروید",
   "update_banner_dismiss": "بستن",

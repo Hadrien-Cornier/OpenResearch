@@ -513,6 +513,8 @@
   "tree_view_no_runs": "कोई रन नहीं",
   "tree_view_open_logs": "लॉग खोलें",
   "tree_view_other_tasks": "अन्य टास्क",
+  "tree_hidden_experiments": "छिपे हुए",
+  "tree_reveal_hidden_experiments": "छिपे हुए प्रयोग दिखाएँ",
   "tree_view_runs": "रन",
   "tree_view_switch_to_entire_project_to_see_all_experiments": "सभी प्रयोग देखने के लिए पूरा प्रोजेक्ट पर स्विच करें",
   "update_banner_dismiss": "खारिज करें",

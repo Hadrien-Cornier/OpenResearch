@@ -513,6 +513,8 @@
   "tree_view_no_runs": "sin ejecuciones",
   "tree_view_open_logs": "Abrir logs",
   "tree_view_other_tasks": "otras tareas",
+  "tree_hidden_experiments": "ocultos",
+  "tree_reveal_hidden_experiments": "Mostrar experimentos ocultos",
   "tree_view_runs": "Ejecuciones",
   "tree_view_switch_to_entire_project_to_see_all_experiments": "Cambia a Todo el proyecto para ver todos los experimentos",
   "update_banner_dismiss": "Descartar",

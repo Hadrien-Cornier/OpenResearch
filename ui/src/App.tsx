@@ -1854,7 +1854,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                         onOpenCode={openCodeTabForExperiment}
                         onArchive={archiveExperiment}
                         agentSessionId={effectiveScope === "agent" ? activeSessionId : null}
-                        onShowProjectScope={showProjectScope}
+                        onRevealHidden={() => {
+                          setShowArchivedExperiments(true);
+                          showProjectScope();
+                        }}
                         viewport={treeViewport}
                         onViewportChange={setTreeViewport}
                       />

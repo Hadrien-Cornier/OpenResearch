@@ -70,7 +70,7 @@ type ExpFlowNode = Node<ExpNodeData, "exp">;
 
 type ElidedNodeData = {
   count: number;
-  onShowProjectScope: () => void;
+  onRevealHidden: () => void;
 };
 type ElidedFlowNode = Node<ElidedNodeData, "elided">;
 type FlowNode = ExpFlowNode | ElidedFlowNode;
@@ -306,7 +306,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
 
 const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>) {
   useLocale();
-  const { count, onShowProjectScope } = data;
+  const { count, onRevealHidden } = data;
   // A div, not a <button>: ReactFlow's <Handle> renders divs, which are
   // invalid inside button elements. tabIndex opts the pill back into the tab
   // order that nodesFocusable={false} removes — it's the only node whose whole
@@ -316,12 +316,12 @@ const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>)
       className="elided-node w-37 h-11 flex items-center gap-2 py-1.5 px-2.5 border border-dashed border-border rounded-md bg-hover-faint text-muted text-sm font-medium text-start transition-[border-color,color] duration-120 ease-standard [&:hover]:border-text [&:hover]:text-text [&_.elided-node-label]:flex [&_.elided-node-label]:flex-col [&_.elided-node-label]:leading-[1.3] [&_.elided-node-sub]:text-muted"
       role="button"
       tabIndex={0}
-      title={m.tree_view_switch_to_entire_project_to_see_all_experiments()}
-      onClick={onShowProjectScope}
+      title={m.tree_reveal_hidden_experiments()}
+      onClick={onRevealHidden}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onShowProjectScope();
+          onRevealHidden();
         }
       }}
     >
@@ -329,7 +329,7 @@ const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>)
       <Ellipsis size={14} />
       <span className="elided-node-label">
         {count === 1 ? m.tree_one_experiment() : m.tree_experiment_count({ count: fmtNumber(count) })}
-        <span className="elided-node-sub">{m.tree_view_other_tasks()}</span>
+        <span className="elided-node-sub">{m.tree_hidden_experiments()}</span>
       </span>
       <Handle type="source" position={Position.Bottom} />
     </div>
@@ -356,7 +356,7 @@ export function TreeView({
   onOpenCode,
   onArchive,
   agentSessionId,
-  onShowProjectScope,
+  onRevealHidden,
   viewport,
   onViewportChange,
 }: {
@@ -379,8 +379,8 @@ export function TreeView({
   /** Current task scope: show only this chat session's experiments, eliding the rest.
    * Null = Entire project scope (the whole forest). */
   agentSessionId: string | null;
-  /** Leave Current task scope (clicking an elided "…" pill). */
-  onShowProjectScope: () => void;
+  /** Reveal archived or other-task nodes from an elided pill. */
+  onRevealHidden: () => void;
   /** Preserve the canvas transform while the experiments pane is unmounted. */
   viewport: Viewport | null;
   onViewportChange: (viewport: Viewport) => void;
@@ -396,11 +396,10 @@ export function TreeView({
 
     const nodes: FlowNode[] = [];
     const edges: Edge[] = [];
-    // Project scope (null session) accepts every node, so the elision pass is
-    // an identity transform and produces no pills.
+    const visibleIds = new Set(experiments.map((experiment) => experiment.id));
     const isMine = (n: TreeNode) =>
-      !agentSessionId || n.exp.chatSessionId === agentSessionId;
-    const roots = elideForeignRegions(buildForest(experiments), isMine);
+      visibleIds.has(n.exp.id) && (!agentSessionId || n.exp.chatSessionId === agentSessionId);
+    const roots = elideForeignRegions(buildForest(allExperiments), isMine);
     const slugById = new Map(allExperiments.map((e) => [e.id, e.slug]));
 
     function layout(node: DisplayNode, cx: number, y: number) {
@@ -432,7 +431,7 @@ export function TreeView({
           id: node.id,
           type: "elided",
           position: { x, y: y + (NODE_H - ELIDED_H) / 2 },
-          data: { count: node.count, onShowProjectScope },
+          data: { count: node.count, onRevealHidden },
         });
       }
       if (node.children.length === 0) return;
@@ -472,7 +471,7 @@ export function TreeView({
     project.githubRepo,
     project.githubEnabled,
     agentSessionId,
-    onShowProjectScope,
+    onRevealHidden,
   ]);
 
   if (experiments.length === 0) {

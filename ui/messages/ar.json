@@ -512,6 +512,8 @@
   "tree_view_no_runs": "لا عمليات تشغيل",
   "tree_view_open_logs": "فتح السجلات",
   "tree_view_other_tasks": "مهام أخرى",
+  "tree_hidden_experiments": "مخفية",
+  "tree_reveal_hidden_experiments": "إظهار التجارب المخفية",
   "tree_view_runs": "عمليات التشغيل",
   "tree_view_switch_to_entire_project_to_see_all_experiments": "بدّل إلى «المشروع بالكامل» لرؤية جميع التجارب",
   "update_banner_dismiss": "تجاهل",

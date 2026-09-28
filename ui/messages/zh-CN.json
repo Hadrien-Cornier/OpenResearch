@@ -509,6 +509,8 @@
   "tree_view_no_runs": "无运行",
   "tree_view_open_logs": "打开日志",
   "tree_view_other_tasks": "其他任务",
+  "tree_hidden_experiments": "已隐藏",
+  "tree_reveal_hidden_experiments": "显示隐藏的实验",
   "tree_view_runs": "运行",
   "tree_view_switch_to_entire_project_to_see_all_experiments": "切换到“整个项目”以查看所有实验",
   "update_banner_dismiss": "关闭",
