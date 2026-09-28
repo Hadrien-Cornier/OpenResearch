@@ -847,6 +847,7 @@ fn dest_matches_source(src: &Path, src_tally: Tally, dest: &Path) -> bool {
     };
     let entries = |dir: fs::ReadDir| -> Option<Vec<fs::DirEntry>> {
         let mut entries = dir.collect::<std::io::Result<Vec<_>>>().ok()?;
+        entries.retain(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()));
         entries.sort_by_key(|entry| entry.file_name());
         Some(entries)
     };
@@ -913,24 +914,25 @@ fn instructions_in(
         .and_then(|(name, dir)| {
             if dir == store_dir(root).join(&name) {
                 let source_file = dir.join("SKILL.md");
+                if let Some(project_file) = project_file.filter(|path| path.exists()) {
+                    return Some(format!(
+                        "Source collision for `{name}`: an upload and a project skill at `{}` share this name. Stop and report the collision; do not read or apply either skill.",
+                        project_file.display()
+                    ));
+                }
                 let selected = if let Some(session_file) = session_file {
                     let target = session_file.parent()?;
                     let base = target.parent()?;
                     let owned = previously_managed(base)
                         .is_some_and(|names| names.contains(&name));
-                    if target.exists() && !owned {
+                    let current = dest_matches_source(&dir, tally_all(&dir), target);
+                    if target.exists() && !owned && !current {
                         return Some(format!(
                             "Source collision for `{name}`: an upload and a project skill at `{}` share this name. Stop and report the collision; do not read or apply either skill.",
                             session_file.display()
                         ));
                     }
-                    if !target.exists() && project_file.is_some_and(Path::exists) {
-                        return Some(format!(
-                            "Source collision for `{name}`: an upload and a project skill at `{}` share this name. Stop and report the collision; do not read or apply either skill.",
-                            project_file?.display()
-                        ));
-                    }
-                    if owned && dest_matches_source(&dir, tally_all(&dir), target) {
+                    if owned && current {
                         session_file
                     } else {
                         source_file.as_path()
@@ -1601,6 +1603,57 @@ mod tests {
         assert!(!previously_managed(&wt.join(rel))
             .unwrap()
             .contains(&"shared".to_string()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn deleted_manifest_keeps_upload_usable_and_late_project_collision_is_reported() {
+        let root = temp_root();
+        let wt = temp_root();
+        save_skill_md_in(&root, skill_md("shared").as_bytes()).unwrap();
+        write_into_session_in(&root, &wt, ".claude/skills").unwrap();
+        let session_file = wt.join(".claude/skills/shared/SKILL.md");
+        fs::remove_file(wt.join(".claude/skills").join(MANAGED_MANIFEST)).unwrap();
+        write_into_session_in(&root, &wt, ".claude/skills").unwrap();
+        let upload = instructions_in(&root, &[], "shared", Some(&session_file), None).unwrap();
+        assert!(upload.contains(
+            &store_dir(&root)
+                .join("shared/SKILL.md")
+                .display()
+                .to_string()
+        ));
+
+        let project_file = wt.join("project/.claude/skills/shared/SKILL.md");
+        fs::create_dir_all(project_file.parent().unwrap()).unwrap();
+        fs::write(&project_file, "PROJECT COPY").unwrap();
+        assert!(instructions_in(
+            &root,
+            &[],
+            "shared",
+            Some(&session_file),
+            Some(&project_file)
+        )
+        .unwrap()
+        .contains("Source collision"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_symlinks_do_not_make_a_session_copy_stale() {
+        let root = temp_root();
+        let wt = temp_root();
+        save_skill_md_in(&root, skill_md("linked").as_bytes()).unwrap();
+        let source = store_dir(&root).join("linked");
+        std::os::unix::fs::symlink("SKILL.md", source.join("alias.md")).unwrap();
+        write_into_session_in(&root, &wt, ".claude/skills").unwrap();
+        assert!(dest_matches_source(
+            &source,
+            tally_all(&source),
+            &wt.join(".claude/skills/linked")
+        ));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&wt);
     }
