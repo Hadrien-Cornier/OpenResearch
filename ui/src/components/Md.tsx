@@ -11,7 +11,6 @@ import { Check, Copy, FileCode, PanelRight, ScrollText, X, Download, Minus, Plus
 import { createContext, memo, useContext, useEffect, useMemo, useRef, useState, type ImgHTMLAttributes, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Markdown as StreamingMarkdown } from "@clo/react-markdown";
-import { defaultUrlTransform } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -25,7 +24,7 @@ import { normalizeMarkdownForRendering } from "../markdownNormalization";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { Button, IconButton, IconButtonLink } from "./ui";
 import { absoluteFileUrl, artifactUrl, projectFileUrl } from "../api";
-import { chatImageTarget, firstCitedLine, isWindowsDrivePath, splitLineSuffix } from "../markdownTarget";
+import { chatImageTarget, firstCitedLine, rehypeSafeUrls, splitLineSuffix } from "../markdownTarget";
 
 const ImageResolverContext = createContext<((src: string, fallback?: boolean) => string | null) | undefined>(undefined);
 
@@ -159,12 +158,6 @@ interface MdastPosition {
   start: MdastPoint;
 }
 
-interface HastNode {
-  tagName?: string;
-  children?: HastNode[];
-  properties?: Record<string, unknown>;
-}
-
 /** Pull `name="value"` (or single-quoted) attributes off a tag's attribute run. */
 function parseTagAttrs(attrs: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -271,25 +264,6 @@ function replaceMentions(parent: MdastNode) {
 
 function remarkMentions() {
   return (tree: MdastNode) => replaceMentions(tree);
-}
-
-function rehypeSafeUrls() {
-  return (tree: HastNode) => {
-    const visit = (node: HastNode) => {
-      for (const key of ["href", "src"]) {
-        if (node.properties && Object.hasOwn(node.properties, key)) {
-          const value = String(node.properties[key] || "");
-          // `Makefile:42` reads as an unknown protocol and is blanked, so the chip
-          // renderer gets the cited target out of band, never as a live href.
-          if (key === "href" && splitLineSuffix(value).line != null) node.properties["data-cited-href"] = value;
-          node.properties[key] = key === "src" && node.tagName === "img" && isWindowsDrivePath(value)
-            ? value : defaultUrlTransform(value);
-        }
-      }
-      node.children?.forEach(visit);
-    };
-    visit(tree);
-  };
 }
 
 function FileChip({

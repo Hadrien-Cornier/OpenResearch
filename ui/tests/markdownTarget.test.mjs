@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import remarkParse from "remark-parse";
+import remarkRehype from "remark-rehype";
+import { unified } from "unified";
 
 import {
   chatImageTarget,
   firstCitedLine,
   isExternalMarkdownTarget,
   markdownTargetUrl,
+  rehypeSafeUrls,
   resolveMarkdownTarget,
   splitLineSuffix,
 } from "../src/markdownTarget.ts";
@@ -104,4 +108,14 @@ test("cited line ranges resolve to their first line", () => {
   assert.equal(firstCitedLine("L20-L40"), 20);
   assert.equal(firstCitedLine("x"), undefined);
   assert.equal(firstCitedLine("-5"), undefined);
+});
+
+test("cited hrefs are sanitized and carried out of band", () => {
+  const processor = unified().use(remarkParse).use(remarkRehype).use(rehypeSafeUrls);
+  const link = (target) => processor.runSync(processor.parse(`[x](${target})`)).children[0].children[0].properties;
+  assert.deepEqual(link("Makefile:42"), { href: "", "data-cited-href": "Makefile:42" });
+  assert.deepEqual(link("src/foo.py:42"), { href: "src/foo.py:42", "data-cited-href": "src/foo.py:42" });
+  assert.deepEqual(link("javascript:1"), { href: "", "data-cited-href": "javascript:1" });
+  assert.equal(link("javascript:alert(1)//x.py:1").href, "");
+  assert.deepEqual(link("https://example.com/docs"), { href: "https://example.com/docs" });
 });

@@ -1,3 +1,5 @@
+import { defaultUrlTransform } from "react-markdown";
+
 export interface MarkdownTarget {
   path: string;
   query: string;
@@ -85,4 +87,29 @@ export function chatImageTarget(src: string): (Pick<MarkdownTarget, "path" | "ha
     return { ...target, path: target.path.slice("artifacts/".length), source: "artifact" };
   }
   return { ...target, source: "checkout" };
+}
+
+interface HastNode {
+  tagName?: string;
+  children?: HastNode[];
+  properties?: Record<string, unknown>;
+}
+
+export function rehypeSafeUrls() {
+  return (tree: HastNode) => {
+    const visit = (node: HastNode) => {
+      for (const key of ["href", "src"]) {
+        if (node.properties && Object.hasOwn(node.properties, key)) {
+          const value = String(node.properties[key] || "");
+          // `Makefile:42` reads as an unknown protocol and is blanked, so the chip
+          // renderer gets the cited target out of band, never as a live href.
+          if (key === "href" && splitLineSuffix(value).line != null) node.properties["data-cited-href"] = value;
+          node.properties[key] = key === "src" && node.tagName === "img" && isWindowsDrivePath(value)
+            ? value : defaultUrlTransform(value);
+        }
+      }
+      node.children?.forEach(visit);
+    };
+    visit(tree);
+  };
 }
