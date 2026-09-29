@@ -17,10 +17,10 @@ import { FolderTree, GitBranch, Terminal } from "lucide-react";
 import { parseDiff, type FileData } from "react-diff-view";
 import {
   backendKind,
+  experimentMonitoringError,
   fmtDuration,
   fmtNumber,
   runDisplayStatus,
-  runMonitoringError,
   timeAgo,
   type Experiment,
   type Run,
@@ -206,8 +206,7 @@ export function ExpHoverCard({
   const failureNote =
     latestRun?.status === "failed" && latestRun.resultMarkdown ? latestRun.resultMarkdown : null;
   const body = exp.description || (failureNote ? null : latestRun?.resultMarkdown) || null;
-  // Any live run, not just the latest: a forced relaunch can leave an older one running.
-  const monitoringError = runs.map((run) => runMonitoringError(run)).find((error) => error !== null) ?? null;
+  const monitoringError = experimentMonitoringError(runs);
 
   // Clamped by default; "Show more" appears when the clamp actually hides
   // content and stays while expanded so "Show less" remains reachable.

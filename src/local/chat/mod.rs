@@ -10604,10 +10604,16 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
 
     #[test]
     fn monitoring_message_names_runs_without_remote_text() {
+        let first = StoredRun {
+            backend_json: r#"{"kind":"slurm_job","monitoringError":"REMOTE_SENTINEL"}"#.into(),
+            ..run("starting")
+        };
         let mut second = run("running");
         second.id = "run_y".into();
+        let text = run_monitoring_text(&[first, second]);
+        assert!(!text.contains("REMOTE_SENTINEL"));
         assert_eq!(
-            run_monitoring_text(&[run("starting"), second]),
+            text,
             "[orx] orx can no longer monitor these live runs:\n\
 - run `run_x` of experiment `exp_1` (still **starting**)\n\
 - run `run_y` of experiment `exp_1` (still **running**)\n\

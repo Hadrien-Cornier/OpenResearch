@@ -120,6 +120,12 @@ export function runMonitoringError(run: Pick<Run, "status" | "backend">): string
   return typeof error === "string" && error ? error : null;
 }
 
+/** The newest live run's monitoring error: a forced relaunch can leave an older run live. */
+export function experimentMonitoringError(runs: Pick<Run, "status" | "backend" | "createdAt">[]): string | null {
+  const newestFirst = [...runs].sort((a, b) => b.createdAt - a.createdAt);
+  return newestFirst.map(runMonitoringError).find((error) => error !== null) ?? null;
+}
+
 const writeScopes = new WeakMap<Response, ReturnType<typeof workspaceScope>>();
 
 async function json<T>(res: Response): Promise<T> {

@@ -172,6 +172,8 @@ pub(crate) fn default_hf_image(flavor: &str) -> String {
     }
 }
 
+const SUPERVISOR_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
 /// Spawn `orx supervise <runId>` fully detached (own process group, stderr to a log),
 /// so it outlives this command and any SSH session that launched it.
 pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
@@ -181,15 +183,15 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
             e
         )
     })?;
-    // Supervisor diagnostics (retries, transitions) exist only on stderr; keep them per run,
-    // across restarts, until the file passes 1 MiB.
+    // Supervisor diagnostics (retries, transitions) exist only on stderr; keep them per run.
     let path = crate::store::log_path(run_id).with_extension("supervisor.log");
-    let append = std::fs::metadata(&path).is_ok_and(|meta| meta.len() < 1 << 20);
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() >= SUPERVISOR_LOG_MAX_BYTES) {
+        // Rename rather than truncate: a still-running supervisor keeps writing to its handle.
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
     let stderr = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
+        .append(true)
         .open(path)
         .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from);
     // A long-lived `orx up` may be running a replaced binary; spawn the new file at its path.

@@ -9,9 +9,9 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
+  experimentMonitoringError,
   fmtDuration,
   runDisplayStatus,
-  runMonitoringError,
   timeAgo,
   type Experiment,
   type Project,
@@ -65,8 +65,7 @@ export function ExperimentOverview({
   onOpenCode: (intent: TabOpenIntent) => void;
 }) {
   const latestRun = runs[0] ?? null;
-  // Any live run, not just the latest: a forced relaunch can leave an older one running.
-  const monitoringError = runs.map((run) => runMonitoringError(run)).find((error) => error !== null) ?? null;
+  const monitoringError = experimentMonitoringError(runs);
   const hasLiveRun = runs.some(
     (run) => run.status === "running" || run.status === "starting",
   );
