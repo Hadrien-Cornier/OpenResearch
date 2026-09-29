@@ -2,8 +2,12 @@ import type { SkillInfo } from "./api";
 import { m } from "./paraglide/messages.js";
 
 export function commandDisplayName(name: string): string {
-  const base = name.split("@")[0];
+  const base = name.split("@")[0].replace(/[~^]$/, "");
   return base.charAt(0).toUpperCase() + base.slice(1).replaceAll("-", " ");
+}
+
+export function canonicalSkillName(name: string): string {
+  return name.replace(/@personal$|\^$/, "@u").replace(/@project$|~$/, "@p");
 }
 
 export function commandLabel(skill: SkillInfo): string {

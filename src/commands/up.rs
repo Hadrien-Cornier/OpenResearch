@@ -1092,7 +1092,7 @@ async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
             .collect();
         for s in crate::local::user_skills::list_for_harness(q.harness.as_deref()) {
             skills.push(json!({
-                "name": if project_names.contains(&s.name) { format!("{}@personal", s.name) } else { s.name },
+                "name": if project_names.contains(&s.name) { format!("{}@u", s.name) } else { s.name },
                 "description": s.description,
                 "source": "user",
                 "plugin": s.plugin,
@@ -1101,7 +1101,7 @@ async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
         }
         for s in project_skills {
             skills.push(json!({
-                "name": format!("{}@project", s.name),
+                "name": format!("{}@p", s.name),
                 "description": s.description,
                 "source": "project",
                 "harness": q.harness,

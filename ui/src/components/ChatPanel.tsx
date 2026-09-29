@@ -171,6 +171,7 @@ import {
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
 import {
+  canonicalSkillName,
   commandMatchesQuery,
   commandsForHarness,
   effectiveCommandPlanMode,
@@ -2998,7 +2999,7 @@ const Message = memo(function Message({
       .join("\n");
     // Known `/command` tokens render as the chips the composer showed, where
     // they were typed. Unknown commands (or skills removed since) stay plain text.
-    const isCommand = (name: string) => !!skills?.some((s) => s.name === name);
+    const isCommand = (name: string) => !!skills?.some((s) => s.name === canonicalSkillName(name));
     // Optimistic parts carry a data URL; server parts carry a file name.
     const attachments = message.parts
       .filter((p) => p.type === "image" && p.text)
@@ -4426,8 +4427,9 @@ export function ChatPanel({
     // The command replaces the `/query` token in place, so the chip lands where
     // it was typed and the rest of the message stays untouched. Only a skill
     // chip is painted wider than its token, so only it reserves a margin.
-    const marginSpaces = skill.source === "command" ? 1 : skillMarginSpaces(skill.name, composerRef.current);
-    const next = insertSlashCommand(draft, slashContext, skill.name, marginSpaces);
+    const tokenName = skill.name.replace(/@u$/, "^").replace(/@p$/, "~");
+    const marginSpaces = skill.source === "command" ? 1 : skillMarginSpaces(tokenName, composerRef.current);
+    const next = insertSlashCommand(draft, slashContext, tokenName, marginSpaces);
     setDraft(next.text);
     window.requestAnimationFrame(() => {
       composerRef.current?.focus();
@@ -5108,7 +5110,7 @@ export function ChatPanel({
   const knownCommand = (name: string) => {
     if (pendingQuestion || bashMode) return false;
     const resolved = resolveComposerCommand(name);
-    const command = commands.find((candidate) => candidate.name === (resolved ?? name));
+    const command = commands.find((candidate) => candidate.name === canonicalSkillName(resolved ?? name));
     if (!command || command.source !== "command") return !!command;
     // Chip a command only where it would run: plan composes with a prompt, the
     // rest are whole-message commands and are otherwise ordinary prose.

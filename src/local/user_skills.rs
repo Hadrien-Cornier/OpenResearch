@@ -262,11 +262,17 @@ pub(crate) enum SkillSelection {
 }
 
 pub(crate) fn parse_selection(token: &str) -> Option<(&str, SkillSelection)> {
-    let (name, source) = match token.rsplit_once('@') {
-        Some((name, "personal")) => (name, SkillSelection::Personal),
-        Some((name, "project")) => (name, SkillSelection::Project),
-        Some(_) => return None,
-        None => (token, SkillSelection::Auto),
+    let (name, source) = if let Some(name) = token.strip_suffix('^') {
+        (name, SkillSelection::Personal)
+    } else if let Some(name) = token.strip_suffix('~') {
+        (name, SkillSelection::Project)
+    } else {
+        match token.rsplit_once('@') {
+            Some((name, "personal" | "u")) => (name, SkillSelection::Personal),
+            Some((name, "project" | "p")) => (name, SkillSelection::Project),
+            Some(_) => return None,
+            None => (token, SkillSelection::Auto),
+        }
     };
     is_valid_slug(name).then_some((name, source))
 }
@@ -1827,6 +1833,22 @@ mod tests {
         );
         assert_eq!(
             parse_selection("shared@project").unwrap().1,
+            SkillSelection::Project
+        );
+        assert_eq!(
+            parse_selection("shared@u").unwrap().1,
+            SkillSelection::Personal
+        );
+        assert_eq!(
+            parse_selection("shared@p").unwrap().1,
+            SkillSelection::Project
+        );
+        assert_eq!(
+            parse_selection("shared^").unwrap().1,
+            SkillSelection::Personal
+        );
+        assert_eq!(
+            parse_selection("shared~").unwrap().1,
             SkillSelection::Project
         );
         assert!(parse_selection("shared@other").is_none());
