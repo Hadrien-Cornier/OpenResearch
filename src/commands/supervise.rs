@@ -1132,16 +1132,18 @@ async fn run_slurm(
             Ok(job) if matches!(job.stage.as_str(), "GONE" | "UNAVAILABLE") => Some("Monitoring unavailable: no exit status or scheduler record. Check cluster/accounting availability; the job has not been declared stopped.".into()),
             _ => None,
         };
-        if let Some(message) = &error {
-            if last_error.as_ref() != Some(message) {
+        match (&error, &last_error) {
+            (Some(message), last) if last.as_ref() != Some(message) => {
                 eprintln!("supervise {run_id}: {message}");
             }
+            (None, Some(_)) => eprintln!("supervise {run_id}: monitoring restored"),
+            _ => {}
         }
         last_error = error.clone();
         failing_since = error
             .as_ref()
             .map(|_| failing_since.unwrap_or_else(std::time::Instant::now));
-        // Single failed polls recover on their own; a restarted supervisor keeps an existing report.
+        // Brief outages recover on their own; a restarted supervisor keeps an existing report.
         let reported = error.clone().filter(|_| {
             descriptor.monitoring_error.is_some()
                 || failing_since.is_some_and(|since| since.elapsed() >= MONITORING_GRACE)

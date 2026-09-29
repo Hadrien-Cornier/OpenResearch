@@ -7737,6 +7737,7 @@ fn run_monitoring_text(runs: &[(crate::store::StoredRun, String)]) -> String {
     let lines = runs
         .iter()
         .map(|(run, error)| {
+            // ssh stderr can span lines; keep each run on one bullet.
             let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
             format!("- `{}` (still **{}**): {error}", run.id, run.status)
         })
@@ -10561,7 +10562,7 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
                 ),
                 (
                     second,
-                    "Monitoring unavailable: no scheduler record.".into()
+                    "Monitoring unavailable:\n  no scheduler record.".into()
                 ),
             ]),
             "[orx] orx can no longer monitor these live runs:\n\
@@ -10595,6 +10596,10 @@ run keeps its current status."
 
         let store = Store::open_at(dir.clone()).unwrap();
         assert!(!store.list_active_run_wakeups().unwrap()[0].monitoring_alerted);
+        assert!(matches!(
+            host.turns.lock().await.get("owner"),
+            Some(TurnState::Draining)
+        ));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
