@@ -202,8 +202,12 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow!("Could not spawn `orx supervise {}`: {}", run_id, e))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
