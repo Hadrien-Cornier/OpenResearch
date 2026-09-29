@@ -685,12 +685,12 @@ pub struct FeedbackArgs {
     /// One line, at most 200 characters.
     #[arg(long)]
     pub summary: String,
-    /// What happened and what was expected, the steps in words, the gist of
-    /// any error, and any workaround; at most 4000 characters. Never include
-    /// research details, paths, or names.
+    /// For bugs, include as much detail as possible: non-sensitive input,
+    /// command and flags, error, expected and actual behavior, environment,
+    /// and workaround; at most 4000 characters. Omit sensitive information.
     #[arg(long)]
     pub details: String,
-    /// The user's own words, rephrased to strip research details; at most 1000
+    /// The user's own words, rephrased to strip sensitive details; at most 1000
     /// characters.
     #[arg(long)]
     pub quote: Option<String>,

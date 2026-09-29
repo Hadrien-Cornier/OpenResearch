@@ -1112,19 +1112,23 @@ async fn codex_auto_review_supported(client: &CodexClient, workspace: &Path) -> 
 }
 
 /// The per-turn `sandboxPolicy` object. workspace-write carries the same
-/// grants the exec path passed via `-c`: the orx data dir, its lifecycle lock,
+/// grants the exec path passed via `-c`: the orx data dir, its lock directory,
 /// and the hub clone's `.git` as writable roots (see the helpers below), plus
 /// network (the agent's job is driving the orx API and git). Like the exec `-c`
 /// override, this is a full policy replacement for the turn — a user's own
 /// config.toml `sandbox_workspace_write.writable_roots` don't survive it (no
 /// append form exists on either transport).
-async fn sandbox_policy_json(mode: Option<PermissionMode>, workspace: &Path) -> Value {
-    match mode.unwrap_or(PermissionMode::Auto) {
+async fn sandbox_policy_json(mode: Option<PermissionMode>, workspace: &Path) -> Result<Value> {
+    Ok(match mode.unwrap_or(PermissionMode::Auto) {
         PermissionMode::Bypass => serde_json::json!({ "type": "dangerFullAccess" }),
         _ => {
             let mut roots: Vec<String> = Vec::new();
             roots.extend(ensure_orx_data_dir().map(|p| p.to_string_lossy().into_owned()));
-            roots.extend(ensure_orx_lifecycle_lock().map(|p| p.to_string_lossy().into_owned()));
+            roots.push(
+                ensure_orx_lifecycle_lock_dir()?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             roots.extend(
                 shared_git_dir(workspace)
                     .await
@@ -1136,7 +1140,7 @@ async fn sandbox_policy_json(mode: Option<PermissionMode>, workspace: &Path) -> 
                 "networkAccess": true,
             })
         }
-    }
+    })
 }
 
 /// The per-turn `collaborationMode` mask (experimental API). Codex's native
@@ -2427,7 +2431,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         // and `sandboxPolicy` is the only carrier of writable roots.
         "approvalPolicy": approval_policy,
         "approvalsReviewer": approvals_reviewer,
-        "sandboxPolicy": sandbox_policy_json(ctx.permission_mode, &repo).await,
+        "sandboxPolicy": sandbox_policy_json(ctx.permission_mode, &repo).await?,
     });
     if let Some(service_tier) = &ctx.service_tier {
         turn_params["serviceTier"] = Value::String(service_tier.clone());
@@ -3332,12 +3336,28 @@ pub(crate) fn ensure_orx_data_dir() -> Option<PathBuf> {
     crate::paths::canonicalize(&dir).ok()
 }
 
-/// The exact lifecycle lock file required by every stateful `orx` command.
-/// Granting only this file avoids exposing the neighboring credentials file.
-fn ensure_orx_lifecycle_lock() -> Option<PathBuf> {
-    let lock = crate::store::open_lifecycle_lock().ok()?;
+/// The lifecycle lock's own directory keeps credentials outside writable roots.
+fn ensure_orx_lifecycle_lock_dir() -> Result<PathBuf> {
+    ensure_orx_lifecycle_lock_dir_in(&crate::config::config_dir())
+}
+
+fn ensure_orx_lifecycle_lock_dir_in(config_dir: &Path) -> Result<PathBuf> {
+    let lock = crate::store::open_lifecycle_lock_in(config_dir)?;
     drop(lock);
-    crate::paths::canonicalize(crate::store::lifecycle_lock_path()).ok()
+    let path = crate::store::lifecycle_lock_path_in(config_dir);
+    let unavailable = || {
+        anyhow!(
+            "Codex sandbox cannot access the lifecycle lock: its dedicated directory at {} is unavailable; check config filesystem hard-link support and directory permissions",
+            path.display()
+        )
+    };
+    let root = crate::paths::canonicalize(path.parent().ok_or_else(unavailable)?)
+        .map_err(|_| unavailable())?;
+    let file = crate::paths::canonicalize(&path).map_err(|_| unavailable())?;
+    if file.parent() != Some(root.as_path()) {
+        return Err(unavailable());
+    }
+    Ok(root)
 }
 
 /// Session reasoning id → Codex `model_reasoning_effort` value.
@@ -3505,10 +3525,9 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             //     every `orx` command that touches it fails with "unable to
             //     open database file"; grant the data dir (see
             //     `ensure_orx_data_dir`).
-            //   * Every stateful `orx` command takes a lifecycle lock in the
-            //     config dir before opening the store. Grant only that lock
-            //     file, not the neighboring credentials (see
-            //     `ensure_orx_lifecycle_lock`).
+            //   * Every stateful `orx` command takes a lifecycle lock before
+            //     opening the store. Grant its directory without granting
+            //     the neighboring credentials (see `ensure_orx_lifecycle_lock_dir`).
             //   * Git metadata isn't writable — codex protects `.git` inside
             //     the workspace, and a worktree's real metadata (the hub
             //     clone's `.git`) sits outside it — so `git fetch`/`commit`
@@ -3521,7 +3540,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
                 let data_dir = ensure_orx_data_dir();
                 let roots: Vec<PathBuf> = [
                     data_dir.clone(),
-                    ensure_orx_lifecycle_lock(),
+                    Some(ensure_orx_lifecycle_lock_dir()?),
                     shared_git_dir(&repo).await,
                 ]
                 .into_iter()
@@ -5172,6 +5191,16 @@ requires_openai_auth = false
         // No roots → no flag at all; `=[]` would clobber the user's own
         // config.toml roots for the turn.
         assert_eq!(writable_roots_override(&[]), None);
+    }
+
+    #[test]
+    fn lifecycle_lock_root_reports_unavailable_directory() {
+        let config_dir = std::env::temp_dir().join(format!("orx-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("locks"), "not a directory").unwrap();
+        let error = ensure_orx_lifecycle_lock_dir_in(&config_dir).unwrap_err();
+        assert!(error.to_string().contains("dedicated directory"));
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]
