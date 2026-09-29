@@ -483,6 +483,8 @@ pub struct SshJobSpec {
     pub container: Option<ContainerRun>,
 }
 
+const TERMINAL_TRAPS: &str = "trap 'code=$?; printf \"%s\\n\" \"$code\" > exit_code' EXIT\ntrap 'exit 143' TERM\ntrap 'exit 130' INT";
+
 #[derive(Debug)]
 pub struct LaunchUncertain;
 
@@ -512,7 +514,7 @@ pub async fn run_job(spec: &SshJobSpec) -> Result<String> {
     } else {
         let script = &spec.script;
         // A payload exit must leave the outer shell alive to record its status.
-        format!("#!/usr/bin/env bash\ncd \"$HOME/{dir}\" || exit 97\n(\n{exports}\n{script}\n) > log 2>&1\necho $? > exit_code\n")
+        format!("#!/usr/bin/env bash\ncd \"$HOME/{dir}\" || exit 97\n{TERMINAL_TRAPS}\n(\n{exports}\n{script}\n) > log 2>&1\n")
     };
 
     // Create the dir (owner-only) and write run.sh from stdin.
@@ -552,17 +554,45 @@ pub async fn inspect_job(
 }
 
 async fn inspect_host_job(target: &SshTarget, dir: &str) -> Result<JobState> {
-    // exit_code present -> finished; pid alive -> running; pid dead & no
-    // exit_code -> killed/crashed; no pid yet -> just starting.
-    let cmd = format!(
-        "d=\"$HOME/{dir}\"; \
+    let script = format!(
+        "{HOST_PROCESS_HELPERS}\n\
+         d=\"$HOME/{dir}\"; \
          if [ -f \"$d/exit_code\" ]; then echo \"EXIT $(cat \"$d/exit_code\")\"; \
-         elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then echo RUNNING; \
+         elif [ -f \"$d/pid\" ] && host_process_alive \"$(cat \"$d/pid\")\"; then echo RUNNING; \
          elif [ -f \"$d/pid\" ]; then echo DEAD; else echo PENDING; fi",
     );
-    let out = ssh_run(target, &cmd, None).await?;
+    let out = ssh_run(target, &format!("bash -c {}", sh_quote(&script)), None).await?;
     Ok(parse_job_state(out.trim()))
 }
+
+const HOST_PROCESS_HELPERS: &str = r#"
+host_process_alive() {
+    local p="$1" stat fields pgid state file
+    if [ -r "/proc/$p/stat" ]; then
+        IFS= read -r stat < "/proc/$p/stat" || return 1
+        stat=${stat##*) }
+        read -ra fields <<< "$stat"
+        if [ "${fields[2]}" = "$p" ]; then
+            for file in /proc/[0-9]*/stat; do
+                IFS= read -r stat < "$file" 2>/dev/null || continue
+                stat=${stat##*) }
+                read -ra fields <<< "$stat"
+                if [ "${fields[2]}" = "$p" ] && [ "${fields[0]}" != Z ] && [ "${fields[0]}" != X ]; then return 0; fi
+            done
+            return 1
+        fi
+        [ "${fields[0]}" != Z ] && [ "${fields[0]}" != X ]
+    else
+        stat=$(ps -o pgid= -o stat= -p "$p" 2>/dev/null) || return 1
+        read -r pgid state <<< "$stat"
+        if [ "$pgid" = "$p" ]; then
+            ps -e -o pgid= -o stat= | awk -v p="$p" '$1 == p && $2 !~ /^[ZX]/ { alive=1 } END { exit !alive }'
+        else
+            [[ $state != Z* && $state != X* ]]
+        fi
+    fi
+}
+"#;
 
 fn parse_job_state(out: &str) -> JobState {
     if let Some(code) = out.strip_prefix("EXIT ") {
@@ -687,6 +717,40 @@ pub async fn preflight(target: &SshTarget) -> SshPreflight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn host_probe_treats_zombie_as_dead() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut zombie = false;
+        for _ in 0..100 {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            zombie = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .starts_with('Z');
+            if zombie {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let alive = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{HOST_PROCESS_HELPERS}\nhost_process_alive {pid}"))
+            .status()
+            .unwrap()
+            .success();
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        assert!(zombie);
+        assert!(!alive);
+    }
 
     #[test]
     fn alias_target_adds_no_extra_opts() {
