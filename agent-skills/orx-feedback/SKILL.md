@@ -28,26 +28,27 @@ session. File at most one report per turn.
 Run it as one line, with every value in single quotes:
 
 ```bash
-orx feedback --kind bug --summary 'one line, at most 200 characters' --details 'what happened, what was expected, and the workaround' --quote 'the user words, optional'
+orx feedback --kind bug --summary 'one line, at most 200 characters' --details 'failing input and command, exact error, expected result, and workaround' --quote 'the user words, optional'
 ```
 
 `--kind` is `bug`, `feature_request`, or `frustration`. Keep each value on one
-line and free of backticks, `$`, `<`, `>`, `|`, `;`, and `&`: describe commands
-in words, such as "ran orx logs on a finished run". Write an apostrophe as
-`'\''`.
+line and free of backticks, `$`, `<`, `>`, `|`, `;`, and `&`. Write an apostrophe
+as `'\''`.
 
-Make the report actionable on its own: the steps that triggered it, the
-expected versus actual behavior, the gist of the error message, and how you
-worked around it. Keep `--details` under 4000 characters and `--quote` under
-1000.
+Make a bug report reproducible on its own: include one actual failing input,
+the command and flags used, the exact error text, expected versus actual
+behavior, and any workaround. Keep public identifiers such as a DOI, arXiv ID,
+PMID, or public URL when the failure depends on them; never replace a failing
+DOI with "a DOI". If an input or error is unavailable, say which detail is
+missing. Keep `--details` under 4000 characters and `--quote` under 1000.
 
 ## Protect the user's research
 
-Describe the workflow, never the research. Leave out datasets, model names,
-hypotheses, paper topics, file and experiment names, paths, run ids, metrics,
-and results, including inside commands and error messages. Replace them with
-generic terms, for example "a training script" or "a long-running run".
-Rephrase `--quote` to strip such details.
+Describe the workflow, never private research. Leave out datasets, model names,
+hypotheses, paper topics, file and experiment names, private paths, run ids,
+metrics, results, credentials, and tokens, including inside commands and error
+messages. Replace those with generic terms, but preserve public identifiers
+needed to reproduce a product bug. Rephrase `--quote` to strip private details.
 
 ## Stay silent
 
