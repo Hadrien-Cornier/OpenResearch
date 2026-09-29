@@ -1,6 +1,11 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
 
 #[test]
 fn full_text_preserves_requested_versions_and_reports_stale_text() {
@@ -8,6 +13,36 @@ fn full_text_preserves_requested_versions_and_reports_stale_text() {
     for (id, text, success, warning) in [
         ("1706.03762v7", "arXiv:1706.03762v7 [cs.CL]", true, ""),
         ("1706.03762v1", "arXiv:1706.03762v1 [cs.CL]", true, ""),
+        (
+            "1706.03762v7",
+            "Earlier arXiv:1706.03762v1 is cited here.\narXiv:1706.03762v7 [cs.CL]",
+            true,
+            "",
+        ),
+        (
+            "1706.03762v7",
+            "A reference to arXiv:1706.03762v7.\narXiv:1706.03762v1.",
+            false,
+            "version mismatch",
+        ),
+        (
+            "1706.03762v7",
+            "**arXiv:1706.03762v1**",
+            false,
+            "version mismatch",
+        ),
+        (
+            "1706.03762v7",
+            "arXiv:1706.03762v7 is cited inline.",
+            true,
+            "could not verify",
+        ),
+        (
+            "1706.03762v7",
+            "arXiv:1706.03762v7\narXiv:1706.03762v1",
+            false,
+            "version mismatch",
+        ),
         (
             "1706.03762v7",
             "arXiv:1706.03762v1 [cs.CL]",
@@ -29,19 +64,31 @@ fn full_text_preserves_requested_versions_and_reports_stale_text() {
         ),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
             let mut paths = Vec::new();
-            for stream in listener.incoming().take(2) {
-                let mut stream = stream.unwrap();
+            while !server_stop.load(Ordering::Relaxed) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(err) => panic!("{err}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 let mut reader = BufReader::new(&stream);
                 let mut request = String::new();
                 reader.read_line(&mut request).unwrap();
                 let path = request.split_whitespace().nth(1).unwrap().to_string();
                 loop {
                     let mut header = String::new();
-                    reader.read_line(&mut header).unwrap();
-                    if header == "\r\n" {
+                    if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
                         break;
                     }
                 }
@@ -70,6 +117,7 @@ fn full_text_preserves_requested_versions_and_reports_stale_text() {
             .args(["--no-telemetry", "paper", id, "--full"])
             .output()
             .unwrap();
+        stop.store(true, Ordering::Relaxed);
         let paths = server.join().unwrap();
         assert!(paths.contains(&format!("/abs/{id}.md")), "{paths:?}");
         assert_eq!(output.status.success(), success);

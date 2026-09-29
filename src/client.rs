@@ -820,22 +820,39 @@ fn validate_paper_text_version(paper_id: &str, text: &str) -> Result<()> {
     if base_id == paper_id {
         return Ok(());
     }
-    let returned_id = text.split("arXiv:").skip(1).find_map(|tail| {
-        let id = tail.split_whitespace().next()?;
-        (versionless_id(id) == base_id && id != base_id).then_some(id)
-    });
-    match returned_id {
-        Some(id) if id != paper_id => Err(anyhow!(
-            "alphaXiv version mismatch: requested {paper_id}, but returned text identifies {id}. Read the requested PDF at https://arxiv.org/pdf/{paper_id}"
-        )),
-        Some(_) => Ok(()),
-        None => {
-            eprintln!(
-                "Warning: could not verify the extracted text's version for {paper_id}. Check the requested PDF at https://arxiv.org/pdf/{paper_id}"
-            );
-            Ok(())
+    let prefix = format!("{base_id}v");
+    let mut verified = false;
+    for line in text.lines() {
+        // A title-page stamp occupies its own line; inline citations are not version evidence.
+        let Some(tail) = line
+            .trim()
+            .trim_start_matches(['*', '_', '`'])
+            .strip_prefix("arXiv:")
+            .and_then(|tail| tail.trim_start().strip_prefix(&prefix))
+        else {
+            continue;
+        };
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        let suffix = tail[digits..].trim_start_matches(|c: char| {
+            c.is_whitespace() || (c.is_ascii_punctuation() && c != '[')
+        });
+        if digits == 0 || (!suffix.is_empty() && !suffix.starts_with('[')) {
+            continue;
         }
+        let version = &tail[..digits];
+        if version != &paper_id[base_id.len() + 1..] {
+            return Err(anyhow!(
+                "alphaXiv version mismatch: requested {paper_id}, but returned text identifies {base_id}v{version}. Read the requested PDF at https://arxiv.org/pdf/{paper_id}"
+            ));
+        }
+        verified = true;
     }
+    if !verified {
+        eprintln!(
+            "Warning: could not verify the extracted text's version for {paper_id}. Check the requested PDF at https://arxiv.org/pdf/{paper_id}"
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
