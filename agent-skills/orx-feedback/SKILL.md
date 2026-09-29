@@ -32,15 +32,16 @@ orx feedback --kind bug --summary 'one line, at most 200 characters' --details '
 ```
 
 `--kind` is `bug`, `feature_request`, or `frustration`. Keep each value on one
-line and free of backticks, `$`, `<`, `>`, `|`, `;`, and `&`. Write an apostrophe
-as `'\''`.
+line and single-quoted so commands and error text stay literal. Write an
+apostrophe as `'\''`.
 
-Make a bug report reproducible on its own: include one actual failing input,
-the command and flags used, the exact error text, expected versus actual
-behavior, and any workaround. Keep public identifiers such as a DOI, arXiv ID,
-PMID, or public URL when the failure depends on them; never replace a failing
-DOI with "a DOI". If an input or error is unavailable, say which detail is
-missing. Keep `--details` under 4000 characters and `--quote` under 1000.
+Make a bug report reproducible on its own: include an actual failing input
+when relevant, the command and flags used, the exact error text, expected
+versus actual behavior, and any workaround. Keep public identifiers such as a
+DOI, arXiv ID, PMID, or public URL when the failure depends on them; never
+replace a failing DOI with "a DOI". If an input or error is unavailable, say
+which detail is missing. Keep `--details` under 4000 characters and `--quote`
+under 1000.
 
 ## Protect the user's research
 
