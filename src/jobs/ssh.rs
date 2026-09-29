@@ -483,7 +483,11 @@ pub struct SshJobSpec {
     pub container: Option<ContainerRun>,
 }
 
-const TERMINAL_TRAPS: &str = "trap 'code=$?; printf \"%s\\n\" \"$code\" > exit_code' EXIT\ntrap 'exit 143' TERM\ntrap 'exit 130' INT";
+const TERMINAL_TRAPS: &str = "trap 'code=$?; printf \"%s\\n\" \"$code\" > exit_code' EXIT\ntrap 'kill -TERM \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; exit 143' TERM\ntrap 'kill -INT \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; exit 130' INT";
+
+fn host_script(dir: &str, exports: &str, script: &str) -> String {
+    format!("#!/usr/bin/env bash\ncd \"$HOME/{dir}\" || exit 97\nchild=\n{TERMINAL_TRAPS}\n(\n{exports}\n{script}\n) > log 2>&1 &\nchild=$!\nwait \"$child\"\n")
+}
 
 #[derive(Debug)]
 pub struct LaunchUncertain;
@@ -512,9 +516,7 @@ pub async fn run_job(spec: &SshJobSpec) -> Result<String> {
         container::upload_script(&spec.target, container, &inner).await?;
         container::host_script(&dir, container)
     } else {
-        let script = &spec.script;
-        // A payload exit must leave the outer shell alive to record its status.
-        format!("#!/usr/bin/env bash\ncd \"$HOME/{dir}\" || exit 97\n{TERMINAL_TRAPS}\n(\n{exports}\n{script}\n) > log 2>&1\n")
+        host_script(&dir, &exports, &spec.script)
     };
 
     // Create the dir (owner-only) and write run.sh from stdin.
@@ -572,6 +574,7 @@ host_process_alive() {
         IFS= read -r stat < "/proc/$p/stat" || return 1
         stat=${stat##*) }
         read -ra fields <<< "$stat"
+        if [ "${fields[0]}" != Z ] && [ "${fields[0]}" != X ]; then return 0; fi
         if [ "${fields[2]}" = "$p" ]; then
             for file in /proc/[0-9]*/stat; do
                 IFS= read -r stat < "$file" 2>/dev/null || continue
@@ -581,14 +584,15 @@ host_process_alive() {
             done
             return 1
         fi
-        [ "${fields[0]}" != Z ] && [ "${fields[0]}" != X ]
+        return 1
     else
         stat=$(ps -o pgid= -o stat= -p "$p" 2>/dev/null) || return 1
         read -r pgid state <<< "$stat"
+        if [[ $state != Z* && $state != X* ]]; then return 0; fi
         if [ "$pgid" = "$p" ]; then
             ps -e -o pgid= -o stat= | awk -v p="$p" '$1 == p && $2 !~ /^[ZX]/ { alive=1 } END { exit !alive }'
         else
-            [[ $state != Z* && $state != X* ]]
+            return 1
         fi
     fi
 }
@@ -720,10 +724,61 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn host_probe_treats_zombie_as_dead() {
+    fn host_wrapper_stops_payload_and_records_term() {
+        let home = crate::local::git::TemporaryDirectory::new("orx-ssh-term").unwrap();
+        let dir = home.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+        let script = home.path().join("run.sh");
+        std::fs::write(
+            &script,
+            host_script("run", "", "sh -c 'echo $$ > child_pid; exec sleep 30'"),
+        )
+        .unwrap();
+        let mut wrapper = std::process::Command::new("bash")
+            .arg(&script)
+            .env("HOME", home.path())
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if dir
+                .join("child_pid")
+                .metadata()
+                .is_ok_and(|file| file.len() > 0)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid: i32 = std::fs::read_to_string(dir.join("child_pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        unsafe { libc::kill(wrapper.id() as i32, libc::SIGTERM) };
+        wrapper.wait().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("exit_code"))
+                .unwrap()
+                .trim(),
+            "143"
+        );
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_probe_waits_for_live_group_members() {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
+            unsafe { libc::setsid() };
+            let member = unsafe { libc::fork() };
+            if member == 0 {
+                unsafe {
+                    libc::sleep(30);
+                    libc::_exit(0)
+                };
+            }
             unsafe { libc::_exit(0) };
         }
 
@@ -741,15 +796,28 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let alive = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(format!("{HOST_PROCESS_HELPERS}\nhost_process_alive {pid}"))
-            .status()
-            .unwrap()
-            .success();
+        let alive = || {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("{HOST_PROCESS_HELPERS}\nhost_process_alive {pid}"))
+                .status()
+                .unwrap()
+                .success()
+        };
+        let with_member = alive();
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        let mut without_member = false;
+        for _ in 0..100 {
+            if !alive() {
+                without_member = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
         assert!(zombie);
-        assert!(!alive);
+        assert!(with_member);
+        assert!(without_member);
     }
 
     #[test]
