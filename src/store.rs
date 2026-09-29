@@ -40,7 +40,7 @@ pub(crate) fn open_lifecycle_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
     open_lifecycle_lock_in(&crate::config::config_dir())
 }
 
-fn open_lifecycle_lock_in(config_dir: &Path) -> Result<fd_lock::RwLock<std::fs::File>> {
+pub(crate) fn open_lifecycle_lock_in(config_dir: &Path) -> Result<fd_lock::RwLock<std::fs::File>> {
     // The config dir stays put while the user can move the live data directory.
     let path = lifecycle_lock_path_in(config_dir);
     let legacy = config_dir.join("orx.lifecycle.lock");
@@ -64,11 +64,7 @@ fn open_lifecycle_lock_in(config_dir: &Path) -> Result<fd_lock::RwLock<std::fs::
     open_lifecycle_lock_at(&path)
 }
 
-pub(crate) fn lifecycle_lock_path() -> PathBuf {
-    lifecycle_lock_path_in(&crate::config::config_dir())
-}
-
-fn lifecycle_lock_path_in(config_dir: &Path) -> PathBuf {
+pub(crate) fn lifecycle_lock_path_in(config_dir: &Path) -> PathBuf {
     config_dir.join("locks/orx.lifecycle.lock")
 }
 
