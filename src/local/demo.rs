@@ -249,6 +249,7 @@ pub fn prewarm(
 
 fn prewarm_repository(repo: &Path, bare: &Path) -> Result<()> {
     if repo.exists() {
+        install_repository(repo, bare)?;
         return Ok(());
     }
     let staging = super::git::TemporaryDirectory::new("orx-demo-prewarm")?;
@@ -2313,6 +2314,10 @@ mod tests {
         };
         let original = Store::open_at(data.clone()).unwrap();
         seed_at(&original, &data, &repo, selection.clone()).unwrap();
+        let bare = data.join("demo-repos/nanochat.git");
+        std::fs::remove_dir_all(&bare).unwrap();
+        prewarm_repository(&repo, &bare).unwrap();
+        assert!(bare.join("HEAD").is_file());
         std::fs::write(repo.join("README.md"), "user changes").unwrap();
         let artifact = data.join("files/nanochat/user-notes.md");
         std::fs::write(&artifact, "user artifact").unwrap();
