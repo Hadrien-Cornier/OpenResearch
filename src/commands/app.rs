@@ -220,32 +220,73 @@ pub(crate) async fn hydrate_shell_env() {
         .kill_on_drop(true);
     // Anything the rc files start is a host program.
     crate::local::shell_env::restore_host_gui_env(probe.as_std_mut());
-    let fut = probe.output();
-    // A slow rc file (nvm, conda) delays the dashboard, so cap the wait; the
-    // inherited environment stays in force when the probe doesn't answer.
-    let out = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) => {
+    // Past the startup wait below, a late answer still supplies PATH; this bounds a hung rc file.
+    let mut answer = tokio::spawn(tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        probe.output(),
+    ));
+    // A slow rc file (nvm, conda) delays the dashboard, so cap the startup wait.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut answer).await {
+        Ok(out) => adopt_probe(out, &shell, &marker, false),
+        Err(_) => {
+            eprintln!(
+                "openresearch app: {shell:?} did not answer within 5s; using the inherited \
+                 environment (a later answer supplies PATH)"
+            );
+            tokio::spawn(async move { adopt_probe(answer.await, &shell, &marker, true) });
+        }
+    }
+}
+
+#[cfg(all(desktop_app, unix))]
+fn adopt_probe(
+    out: Result<
+        Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
+        tokio::task::JoinError,
+    >,
+    shell: &std::ffi::OsStr,
+    marker: &str,
+    late: bool,
+) {
+    let out = match out {
+        Ok(Ok(Ok(out))) => out,
+        Ok(Ok(Err(err))) => {
             eprintln!(
                 "openresearch app: could not run {shell:?}: {err}; using the inherited environment"
             );
             return;
         }
-        Err(_) => {
-            eprintln!("openresearch app: {shell:?} did not answer within 5s; using the inherited environment");
+        Ok(Err(_)) => {
+            eprintln!(
+                "openresearch app: {shell:?} did not answer within 60s; using the inherited \
+                 environment"
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!(
+                "openresearch app: probing {shell:?} failed: {err}; using the inherited \
+                 environment"
+            );
             return;
         }
     };
     // The markers are the success signal, not the exit status — an interactive
     // rc file routinely ends on a failing command.
-    match crate::local::shell_env::parse_probe(&String::from_utf8_lossy(&out.stdout), &marker) {
-        Some(vars) => {
+    match crate::local::shell_env::parse_probe(&String::from_utf8_lossy(&out.stdout), marker) {
+        Some(mut vars) => {
+            // The other imports pick directories already in use; switching them mid-session
+            // would split state between the old and new directories.
+            if late {
+                vars.retain(|key, _| *key == "PATH");
+            }
             let adopted: Vec<String> = crate::local::shell_env::IMPORTED
                 .iter()
                 .filter_map(|key| Some(format!("{key}={:?}", vars.get(key)?)))
                 .collect();
             eprintln!(
-                "openresearch app: adopted the shell environment: {}",
+                "openresearch app: adopted the shell environment{}: {}",
+                if late { " late (PATH only)" } else { "" },
                 adopted.join(" ")
             );
             crate::local::shell_env::set(vars);
