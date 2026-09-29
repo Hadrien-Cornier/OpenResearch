@@ -87,10 +87,14 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     windows::spawn(&mut cmd, &dir).map_err(|e| anyhow!("Could not launch the local run: {}", e))?;
     #[cfg(not(windows))]
     {
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| anyhow!("Could not launch the local run: {}", e))?;
-        std::fs::write(dir.join("pid"), format!("{}\n", child.id()))
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        std::fs::write(dir.join("pid"), format!("{pid}\n"))
             .map_err(|e| anyhow!("Could not record the run's pid: {}", e))?;
     }
     Ok(dir)
@@ -406,6 +410,22 @@ mod tests {
         state
     }
 
+    #[cfg(unix)]
+    fn assert_reaped(dir: &Path) {
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        for _ in 0..100 {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .unwrap();
+            if output.stdout.is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("local run {} was not reaped", pid.trim());
+    }
+
     #[test]
     fn local_job_lifecycle() {
         // The only test that touches ORX_DATA_DIR, so the global env is safe.
@@ -424,6 +444,9 @@ mod tests {
         .unwrap();
         let state = wait_terminal(&dir);
         assert_eq!(state.stage, "COMPLETED", "message: {:?}", state.message);
+        #[cfg(unix)]
+        assert_reaped(&dir);
+
         let run_sh = std::fs::read_to_string(dir.join("run.sh")).unwrap();
         assert!(!run_sh.contains("fake-token"));
         assert!(!run_sh.contains("s3cr3t-value"));
@@ -451,6 +474,9 @@ mod tests {
         assert_eq!(state.stage, "ERROR");
         assert_eq!(state.message.as_deref(), Some("exited with code 3"));
 
+        #[cfg(unix)]
+        assert_reaped(&failed);
+
         let cancelled = run_job(&LocalJobSpec {
             run_id: "cancelled".into(),
             script: "sleep 60".into(),
@@ -466,6 +492,9 @@ mod tests {
         // TERM leaves either a dead pid with no exit_code, or a non-zero
         // exit_code if run.sh got to write one — ERROR either way.
         assert_eq!(state.stage, "ERROR");
+
+        #[cfg(unix)]
+        assert_reaped(&cancelled);
 
         let descendants = run_job(&LocalJobSpec {
             run_id: "descendants".into(),
@@ -484,6 +513,9 @@ mod tests {
         cancel_job(&descendants).unwrap();
         assert!(started, "the descendant did not start");
         assert_eq!(wait_terminal(&descendants).stage, "ERROR");
+        #[cfg(unix)]
+        assert_reaped(&descendants);
+
         let heartbeat = std::fs::read(descendants.join("heartbeat")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert_eq!(
