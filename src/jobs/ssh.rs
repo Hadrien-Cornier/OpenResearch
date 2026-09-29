@@ -486,10 +486,11 @@ pub struct SshJobSpec {
 const TERMINAL_TRAPS: &str = r#"trap 'code=$?; printf "%s\n" "$code" > exit_code' EXIT
 stop_child() {
     kill -"$1" "$child" 2>/dev/null
-    (sleep 2 & timer=$!; trap 'kill "$timer" 2>/dev/null; exit' TERM; wait "$timer" 2>/dev/null; kill -KILL "$child" 2>/dev/null) &
+    set -m
+    (sleep 2; kill -KILL -"$$" 2>/dev/null; while ps -e -o pgid= -o stat= | awk -v p="$$" '$1 == p && $2 !~ /^[ZX]/ { alive=1 } END { exit !alive }'; do sleep 0.1; done; printf "%s\n" "$2" > exit_code) </dev/null >/dev/null 2>&1 &
     killer=$!
+    set +m
     wait "$child" 2>/dev/null
-    kill "$killer" 2>/dev/null
     wait "$killer" 2>/dev/null
     exit "$2"
 }
@@ -540,7 +541,7 @@ pub async fn run_job(spec: &SshJobSpec) -> Result<String> {
     let launch = if spec.container.is_some() {
         format!("cd \"$HOME/{dir}\" && date +%s > launch_time.tmp && mv launch_time.tmp launch_time && {{ if command -v setsid >/dev/null 2>&1; then setsid bash run.sh </dev/null >/dev/null 2>&1 & else nohup bash run.sh </dev/null >/dev/null 2>&1 & fi; }}")
     } else {
-        format!("cd \"$HOME/{dir}\" && if command -v setsid >/dev/null 2>&1; then setsid bash run.sh </dev/null >/dev/null 2>&1 & else nohup bash run.sh </dev/null >/dev/null 2>&1 & fi; echo $! > pid")
+        format!("cd \"$HOME/{dir}\" && if command -v setsid >/dev/null 2>&1; then setsid bash run.sh </dev/null >/dev/null 2>&1 & else set -m; trap '' HUP; bash run.sh </dev/null >/dev/null 2>&1 & fi; echo $! > pid")
     };
     ssh_run(&spec.target, &launch, None)
         .await
@@ -735,7 +736,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn host_wrapper_kills_term_ignoring_payload_and_records_term() {
+    fn host_wrapper_kills_term_ignoring_descendants_and_records_term() {
+        use std::os::unix::process::CommandExt;
+
         let home = crate::local::git::TemporaryDirectory::new("orx-ssh-term").unwrap();
         let dir = home.path().join("run");
         std::fs::create_dir(&dir).unwrap();
@@ -745,15 +748,16 @@ mod tests {
             host_script(
                 "run",
                 "",
-                "sh -c 'trap \"\" TERM; echo $$ > child_pid; exec sleep 30'",
+                "bash -c 'trap \"\" TERM; sleep 30 & echo $! > child_pid; wait' & wait",
             ),
         )
         .unwrap();
-        let mut wrapper = std::process::Command::new("bash")
+        let mut command = std::process::Command::new("bash");
+        command
             .arg(&script)
             .env("HOME", home.path())
-            .spawn()
-            .unwrap();
+            .process_group(0);
+        let mut wrapper = command.spawn().unwrap();
         for _ in 0..100 {
             if dir
                 .join("child_pid")
@@ -771,13 +775,21 @@ mod tests {
             .unwrap();
         unsafe { libc::kill(wrapper.id() as i32, libc::SIGTERM) };
         wrapper.wait().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("exit_code"))
-                .unwrap()
-                .trim(),
-            "143"
-        );
-        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+        let mut marker = String::new();
+        for _ in 0..100 {
+            marker = std::fs::read_to_string(dir.join("exit_code")).unwrap_or_default();
+            if !marker.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(marker.trim(), "143");
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &child_pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        assert!(state.trim().is_empty() || state.trim().starts_with('Z'));
     }
 
     #[cfg(unix)]
