@@ -71,8 +71,18 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     {
         cmd.env("PATH", path);
     }
-    cmd.arg("run.sh")
-        .envs(&env)
+    #[cfg(not(windows))]
+    {
+        let script_path = crate::paths::canonicalize(&run_sh_path)?;
+        std::fs::write(
+            dir.join("pid_script"),
+            script_path.to_string_lossy().as_bytes(),
+        )?;
+        cmd.arg(script_path);
+    }
+    #[cfg(windows)]
+    cmd.arg("run.sh");
+    cmd.envs(&env)
         .envs(&spec.secret_env)
         .current_dir(&dir)
         .stdin(std::process::Stdio::null())
@@ -91,8 +101,18 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
             .spawn()
             .map_err(|e| anyhow!("Could not launch the local run: {}", e))?;
         let pid = child.id();
+        let completed_dir = dir.clone();
         std::thread::spawn(move || {
-            let _ = child.wait();
+            if let Ok(status) = child.wait() {
+                if exit_code_state(&completed_dir).is_none() {
+                    let code = status.code().unwrap_or(-1);
+                    if let Err(error) =
+                        std::fs::write(completed_dir.join("exit_code"), format!("{code}\n"))
+                    {
+                        eprintln!("Could not record local run exit: {error}");
+                    }
+                }
+            }
         });
         std::fs::write(dir.join("pid"), format!("{pid}\n"))
             .map_err(|e| anyhow!("Could not record the run's pid: {}", e))?;
@@ -100,23 +120,35 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Is the recorded process still alive? `ps` rather than `kill -0`: a zombie
-/// (dead but not yet reaped by a still-living spawner) answers `kill -0` yet
-/// is not running. No libc dependency; works on macOS and Linux.
+/// The unique script path distinguishes a run from an unrelated process reusing its PID.
 #[cfg(not(windows))]
-fn pid_alive(pid: &str) -> bool {
-    match std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", pid])
+fn run_alive(dir: &Path, pid: &str) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-ww", "-o", "stat=,command=", "-p", pid])
         .stderr(std::process::Stdio::null())
         .output()
-    {
-        Ok(o) if o.status.success() => {
-            let stat = String::from_utf8_lossy(&o.stdout);
-            let stat = stat.trim();
-            !stat.is_empty() && !stat.starts_with('Z')
-        }
-        _ => false,
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some((stat, command)) = text.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    if stat.starts_with('Z') {
+        return false;
     }
+    match std::fs::read_to_string(dir.join("pid_script")) {
+        Ok(script) => command
+            .strip_suffix(&script)
+            .is_some_and(|prefix| prefix.ends_with(' ')),
+        // Runs launched before pid_script existed still use their original PID contract.
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(windows)]
+fn run_alive(_dir: &Path, pid: &str) -> bool {
+    pid_alive(pid)
 }
 
 /// Windows has no `ps`. A zero-timeout wait, not the exit code, where a real 259 reads as live.
@@ -172,7 +204,7 @@ pub fn inspect_job(dir: &Path) -> JobState {
         return state;
     }
     match std::fs::read_to_string(dir.join("pid")) {
-        Ok(pid) if pid_alive(pid.trim()) => JobState {
+        Ok(pid) if run_alive(dir, pid.trim()) => JobState {
             stage: "RUNNING".into(),
             message: None,
         },
@@ -225,6 +257,9 @@ pub fn stream_logs(dir: &Path, skip: u64, sink: &mut (dyn FnMut(&str) + Send)) -
 
 /// TERM the process group (pid == pgid), else the pid alone; on Windows, the process tree.
 pub fn cancel_job(dir: &Path) -> Result<()> {
+    if exit_code_state(dir).is_some() {
+        return Ok(());
+    }
     let pid = std::fs::read_to_string(dir.join("pid"))
         .map_err(|e| anyhow!("Could not read the run's pid: {}", e))?;
     let pid = pid.trim().to_string();
@@ -234,6 +269,9 @@ pub fn cancel_job(dir: &Path) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
+        if !run_alive(dir, &pid) {
+            return Ok(());
+        }
         terminate_group(&pid)
     }
 }
@@ -522,6 +560,31 @@ mod tests {
             std::fs::read(descendants.join("heartbeat")).unwrap(),
             heartbeat
         );
+
+        #[cfg(unix)]
+        {
+            let stale = base.join("stale-pid");
+            std::fs::create_dir_all(&stale).unwrap();
+            let mut unrelated = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            std::fs::write(stale.join("pid"), unrelated.id().to_string()).unwrap();
+            std::fs::write(
+                stale.join("pid_script"),
+                stale.join("run.sh").to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let state = inspect_job(&stale);
+            let cancelled = cancel_job(&stale);
+            let alive = unrelated.try_wait().unwrap().is_none();
+            let _ = unrelated.kill();
+            unrelated.wait().unwrap();
+            assert_eq!(state.stage, "ERROR");
+            cancelled.unwrap();
+            assert!(alive, "cancellation must not signal a reused PID");
+        }
 
         std::env::remove_var("ORX_DATA_DIR");
         let _ = std::fs::remove_dir_all(&base);
