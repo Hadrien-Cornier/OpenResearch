@@ -33,8 +33,10 @@ orx feedback --kind bug --summary 'one line, at most 200 characters' --details '
 
 `--kind` is `bug`, `feature_request`, or `frustration`. Keep each value on one
 line and free of backticks, `$`, `<`, `>`, `|`, `;`, and `&` so agent permission
-checks do not interrupt filing. Spell out only those characters in commands or
-errors; keep the rest verbatim. Write an apostrophe as
+checks do not interrupt filing. Replace only those characters with bracketed
+names, such as `[ampersand]`, in commands, errors, and public URLs. State that
+the bracketed names represent literal characters so inputs can be restored.
+Keep the rest verbatim. Write an apostrophe as
 `'\''`.
 
 Make a bug report reproducible on its own: include an actual failing input
