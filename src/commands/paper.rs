@@ -405,7 +405,7 @@ fn is_archive(s: &str) -> bool {
 }
 
 fn alphaxiv_paper_url(id: &str) -> String {
-    format!("https://www.alphaxiv.org/abs/{}", versionless_id(id))
+    format!("https://www.alphaxiv.org/abs/{id}")
 }
 
 #[cfg(test)]
@@ -498,10 +498,10 @@ mod tests {
     }
 
     #[test]
-    fn builds_versionless_alphaxiv_links() {
+    fn preserves_versions_in_alphaxiv_links() {
         assert_eq!(
             alphaxiv_paper_url("2401.12345v2"),
-            "https://www.alphaxiv.org/abs/2401.12345"
+            "https://www.alphaxiv.org/abs/2401.12345v2"
         );
         assert_eq!(
             alphaxiv_paper_url("2401.12345"),

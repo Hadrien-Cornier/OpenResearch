@@ -808,7 +808,34 @@ pub async fn fetch_paper_markdown(kind: &str, paper_id: &str) -> Result<Option<S
             reason
         ));
     }
-    Ok(Some(res.text().await?))
+    let text = res.text().await?;
+    if kind == "abs" {
+        validate_paper_text_version(paper_id, &text)?;
+    }
+    Ok(Some(text))
+}
+
+fn validate_paper_text_version(paper_id: &str, text: &str) -> Result<()> {
+    let base_id = versionless_id(paper_id);
+    if base_id == paper_id {
+        return Ok(());
+    }
+    let returned_id = text.split("arXiv:").skip(1).find_map(|tail| {
+        let id = tail.split_whitespace().next()?;
+        (versionless_id(id) == base_id && id != base_id).then_some(id)
+    });
+    match returned_id {
+        Some(id) if id != paper_id => Err(anyhow!(
+            "alphaXiv version mismatch: requested {paper_id}, but returned text identifies {id}. Read the requested PDF at https://arxiv.org/pdf/{paper_id}"
+        )),
+        Some(_) => Ok(()),
+        None => {
+            eprintln!(
+                "Warning: could not verify the extracted text's version for {paper_id}. Check the requested PDF at https://arxiv.org/pdf/{paper_id}"
+            );
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
