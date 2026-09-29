@@ -7786,20 +7786,23 @@ fn run_wakeup_text(run: &crate::store::StoredRun) -> Option<String> {
     })
 }
 
-fn run_monitoring_text(runs: &[(crate::store::StoredRun, String)]) -> String {
+// Only local identifiers here: the error text includes remote ssh stderr, so the agent reads it
+// as command output instead of inside an `[orx]` instruction.
+fn run_monitoring_text(runs: &[crate::store::StoredRun]) -> String {
     let lines = runs
         .iter()
-        .map(|(run, error)| {
-            // ssh stderr can span lines; keep each run on one bullet.
-            let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
-            format!("- `{}` (still **{}**): {error}", run.id, run.status)
+        .map(|run| {
+            format!(
+                "- run `{}` of experiment `{}` (still **{}**)",
+                run.id, run.experiment_id, run.status
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "[orx] orx can no longer monitor these live runs:\n{lines}\nTell the user so they can \
-         fix it. orx wakes you once it can see a run finish; until then each run keeps \
-         its current status."
+        "[orx] orx can no longer monitor these live runs:\n{lines}\nRun `orx exp status <expId>` \
+         for the reason and tell the user so they can fix it. orx wakes you once it can see a run \
+         finish; until then each run keeps its current status."
     )
 }
 
@@ -7890,28 +7893,24 @@ async fn process_run_monitoring_alerts(
 ) -> Result<()> {
     let mut unalerted = Vec::new();
     for wakeup in store.list_active_run_wakeups()? {
-        let error = crate::jobs::BackendDescriptor::parse(&wakeup.run.backend_json)
-            .ok()
-            .and_then(|descriptor| descriptor.monitoring_error);
-        match error {
-            Some(error) if !wakeup.monitoring_alerted => unalerted.push((wakeup, error)),
-            Some(_) => {}
-            None if wakeup.monitoring_alerted => {
-                store.set_run_wakeup_monitoring_alerted(
-                    &wakeup.run.id,
-                    &wakeup.chat_session_id,
-                    false,
-                )?;
-            }
-            None => {}
+        let unmonitored = crate::jobs::BackendDescriptor::parse(&wakeup.run.backend_json)
+            .is_ok_and(|descriptor| descriptor.monitoring_error.is_some());
+        if unmonitored && !wakeup.monitoring_alerted {
+            unalerted.push(wakeup);
+        } else if !unmonitored && wakeup.monitoring_alerted {
+            store.set_run_wakeup_monitoring_alerted(
+                &wakeup.run.id,
+                &wakeup.chat_session_id,
+                false,
+            )?;
         }
     }
-    let mut by_session: HashMap<String, Vec<(crate::store::RunWakeup, String)>> = HashMap::new();
-    for (wakeup, error) in unalerted {
+    let mut by_session: HashMap<String, Vec<crate::store::RunWakeup>> = HashMap::new();
+    for wakeup in unalerted {
         by_session
             .entry(wakeup.chat_session_id.clone())
             .or_default()
-            .push((wakeup, error));
+            .push(wakeup);
     }
     for (session_id, alerts) in by_session {
         let Some(mut guard) = TurnGuard::claim_hidden(chat, &session_id).await else {
@@ -7924,9 +7923,9 @@ async fn process_run_monitoring_alerts(
             return Ok(());
         }
         let mut claimed = Vec::new();
-        for (wakeup, error) in alerts {
+        for wakeup in alerts {
             if store.set_run_wakeup_monitoring_alerted(&wakeup.run.id, &session_id, true)? {
-                claimed.push((wakeup.run, error));
+                claimed.push(wakeup.run);
             }
         }
         if claimed.is_empty() {
@@ -7936,7 +7935,7 @@ async fn process_run_monitoring_alerts(
         let text = run_monitoring_text(&claimed);
         let started = chat.send_hidden_message(&session_id, text, guard).await;
         if !matches!(started, Ok(TurnSubmission::Started(_))) {
-            for (run, _) in &claimed {
+            for run in &claimed {
                 store.set_run_wakeup_monitoring_alerted(&run.id, &session_id, false)?;
             }
             if let Err(err) = started {
@@ -10604,25 +10603,16 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
     }
 
     #[test]
-    fn monitoring_message_lists_each_unmonitored_run() {
+    fn monitoring_message_names_runs_without_remote_text() {
         let mut second = run("running");
         second.id = "run_y".into();
         assert_eq!(
-            run_monitoring_text(&[
-                (
-                    run("starting"),
-                    "Monitoring unavailable: ssh failed.".into()
-                ),
-                (
-                    second,
-                    "Monitoring unavailable:\n  no scheduler record.".into()
-                ),
-            ]),
+            run_monitoring_text(&[run("starting"), second]),
             "[orx] orx can no longer monitor these live runs:\n\
-- `run_x` (still **starting**): Monitoring unavailable: ssh failed.\n\
-- `run_y` (still **running**): Monitoring unavailable: no scheduler record.\n\
-Tell the user so they can fix it. orx wakes you once it can see a run finish; until then each \
-run keeps its current status."
+- run `run_x` of experiment `exp_1` (still **starting**)\n\
+- run `run_y` of experiment `exp_1` (still **running**)\n\
+Run `orx exp status <expId>` for the reason and tell the user so they can fix it. orx wakes you \
+once it can see a run finish; until then each run keeps its current status."
         );
     }
 

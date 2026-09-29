@@ -206,7 +206,8 @@ export function ExpHoverCard({
   const failureNote =
     latestRun?.status === "failed" && latestRun.resultMarkdown ? latestRun.resultMarkdown : null;
   const body = exp.description || (failureNote ? null : latestRun?.resultMarkdown) || null;
-  const monitoringError = latestRun ? runMonitoringError(latestRun) : null;
+  // Any live run, not just the latest: a forced relaunch can leave an older one running.
+  const monitoringError = runs.map((run) => runMonitoringError(run)).find((error) => error !== null) ?? null;
 
   // Clamped by default; "Show more" appears when the clamp actually hides
   // content and stays while expanded so "Show less" remains reachable.

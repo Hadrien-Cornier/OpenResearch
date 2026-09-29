@@ -181,11 +181,16 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
             e
         )
     })?;
-    // Supervisor diagnostics (retries, transitions) exist only on stderr; keep them per run.
+    // Supervisor diagnostics (retries, transitions) exist only on stderr; keep them per run,
+    // across restarts, until the file passes 1 MiB.
+    let path = crate::store::log_path(run_id).with_extension("supervisor.log");
+    let append = std::fs::metadata(&path).is_ok_and(|meta| meta.len() < 1 << 20);
     let stderr = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
-        .open(crate::store::log_path(run_id).with_extension("supervisor.log"))
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(path)
         .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from);
     // A long-lived `orx up` may be running a replaced binary; spawn the new file at its path.
     let mut cmd = std::process::Command::new(exe);

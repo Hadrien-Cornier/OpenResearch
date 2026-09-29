@@ -65,7 +65,8 @@ export function ExperimentOverview({
   onOpenCode: (intent: TabOpenIntent) => void;
 }) {
   const latestRun = runs[0] ?? null;
-  const monitoringError = latestRun ? runMonitoringError(latestRun) : null;
+  // Any live run, not just the latest: a forced relaunch can leave an older one running.
+  const monitoringError = runs.map((run) => runMonitoringError(run)).find((error) => error !== null) ?? null;
   const hasLiveRun = runs.some(
     (run) => run.status === "running" || run.status === "starting",
   );
