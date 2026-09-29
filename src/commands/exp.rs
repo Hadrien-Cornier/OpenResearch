@@ -181,7 +181,7 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
             e
         )
     })?;
-    // Supervisors report monitoring failures only on stderr; keep them for diagnosis.
+    // Supervisor diagnostics (retries, transitions) exist only on stderr; keep them per run.
     let stderr = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

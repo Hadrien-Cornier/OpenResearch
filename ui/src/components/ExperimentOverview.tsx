@@ -65,6 +65,7 @@ export function ExperimentOverview({
   onOpenCode: (intent: TabOpenIntent) => void;
 }) {
   const latestRun = runs[0] ?? null;
+  const monitoringError = latestRun ? runMonitoringError(latestRun) : null;
   const hasLiveRun = runs.some(
     (run) => run.status === "running" || run.status === "starting",
   );
@@ -144,9 +145,9 @@ export function ExperimentOverview({
               {latestRun.command && (
                 <code className={EXPERIMENT_OVERVIEW_COMMAND_CLASS_NAME}>$ {latestRun.command}</code>
               )}
-              {runMonitoringError(latestRun) && (
+              {monitoringError && (
                 <p className="experiment-overview-monitoring mt-4 text-accent-amber text-sm wrap-anywhere">
-                  {runMonitoringError(latestRun)}
+                  {monitoringError}
                 </p>
               )}
               {latestRun.resultMarkdown && (

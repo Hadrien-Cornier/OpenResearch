@@ -1189,7 +1189,7 @@ impl Store {
         )
     }
 
-    fn list_run_wakeups(&self, filter: &str) -> Result<Vec<RunWakeup>> {
+    fn list_run_wakeups(&self, filter: &'static str) -> Result<Vec<RunWakeup>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT r.id, r.experiment_id, r.project_id, r.status, r.backend_json, r.command,
                     r.created_at, r.updated_at, r.ended_at, r.exit_code,
@@ -5081,6 +5081,13 @@ mod tests {
             .unwrap()
             .iter()
             .any(|wakeup| wakeup.run.id == "run_live" && wakeup.state == "pending"));
+        first
+            .claim_run_wakeup("run_live", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(!first
+            .set_run_wakeup_monitoring_alerted("run_live", "chat_A", false)
+            .unwrap());
 
         drop(second);
         drop(first);

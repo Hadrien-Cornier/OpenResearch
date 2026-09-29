@@ -24,6 +24,8 @@ use crate::store::{log_path, now_ms, RunStatus, Store};
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a silent log stream is held before re-checking job state.
 const LOG_IDLE: Duration = Duration::from_secs(30);
+/// How long monitoring must keep failing before it is reported on the run.
+const MONITORING_GRACE: Duration = Duration::from_secs(60);
 
 fn open_supervisor_lock(path: &std::path::Path) -> Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
@@ -712,13 +714,24 @@ async fn tail_logs_ssh(
         }
     };
     let mut seen = 0u64;
+    let mut last_error = None;
     loop {
         let mut sink = |line: &str| {
             let _ = writeln!(log_file, "{line}");
         };
         match ssh::stream_logs(&target, &dir, seen, LOG_IDLE, &mut sink).await {
-            Ok(s) => seen = s,
-            Err(err) => eprintln!("supervise {run_id}: log stream error (will retry): {err}"),
+            Ok(s) => {
+                seen = s;
+                last_error = None;
+            }
+            // Retries every 2s through an outage; log each distinct failure once.
+            Err(err) => {
+                let err = err.to_string();
+                if last_error.as_ref() != Some(&err) {
+                    eprintln!("supervise {run_id}: log stream error (will retry): {err}");
+                    last_error = Some(err);
+                }
+            }
         }
         let _ = log_file.flush();
         if *done.borrow() {
@@ -1101,6 +1114,7 @@ async fn run_slurm(
 
     let mut last_status = status_of(&stored)?;
     let mut cancel_sent = descriptor.cancellation_accepted;
+    let mut failing_since = None;
 
     loop {
         if !cancel_sent && local_cancel_requested(&store, &run_id) {
@@ -1117,12 +1131,22 @@ async fn run_slurm(
             Ok(job) if matches!(job.stage.as_str(), "GONE" | "UNAVAILABLE") => Some("Monitoring unavailable: no exit status or scheduler record. Check cluster/accounting availability; the job has not been declared stopped.".into()),
             _ => None,
         };
-        if error != descriptor.monitoring_error || cancel_sent != descriptor.cancellation_accepted {
-            if let Some(error) = &error {
+        failing_since = error
+            .as_ref()
+            .map(|_| failing_since.unwrap_or_else(std::time::Instant::now));
+        // Single failed polls recover on their own; a restarted supervisor keeps an existing report.
+        let reported = error.clone().filter(|_| {
+            descriptor.monitoring_error.is_some()
+                || failing_since.is_some_and(|since| since.elapsed() >= MONITORING_GRACE)
+        });
+        if reported != descriptor.monitoring_error
+            || cancel_sent != descriptor.cancellation_accepted
+        {
+            if let Some(error) = &reported {
                 eprintln!("supervise {run_id}: {error}");
             }
             let mut updated = descriptor.clone();
-            updated.monitoring_error = error.clone();
+            updated.monitoring_error = reported;
             updated.cancellation_accepted = cancel_sent;
             match store.set_backend_json(&run_id, &updated.to_json()) {
                 Ok(()) => descriptor = updated,
