@@ -1063,11 +1063,23 @@ struct SkillsQ {
 }
 
 /// Slash-skills the composer's `/` dropdown offers (expanded server-side): the
-/// built-in catalog plus the user's own — uploaded here or mirrored from a
-/// coding agent.
+/// built-in catalog, personal skills, and skills in the open project.
 async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
     tokio::task::spawn_blocking(move || {
         let importing = crate::local::user_skills::refresh_imports();
+        let project = q.project.as_deref().and_then(|id| {
+            Store::open().ok()?.get_local_project(id).ok().flatten()
+        });
+        let project_skills = project
+            .as_ref()
+            .map(|project| {
+                crate::local::user_skills::list_project_skills(
+                    std::path::Path::new(&project.repo_path),
+                    q.harness.as_deref(),
+                )
+            })
+            .unwrap_or_default();
+        let project_names: HashSet<_> = project_skills.iter().map(|skill| &skill.name).collect();
         let mut skills: Vec<Value> = crate::local::skills::CATALOG
             .iter()
             .map(|s| {
@@ -1080,10 +1092,18 @@ async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
             .collect();
         for s in crate::local::user_skills::list_for_harness(q.harness.as_deref()) {
             skills.push(json!({
-                "name": s.name,
+                "name": if project_names.contains(&s.name) { format!("{}@personal", s.name) } else { s.name },
                 "description": s.description,
                 "source": "user",
                 "plugin": s.plugin,
+                "harness": q.harness,
+            }));
+        }
+        for s in project_skills {
+            skills.push(json!({
+                "name": format!("{}@project", s.name),
+                "description": s.description,
+                "source": "project",
                 "harness": q.harness,
             }));
         }
@@ -1094,7 +1114,7 @@ async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
 }
 
 async fn get_skill(Path(name): Path<String>, Query(q): Query<SkillsQ>) -> ApiResult {
-    if !crate::local::user_skills::is_valid_slug(&name) {
+    if crate::local::user_skills::parse_selection(&name).is_none() {
         return Err(bad_request("invalid skill name"));
     }
     let github_enabled = if let Some(project_id) = q.project.as_deref() {
@@ -1109,8 +1129,17 @@ async fn get_skill(Path(name): Path<String>, Query(q): Query<SkillsQ>) -> ApiRes
         return Ok(Json(json!({ "name": name, "content": content })));
     }
     let skill_name = name.clone();
+    let project_repo = q
+        .project
+        .as_deref()
+        .and_then(|id| Store::open().ok()?.get_local_project(id).ok().flatten())
+        .map(|project| project.repo_path);
     let content = tokio::task::spawn_blocking(move || {
-        crate::local::user_skills::content(&skill_name, q.harness.as_deref())
+        crate::local::user_skills::content(
+            &skill_name,
+            q.harness.as_deref(),
+            project_repo.as_deref().map(std::path::Path::new),
+        )
     })
     .await
     .map_err(|e| ApiError::from(anyhow!(e)))?

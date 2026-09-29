@@ -254,6 +254,23 @@ pub(crate) fn is_valid_slug(name: &str) -> bool {
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkillSelection {
+    Auto,
+    Personal,
+    Project,
+}
+
+pub(crate) fn parse_selection(token: &str) -> Option<(&str, SkillSelection)> {
+    let (name, source) = match token.rsplit_once('@') {
+        Some((name, "personal")) => (name, SkillSelection::Personal),
+        Some((name, "project")) => (name, SkillSelection::Project),
+        Some(_) => return None,
+        None => (token, SkillSelection::Auto),
+    };
+    is_valid_slug(name).then_some((name, source))
+}
+
 /// Names owned by the built-ins: the `orx-` namespace, any bundled agent skill
 /// (bare or prefixed), and the composer's slash-skill catalog. Rejected so an
 /// upload can never shadow or be shadowed by a built-in.
@@ -660,6 +677,26 @@ pub fn list_for_harness(harness: Option<&str>) -> Vec<UserSkill> {
     list_in(&root(), &native_skills(harness))
 }
 
+pub fn list_project_skills(repo: &Path, harness: Option<&str>) -> Vec<UserSkill> {
+    let Some(dir) = harness
+        .and_then(super::harness::chat_harness)
+        .and_then(|agent| agent.session_skills_dir())
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(repo.join(dir)) else {
+        return Vec::new();
+    };
+    let mut skills: Vec<_> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| read_uploaded_at(&entry.path()).ok())
+        .filter(|skill| !is_reserved(&skill.name))
+        .collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
 fn native_skills(harness: Option<&str>) -> Vec<Mirrored> {
     let Some(harness) = harness else {
         return Vec::new();
@@ -714,15 +751,37 @@ fn source_dirs(root: &Path, mirrored: &[Mirrored]) -> Vec<(String, PathBuf)> {
 }
 
 /// The Markdown body of a skill's `SKILL.md`, for the composer hover preview.
-pub fn content(name: &str, harness: Option<&str>) -> Option<String> {
-    content_in(&root(), &native_skills(harness), name)
+pub fn content(name: &str, harness: Option<&str>, project_repo: Option<&Path>) -> Option<String> {
+    let (name, selection) = parse_selection(name)?;
+    let project_file = harness
+        .and_then(super::harness::chat_harness)
+        .and_then(|agent| agent.session_skills_dir())
+        .and_then(|dir| project_repo.map(|repo| repo.join(dir).join(name).join("SKILL.md")));
+    content_selected_in(
+        &root(),
+        &native_skills(harness),
+        name,
+        selection,
+        project_file.as_deref(),
+    )
 }
 
-fn content_in(root: &Path, mirrored: &[Mirrored], name: &str) -> Option<String> {
-    let (_, dir) = source_dirs(root, mirrored)
-        .into_iter()
-        .find(|(n, ..)| n == name)?;
-    let content = fs::read_to_string(dir.join("SKILL.md")).ok()?;
+fn content_selected_in(
+    root: &Path,
+    mirrored: &[Mirrored],
+    name: &str,
+    selection: SkillSelection,
+    project_file: Option<&Path>,
+) -> Option<String> {
+    let file = if selection == SkillSelection::Project {
+        project_file?.to_path_buf()
+    } else {
+        let (_, dir) = source_dirs(root, mirrored)
+            .into_iter()
+            .find(|(n, ..)| n == name)?;
+        dir.join("SKILL.md")
+    };
+    let content = fs::read_to_string(file).ok()?;
     let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
     let after_open = content
         .strip_prefix("---\n")
@@ -733,6 +792,11 @@ fn content_in(root: &Path, mirrored: &[Mirrored], name: &str) -> Option<String> 
             .trim_start_matches(['\r', '\n'])
             .to_string(),
     )
+}
+
+#[cfg(test)]
+fn content_in(root: &Path, mirrored: &[Mirrored], name: &str) -> Option<String> {
+    content_selected_in(root, mirrored, name, SkillSelection::Auto, None)
 }
 
 /// Remove uploads, or exclude discovered skills without touching their source.
@@ -887,41 +951,58 @@ pub fn instructions(
     worktree: Option<&Path>,
     project_repo: Option<&Path>,
 ) -> Option<String> {
+    let (skill_name, selection) = parse_selection(name)?;
     let skills_dir = harness
         .and_then(super::harness::chat_harness)
         .and_then(|agent| agent.session_skills_dir());
-    let session_file = skills_dir
-        .and_then(|dir| worktree.map(|worktree| worktree.join(dir).join(name).join("SKILL.md")));
+    let session_file = skills_dir.and_then(|dir| {
+        worktree.map(|worktree| worktree.join(dir).join(skill_name).join("SKILL.md"))
+    });
     let project_file = skills_dir
-        .and_then(|dir| project_repo.map(|repo| repo.join(dir).join(name).join("SKILL.md")));
-    instructions_in(
+        .and_then(|dir| project_repo.map(|repo| repo.join(dir).join(skill_name).join("SKILL.md")));
+    instructions_selected_in(
         &root(),
         &native_skills(harness),
-        name,
+        skill_name,
+        selection,
         session_file.as_deref(),
         project_file.as_deref(),
     )
 }
 
-fn instructions_in(
+fn instructions_selected_in(
     root: &Path,
     mirrored: &[Mirrored],
     name: &str,
+    selection: SkillSelection,
     session_file: Option<&Path>,
     project_file: Option<&Path>,
 ) -> Option<String> {
+    if selection == SkillSelection::Project {
+        let file = project_file.filter(|path| path.exists())?;
+        return Some(format!(
+            "Use the project `{name}` skill at `{}`. Read that SKILL.md and follow it.",
+            file.display()
+        ));
+    }
     source_dirs(root, mirrored)
         .into_iter()
         .find(|(n, ..)| n == name)
         .and_then(|(name, dir)| {
+            if selection == SkillSelection::Personal {
+                return Some(format!(
+                    "Use the personal `{name}` skill at `{}`. Read that SKILL.md and follow it.",
+                    dir.join("SKILL.md").display()
+                ));
+            }
+            if let Some(project_file) = project_file.filter(|path| path.exists()) {
+                return Some(format!(
+                    "Source collision for `{name}`: a personal and a project skill at `{}` share this name. Stop and report the collision; do not read or apply either skill.",
+                    project_file.display()
+                ));
+            }
             if dir == store_dir(root).join(&name) {
                 let source_file = dir.join("SKILL.md");
-                if let Some(project_file) = project_file.filter(|path| path.exists()) {
-                    return Some(format!(
-                        "Source collision for `{name}`: an upload and a project skill at `{}` share this name. Stop and report the collision; do not read or apply either skill.",
-                        project_file.display()
-                    ));
-                }
                 let selected = if let Some(session_file) = session_file {
                     let target = session_file.parent()?;
                     let base = target.parent()?;
@@ -954,6 +1035,24 @@ fn instructions_in(
                 .unwrap_or(name);
             Some(format!("Use the `{native_name}` skill."))
         })
+}
+
+#[cfg(test)]
+fn instructions_in(
+    root: &Path,
+    mirrored: &[Mirrored],
+    name: &str,
+    session_file: Option<&Path>,
+    project_file: Option<&Path>,
+) -> Option<String> {
+    instructions_selected_in(
+        root,
+        mirrored,
+        name,
+        SkillSelection::Auto,
+        session_file,
+        project_file,
+    )
 }
 
 // --- fs helpers ---------------------------------------------------------------
@@ -1641,6 +1740,82 @@ mod tests {
         .contains("Source collision"));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn duplicate_picker_entries_select_distinct_sources() {
+        let root = temp_root();
+        let repo = temp_root();
+        let upload_md = skill_md_desc("shared", "UPLOAD SOURCE").replace("body", "UPLOAD SOURCE");
+        save_skill_md_in(&root, upload_md.as_bytes()).unwrap();
+        let project_file = repo.join(".agents/skills/shared/SKILL.md");
+        fs::create_dir_all(project_file.parent().unwrap()).unwrap();
+        fs::write(
+            &project_file,
+            skill_md_desc("shared", "PROJECT SOURCE").replace("body", "PROJECT SOURCE"),
+        )
+        .unwrap();
+
+        let project = list_project_skills(&repo, Some("codex"));
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].name, "shared");
+        assert_eq!(project[0].description, "PROJECT SOURCE");
+        assert_eq!(
+            parse_selection("shared@personal").unwrap().1,
+            SkillSelection::Personal
+        );
+        assert_eq!(
+            parse_selection("shared@project").unwrap().1,
+            SkillSelection::Project
+        );
+        assert!(parse_selection("shared@other").is_none());
+
+        let personal = instructions_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Personal,
+            None,
+            Some(&project_file),
+        )
+        .unwrap();
+        let project = instructions_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Project,
+            None,
+            Some(&project_file),
+        )
+        .unwrap();
+        assert!(personal.contains(
+            &store_dir(&root)
+                .join("shared")
+                .join("SKILL.md")
+                .display()
+                .to_string()
+        ));
+        assert!(project.contains(&project_file.display().to_string()));
+        assert!(content_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Personal,
+            Some(&project_file)
+        )
+        .unwrap()
+        .contains("UPLOAD SOURCE"));
+        assert!(content_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Project,
+            Some(&project_file)
+        )
+        .unwrap()
+        .contains("PROJECT SOURCE"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[cfg(unix)]

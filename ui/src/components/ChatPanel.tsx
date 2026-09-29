@@ -4540,7 +4540,7 @@ export function ChatPanel({
     : savedSelection
       ? { ...savedSelection, ...sessionOverride }
       : null;
-  const { data: skills = EMPTY_SKILLS } = useQuery(getSkillsQuery(rawSelection?.harness));
+  const { data: skills = EMPTY_SKILLS } = useQuery(getSkillsQuery(rawSelection?.harness, projectId));
   const activeHarness = rawSelection
     ? harnesses.find((h) => h.id === rawSelection.harness)
     : undefined;

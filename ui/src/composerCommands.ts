@@ -2,11 +2,15 @@ import type { SkillInfo } from "./api";
 import { m } from "./paraglide/messages.js";
 
 export function commandDisplayName(name: string): string {
-  return name.charAt(0).toUpperCase() + name.slice(1).replaceAll("-", " ");
+  const [base, source] = name.split("@");
+  const label = base.charAt(0).toUpperCase() + base.slice(1).replaceAll("-", " ");
+  if (source === "personal") return `${label} · ${m.skill_menu_personal()}`;
+  if (source === "project") return `${label} · ${m.header_project()}`;
+  return label;
 }
 
 export function commandLabel(skill: SkillInfo): string {
-  return `${skill.plugin ? `${commandDisplayName(skill.plugin)}: ` : ""}${commandDisplayName(skill.name)}`;
+  return `${skill.plugin ? `${commandDisplayName(skill.plugin)}: ` : ""}${commandDisplayName(skill.name.split("@")[0])}`;
 }
 
 /** Built-in commands the dashboard runs instead of sending, same on every harness. */
@@ -162,8 +166,7 @@ export function commandsForHarness(
   skills: SkillInfo[],
   planActivation: "permission" | "command" | null | undefined,
 ): SkillInfo[] {
-  // Every skill is inserted and resolved by its bare name, a plugin's included,
-  // so one sharing a command's name (or alias) would shadow it.
+  // Keep dashboard commands ahead of skills with the same name or alias.
   const availableSkills = skills.filter((skill) => !resolveComposerCommand(skill.name));
   for (const name of availableCommands(planActivation)) availableSkills.push(composerCommand(name));
   return availableSkills.sort((a, b) => {

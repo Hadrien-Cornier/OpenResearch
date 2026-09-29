@@ -1709,10 +1709,13 @@ export interface SkillInfo {
   harness?: string | null;
   description: string;
   /** Built-in composer commands share the menu with harness/user skills. */
-  source?: "builtin" | "user" | "command";
+  source?: "builtin" | "user" | "project" | "command";
 }
 
-export const getSkills = (signal?: AbortSignal, harness?: string) => get<{ skills: SkillInfo[]; importing: boolean }>(`/api/skills${harness ? `?harness=${encodeURIComponent(harness)}` : ""}`, signal);
+export const getSkills = (signal?: AbortSignal, harness?: string, projectId?: string) => {
+  const query = new URLSearchParams({ ...(harness ? { harness } : {}), ...(projectId ? { project: projectId } : {}) });
+  return get<{ skills: SkillInfo[]; importing: boolean }>(`/api/skills${query.size ? `?${query}` : ""}`, signal);
+};
 
 export const getSkillContent = (name: string, projectId?: string, signal?: AbortSignal, harness?: string | null) =>
   get<{ content: string }>(
