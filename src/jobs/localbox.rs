@@ -52,7 +52,7 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     let completion = format!(
         "trap 'exit 143' TERM\ntrap {} EXIT\n",
         sh_quote(&format!(
-            "code=$?; echo \"$code\" > {}; wait; exit \"$code\"",
+            "code=$?; wait; echo \"$code\" > {}; exit \"$code\"",
             sh_quote(&crate::local::bash::bash_path(&dir.join("exit_code")))
         ))
     );
@@ -580,7 +580,19 @@ mod tests {
                 secret_env: HashMap::new(),
             })
             .unwrap();
-            assert_eq!(wait_terminal(&background).stage, "COMPLETED");
+            let heartbeat_path = background.join("heartbeat");
+            for _ in 0..100 {
+                if heartbeat_path.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                heartbeat_path.exists(),
+                "the background child did not start"
+            );
+            assert_eq!(inspect_job(&background).stage, "RUNNING");
+            assert!(!background.join("exit_code").exists());
             cancel_job(&background).unwrap();
             assert_reaped(&background);
             let heartbeat = std::fs::read(background.join("heartbeat")).unwrap();
