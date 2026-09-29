@@ -181,12 +181,18 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
             e
         )
     })?;
+    // Supervisors report monitoring failures only on stderr; keep them for diagnosis.
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::store::log_path(run_id).with_extension("supervisor.log"))
+        .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from);
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("supervise")
         .arg(run_id)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr);
     // The supervisor re-resolves its directories from its own environment, so
     // without this a run launched from the macOS app is tracked in a different
     // store than the app is reading.

@@ -20,6 +20,7 @@ import {
   fmtDuration,
   fmtNumber,
   runDisplayStatus,
+  runMonitoringError,
   timeAgo,
   type Experiment,
   type Run,
@@ -205,6 +206,7 @@ export function ExpHoverCard({
   const failureNote =
     latestRun?.status === "failed" && latestRun.resultMarkdown ? latestRun.resultMarkdown : null;
   const body = exp.description || (failureNote ? null : latestRun?.resultMarkdown) || null;
+  const monitoringError = latestRun ? runMonitoringError(latestRun) : null;
 
   // Clamped by default; "Show more" appears when the clamp actually hides
   // content and stays while expanded so "Show less" remains reachable.
@@ -268,6 +270,7 @@ export function ExpHoverCard({
         </button>
       )}
       {failureNote && <div className="hc-failure">{failureNote}</div>}
+      {monitoringError && <div className="hc-monitoring mt-2 text-accent-amber line-clamp-3">{monitoringError}</div>}
       <div className="hc-stats">
         <span>
           {new Intl.ListFormat(getLocale(), { style: "short" }).format([

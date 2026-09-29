@@ -11,6 +11,7 @@ import { useEffect, useState } from "react";
 import {
   fmtDuration,
   runDisplayStatus,
+  runMonitoringError,
   timeAgo,
   type Experiment,
   type Project,
@@ -142,6 +143,11 @@ export function ExperimentOverview({
               </div>
               {latestRun.command && (
                 <code className={EXPERIMENT_OVERVIEW_COMMAND_CLASS_NAME}>$ {latestRun.command}</code>
+              )}
+              {runMonitoringError(latestRun) && (
+                <p className="experiment-overview-monitoring mt-4 text-accent-amber text-sm wrap-anywhere">
+                  {runMonitoringError(latestRun)}
+                </p>
               )}
               {latestRun.resultMarkdown && (
                 <div
