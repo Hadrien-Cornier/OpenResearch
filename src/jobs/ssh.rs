@@ -487,10 +487,12 @@ const TERMINAL_TRAPS: &str = r#"trap 'code=$?; printf "%s\n" "$code" > exit_code
 stop_child() {
     kill -"$1" "$child" 2>/dev/null
     set -m
-    (sleep 2; kill -KILL -"$$" 2>/dev/null; while ps -e -o pgid= -o stat= | awk -v p="$$" '$1 == p && $2 !~ /^[ZX]/ { alive=1 } END { exit !alive }'; do sleep 0.1; done; printf "%s\n" "$2" > exit_code) </dev/null >/dev/null 2>&1 &
+    (sleep 2 & timer=$!; trap 'kill "$timer" 2>/dev/null; exit' TERM; wait "$timer" 2>/dev/null; kill -KILL -"$$" 2>/dev/null; while ps -e -o pgid= -o stat= | awk -v p="$$" '$1 == p && $2 !~ /^[ZX]/ { alive=1 } END { exit !alive }'; do sleep 0.1; done; printf "%s\n" "$2" > exit_code) </dev/null >/dev/null 2>&1 &
     killer=$!
-    set +m
     wait "$child" 2>/dev/null
+    if ! ps -e -o pgid= -o pid= -o stat= | awk -v p="$$" '$1 == p && $2 != p && $3 !~ /^[ZX]/ { alive=1 } END { exit !alive }'; then
+        kill "$killer" 2>/dev/null
+    fi
     wait "$killer" 2>/dev/null
     exit "$2"
 }
@@ -733,6 +735,40 @@ pub async fn preflight(target: &SshTarget) -> SshPreflight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn host_wrapper_finishes_cooperative_term_promptly() {
+        use std::os::unix::process::CommandExt;
+
+        let home = crate::local::git::TemporaryDirectory::new("orx-ssh-term-fast").unwrap();
+        let dir = home.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+        let script = home.path().join("run.sh");
+        std::fs::write(&script, host_script("run", "", "sleep 30")).unwrap();
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg(&script)
+            .env("HOME", home.path())
+            .process_group(0);
+        let mut wrapper = command.spawn().unwrap();
+        for _ in 0..100 {
+            if dir.join("log").exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let start = std::time::Instant::now();
+        unsafe { libc::kill(wrapper.id() as i32, libc::SIGTERM) };
+        wrapper.wait().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("exit_code"))
+                .unwrap()
+                .trim(),
+            "143"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
