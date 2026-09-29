@@ -487,10 +487,11 @@ const TERMINAL_TRAPS: &str = r#"trap 'code=$?; printf "%s\n" "$code" > exit_code
 stop_child() {
     kill -"$1" "$child" 2>/dev/null
     set -m
+    set -o pipefail
     (sleep 2 & timer=$!; trap 'kill "$timer" 2>/dev/null; exit' TERM; wait "$timer" 2>/dev/null; kill -KILL -"$$" 2>/dev/null; while ps -e -o pgid= -o stat= | awk -v p="$$" '$1 == p && $2 !~ /^[ZX]/ { alive=1 } END { exit !alive }'; do sleep 0.1; done; printf "%s\n" "$2" > exit_code) </dev/null >/dev/null 2>&1 &
     killer=$!
     wait "$child" 2>/dev/null
-    if ! ps -e -o pgid= -o pid= -o stat= | awk -v p="$$" '$1 == p && $2 != p && $3 !~ /^[ZX]/ { alive=1 } END { exit !alive }'; then
+    if ps -e -o pgid= -o pid= -o stat= | awk -v p="$$" '$1 == p && $2 != p && $3 !~ /^[ZX]/ { alive=1 } END { exit alive }'; then
         kill "$killer" 2>/dev/null
     fi
     wait "$killer" 2>/dev/null
@@ -772,7 +773,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn host_wrapper_kills_term_ignoring_descendants_and_records_term() {
+    fn host_wrapper_kills_term_ignoring_descendants_without_ps() {
         use std::os::unix::process::CommandExt;
 
         let home = crate::local::git::TemporaryDirectory::new("orx-ssh-term").unwrap();
@@ -788,10 +789,13 @@ mod tests {
             ),
         )
         .unwrap();
+        let bash_env = home.path().join("bash_env");
+        std::fs::write(&bash_env, "ps() { return 127; }\n").unwrap();
         let mut command = std::process::Command::new("bash");
         command
             .arg(&script)
             .env("HOME", home.path())
+            .env("BASH_ENV", &bash_env)
             .process_group(0);
         let mut wrapper = command.spawn().unwrap();
         for _ in 0..100 {
