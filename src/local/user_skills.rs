@@ -689,12 +689,31 @@ pub fn list_project_skills(repo: &Path, harness: Option<&str>) -> Vec<UserSkill>
     };
     let mut skills: Vec<_> = entries
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| read_uploaded_at(&entry.path()).ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| read_project_at(&entry.path()).ok())
         .filter(|skill| !is_reserved(&skill.name))
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+fn read_project_at(dir: &Path) -> Result<UserSkill> {
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| is_valid_slug(name))
+        .ok_or_else(|| anyhow!("invalid project skill name"))?;
+    let md_path = dir.join("SKILL.md");
+    let content = fs::read_to_string(&md_path)?;
+    let fm = parse_frontmatter(&content)?;
+    Ok(UserSkill {
+        name,
+        description: fm.description,
+        origin: None,
+        plugin: None,
+        bytes: content.len() as u64,
+        updated_at: mtime_ms(&md_path),
+    })
 }
 
 fn native_skills(harness: Option<&str>) -> Vec<Mirrored> {
@@ -979,7 +998,15 @@ fn instructions_selected_in(
     project_file: Option<&Path>,
 ) -> Option<String> {
     if selection == SkillSelection::Project {
-        let file = project_file.filter(|path| path.exists())?;
+        let file = match session_file {
+            Some(file) => {
+                let base = file.parent()?.parent()?;
+                let owned = previously_managed(base)
+                    .is_some_and(|names| names.iter().any(|managed| managed == name));
+                (!owned && file.exists()).then_some(file)?
+            }
+            None => project_file.filter(|path| path.exists())?,
+        };
         return Some(format!(
             "Use the project `{name}` skill at `{}`. Read that SKILL.md and follow it.",
             file.display()
@@ -1755,6 +1782,9 @@ mod tests {
             skill_md_desc("shared", "PROJECT SOURCE").replace("body", "PROJECT SOURCE"),
         )
         .unwrap();
+        let session_file = repo.join("session/.agents/skills/shared/SKILL.md");
+        fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        fs::write(&session_file, skill_md_desc("shared", "SESSION SOURCE")).unwrap();
 
         let project = list_project_skills(&repo, Some("codex"));
         assert_eq!(project.len(), 1);
@@ -1784,7 +1814,7 @@ mod tests {
             &[],
             "shared",
             SkillSelection::Project,
-            None,
+            Some(&session_file),
             Some(&project_file),
         )
         .unwrap();
@@ -1795,7 +1825,25 @@ mod tests {
                 .display()
                 .to_string()
         ));
-        assert!(project.contains(&project_file.display().to_string()));
+        assert!(project.contains(&session_file.display().to_string()));
+        assert!(!project.contains(&project_file.display().to_string()));
+        let manifest = session_file
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(MANAGED_MANIFEST);
+        fs::write(&manifest, "shared\n").unwrap();
+        assert!(instructions_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Project,
+            Some(&session_file),
+            Some(&project_file)
+        )
+        .is_none());
+        fs::remove_file(manifest).unwrap();
         assert!(content_selected_in(
             &root,
             &[],
@@ -1814,7 +1862,37 @@ mod tests {
         )
         .unwrap()
         .contains("PROJECT SOURCE"));
+        fs::remove_file(&session_file).unwrap();
+        assert!(instructions_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Project,
+            Some(&session_file),
+            Some(&project_file)
+        )
+        .is_none());
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_picker_includes_symlinked_and_large_skills() {
+        let repo = temp_root();
+        let real = repo.join("real-skill");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("SKILL.md"), skill_md_desc("linked", "linked")).unwrap();
+        fs::File::create(real.join("asset.bin"))
+            .unwrap()
+            .set_len(MAX_TOTAL_BYTES + 1)
+            .unwrap();
+        let dir = repo.join(".agents/skills");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("linked")).unwrap();
+        let skills = list_project_skills(&repo, Some("codex"));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "linked");
         let _ = fs::remove_dir_all(repo);
     }
 
