@@ -2,15 +2,12 @@ import type { SkillInfo } from "./api";
 import { m } from "./paraglide/messages.js";
 
 export function commandDisplayName(name: string): string {
-  const [base, source] = name.split("@");
-  const label = base.charAt(0).toUpperCase() + base.slice(1).replaceAll("-", " ");
-  if (source === "personal") return `${label} · ${m.skill_menu_personal()}`;
-  if (source === "project") return `${label} · ${m.header_project()}`;
-  return label;
+  const base = name.split("@")[0];
+  return base.charAt(0).toUpperCase() + base.slice(1).replaceAll("-", " ");
 }
 
 export function commandLabel(skill: SkillInfo): string {
-  return `${skill.plugin ? `${commandDisplayName(skill.plugin)}: ` : ""}${commandDisplayName(skill.name.split("@")[0])}`;
+  return `${skill.plugin ? `${commandDisplayName(skill.plugin)}: ` : ""}${commandDisplayName(skill.name)}`;
 }
 
 /** Built-in commands the dashboard runs instead of sending, same on every harness. */
