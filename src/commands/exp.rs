@@ -181,7 +181,8 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
             e
         )
     })?;
-    let mut cmd = std::process::Command::new(exe);
+    // A long-lived `orx up` may be running a replaced binary; spawn the new file at its path.
+    let mut cmd = std::process::Command::new(crate::updates::relaunch_target(exe));
     cmd.arg("supervise")
         .arg(run_id)
         .stdin(std::process::Stdio::null())

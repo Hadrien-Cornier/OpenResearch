@@ -986,8 +986,7 @@ pub fn relaunch(port: u16) -> std::io::Error {
 
 /// Linux reports a replaced binary as `<path> (deleted)`; the installer put the
 /// new file at `<path>`, which is what to exec.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn relaunch_target(exe: PathBuf) -> PathBuf {
+pub(crate) fn relaunch_target(exe: PathBuf) -> PathBuf {
     exe.to_str()
         .and_then(|exe| exe.strip_suffix(" (deleted)"))
         .map(PathBuf::from)
