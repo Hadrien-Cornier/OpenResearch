@@ -63,7 +63,7 @@ pub async fn run(args: crate::VersionArgs) -> Result<()> {
     println!("orx {}", current);
     match latest.filter(|_| update_available) {
         Some(latest) => println!(
-            "A new release is available: {} → {}. Run `{} update` to upgrade. Release notes: {}/releases/tag/v{}",
+            "A new release is available: {} → {}. Run `{} update` to upgrade. Release notes: {}/releases/tag/{}",
             current,
             latest.version,
             crate::invocation::orx(),
