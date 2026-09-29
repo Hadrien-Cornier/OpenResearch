@@ -820,6 +820,13 @@ fn remote_route_forbidden(path: &str) -> bool {
 }
 
 fn is_remote_callback_route(method: &Method, path: &str) -> bool {
+    if method == Method::GET {
+        // `orx agent spawn`'s install preflight (read-only).
+        return path
+            .strip_prefix("/api/harnesses/")
+            .and_then(|path| path.strip_suffix("/snapshot"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    }
     if method != Method::POST {
         return false;
     }
@@ -7768,7 +7775,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_callback_token_is_limited_to_run_submission_and_cancellation() {
+    fn remote_callback_token_is_limited_to_runs_and_the_spawn_preflight() {
         assert!(is_remote_callback_route(&Method::POST, "/api/runs"));
         assert!(is_remote_callback_route(
             &Method::POST,
@@ -7782,6 +7789,19 @@ mod tests {
         assert!(!is_remote_callback_route(
             &Method::POST,
             "/api/chat/sessions/s1/message"
+        ));
+        assert!(is_remote_callback_route(
+            &Method::GET,
+            "/api/harnesses/codex/snapshot"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::POST,
+            "/api/harnesses/codex/snapshot"
+        ));
+        assert!(!is_remote_callback_route(&Method::GET, "/api/harnesses"));
+        assert!(!is_remote_callback_route(
+            &Method::GET,
+            "/api/harnesses/setup/commands"
         ));
     }
 
