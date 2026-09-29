@@ -1112,7 +1112,7 @@ async fn codex_auto_review_supported(client: &CodexClient, workspace: &Path) -> 
 }
 
 /// The per-turn `sandboxPolicy` object. workspace-write carries the same
-/// grants the exec path passed via `-c`: the orx data dir, its lifecycle lock,
+/// grants the exec path passed via `-c`: the orx data dir, its lock directory,
 /// and the hub clone's `.git` as writable roots (see the helpers below), plus
 /// network (the agent's job is driving the orx API and git). Like the exec `-c`
 /// override, this is a full policy replacement for the turn — a user's own
@@ -1124,7 +1124,7 @@ async fn sandbox_policy_json(mode: Option<PermissionMode>, workspace: &Path) -> 
         _ => {
             let mut roots: Vec<String> = Vec::new();
             roots.extend(ensure_orx_data_dir().map(|p| p.to_string_lossy().into_owned()));
-            roots.extend(ensure_orx_lifecycle_lock().map(|p| p.to_string_lossy().into_owned()));
+            roots.extend(ensure_orx_lifecycle_lock_dir().map(|p| p.to_string_lossy().into_owned()));
             roots.extend(
                 shared_git_dir(workspace)
                     .await
@@ -3332,12 +3332,11 @@ pub(crate) fn ensure_orx_data_dir() -> Option<PathBuf> {
     crate::paths::canonicalize(&dir).ok()
 }
 
-/// The exact lifecycle lock file required by every stateful `orx` command.
-/// Granting only this file avoids exposing the neighboring credentials file.
-fn ensure_orx_lifecycle_lock() -> Option<PathBuf> {
+/// The lifecycle lock's own directory keeps credentials outside writable roots.
+fn ensure_orx_lifecycle_lock_dir() -> Option<PathBuf> {
     let lock = crate::store::open_lifecycle_lock().ok()?;
     drop(lock);
-    crate::paths::canonicalize(crate::store::lifecycle_lock_path()).ok()
+    crate::paths::canonicalize(crate::store::lifecycle_lock_path().parent()?).ok()
 }
 
 /// Session reasoning id → Codex `model_reasoning_effort` value.
@@ -3505,10 +3504,9 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             //     every `orx` command that touches it fails with "unable to
             //     open database file"; grant the data dir (see
             //     `ensure_orx_data_dir`).
-            //   * Every stateful `orx` command takes a lifecycle lock in the
-            //     config dir before opening the store. Grant only that lock
-            //     file, not the neighboring credentials (see
-            //     `ensure_orx_lifecycle_lock`).
+            //   * Every stateful `orx` command takes a lifecycle lock before
+            //     opening the store. Grant its directory without granting
+            //     the neighboring credentials (see `ensure_orx_lifecycle_lock_dir`).
             //   * Git metadata isn't writable — codex protects `.git` inside
             //     the workspace, and a worktree's real metadata (the hub
             //     clone's `.git`) sits outside it — so `git fetch`/`commit`
@@ -3521,7 +3519,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
                 let data_dir = ensure_orx_data_dir();
                 let roots: Vec<PathBuf> = [
                     data_dir.clone(),
-                    ensure_orx_lifecycle_lock(),
+                    ensure_orx_lifecycle_lock_dir(),
                     shared_git_dir(&repo).await,
                 ]
                 .into_iter()
@@ -5172,6 +5170,17 @@ requires_openai_auth = false
         // No roots → no flag at all; `=[]` would clobber the user's own
         // config.toml roots for the turn.
         assert_eq!(writable_roots_override(&[]), None);
+    }
+
+    #[test]
+    fn lifecycle_lock_writable_root_is_a_directory() {
+        let root = ensure_orx_lifecycle_lock_dir().unwrap();
+        assert!(root.is_dir(), "writable root must be a directory: {root:?}");
+        let lock = crate::paths::canonicalize(crate::store::lifecycle_lock_path()).unwrap();
+        assert_eq!(lock.parent(), Some(root.as_path()));
+        assert!(!crate::config::config_dir()
+            .join("credentials.json")
+            .starts_with(root));
     }
 
     #[test]

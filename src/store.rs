@@ -38,11 +38,22 @@ pub fn data_dir() -> PathBuf {
 
 pub(crate) fn open_lifecycle_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
     // The config dir stays put while the user can move the live data directory.
-    open_lifecycle_lock_at(&lifecycle_lock_path())
+    let path = lifecycle_lock_path();
+    if !path.exists() {
+        let legacy = crate::config::config_dir().join("orx.lifecycle.lock");
+        drop(open_lifecycle_lock_at(&legacy)?);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        match std::fs::hard_link(&legacy, &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    open_lifecycle_lock_at(&path)
 }
 
 pub(crate) fn lifecycle_lock_path() -> PathBuf {
-    crate::config::config_dir().join("orx.lifecycle.lock")
+    crate::config::config_dir().join("locks/orx.lifecycle.lock")
 }
 
 pub(crate) fn open_lifecycle_lock_at(
@@ -3194,6 +3205,19 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_keeps_legacy_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _lock = open_lifecycle_lock().unwrap();
+        let legacy = crate::config::config_dir().join("orx.lifecycle.lock");
+        assert_eq!(
+            std::fs::metadata(legacy).unwrap().ino(),
+            std::fs::metadata(lifecycle_lock_path()).unwrap().ino()
+        );
+    }
 
     #[test]
     fn human_bytes_scales() {
