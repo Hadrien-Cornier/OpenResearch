@@ -2,7 +2,12 @@ import type { SkillInfo } from "./api";
 import { m } from "./paraglide/messages.js";
 
 export function commandDisplayName(name: string): string {
-  return name.charAt(0).toUpperCase() + name.slice(1).replaceAll("-", " ");
+  const base = name.split("@")[0].replace(/[~^]$/, "");
+  return base.charAt(0).toUpperCase() + base.slice(1).replaceAll("-", " ");
+}
+
+export function canonicalSkillName(name: string): string {
+  return name.replace(/@personal$|\^$/, "@u").replace(/@project$|~$/, "@p");
 }
 
 export function commandLabel(skill: SkillInfo): string {
@@ -162,8 +167,7 @@ export function commandsForHarness(
   skills: SkillInfo[],
   planActivation: "permission" | "command" | null | undefined,
 ): SkillInfo[] {
-  // Every skill is inserted and resolved by its bare name, a plugin's included,
-  // so one sharing a command's name (or alias) would shadow it.
+  // Keep dashboard commands ahead of skills with the same name or alias.
   const availableSkills = skills.filter((skill) => !resolveComposerCommand(skill.name));
   for (const name of availableCommands(planActivation)) availableSkills.push(composerCommand(name));
   return availableSkills.sort((a, b) => {

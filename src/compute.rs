@@ -667,6 +667,20 @@ pub fn capabilities() -> Vec<Capabilities> {
 }
 
 pub fn validate_run_args(args: &crate::ExpRunArgs) -> Result<()> {
+    if let Some(timeout) = &args.timeout {
+        match args.backend.as_deref().unwrap_or("local") {
+            "local" | "ssh" => {
+                return Err(anyhow!("--timeout does not apply to this backend."));
+            }
+            "ray" => {
+                return Err(anyhow!("--timeout isn't supported on --backend ray."));
+            }
+            "tinker" => {}
+            _ => {
+                crate::jobs::huggingface::parse_timeout(timeout)?;
+            }
+        }
+    }
     if (args.container.is_some() || args.no_container) && args.backend.as_deref() != Some("ssh") {
         return Err(anyhow!(
             "--container and --no-container only apply with --backend ssh."
@@ -725,6 +739,7 @@ pub fn validate_run_args(args: &crate::ExpRunArgs) -> Result<()> {
 }
 
 pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
+    validate_run_args(args)?;
     let backend_id = args.backend.as_deref().unwrap_or("local");
     let backend = backend(backend_id)?;
     let store = Store::open()?;
@@ -1024,5 +1039,28 @@ mod tests {
         args.image = None;
         args.timeout = Some("1h".into());
         assert!(validate_run_args(&args).is_err());
+    }
+
+    #[test]
+    fn invalid_timeout_is_rejected_before_submission() {
+        let mut args = tinker_args();
+        for backend in [
+            None,
+            Some("local"),
+            Some("ssh"),
+            Some("ray"),
+            Some("tinker"),
+        ] {
+            args.backend = backend.map(str::to_string);
+            args.timeout = Some("1h".into());
+            assert!(validate_run_args(&args).is_err(), "{backend:?}");
+        }
+        args.backend = Some("hf".into());
+        for timeout in ["0s", "18446744073709551615d", "bad"] {
+            args.timeout = Some(timeout.into());
+            assert!(validate_run_args(&args).is_err(), "{timeout}");
+        }
+        args.timeout = Some("1h".into());
+        assert!(validate_run_args(&args).is_ok());
     }
 }

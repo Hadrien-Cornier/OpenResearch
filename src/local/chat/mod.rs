@@ -2766,10 +2766,34 @@ fn slash_skill_name(token: &str) -> Option<String> {
     Some(name.to_ascii_lowercase())
 }
 
+async fn prepare_project_slash_worktree(project: &LocalProject, text: &str, session_id: &str) {
+    let has_project_skill = text
+        .split_whitespace()
+        .filter_map(slash_skill_name)
+        .any(|name| {
+            matches!(
+                crate::local::user_skills::parse_selection(&name),
+                Some((_, crate::local::user_skills::SkillSelection::Project))
+            )
+        });
+    if !has_project_skill
+        || crate::local::git::existing_session_worktree_path(project, session_id).exists()
+    {
+        return;
+    }
+    let project = project.clone();
+    let session_id = session_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::local::git::ensure_session_worktree(&project, &session_id)
+    })
+    .await;
+}
+
 fn selected_slash_skills(
     project: &LocalProject,
     text: &str,
     harness: Option<&str>,
+    session_id: Option<&str>,
 ) -> (Vec<SelectedSlashSkill>, bool) {
     let has_request = text
         .split_whitespace()
@@ -2799,9 +2823,18 @@ fn selected_slash_skills(
                     instructions,
                 });
             }
-        } else if let Some(instructions) = crate::local::user_skills::instructions(&name, harness) {
-            seen.insert(name);
-            selected.push(SelectedSlashSkill::User { instructions });
+        } else {
+            if let Some(instructions) = crate::local::user_skills::instructions(
+                &name,
+                harness,
+                session_id
+                    .map(|id| crate::local::git::existing_session_worktree_path(project, id))
+                    .as_deref(),
+                Some(std::path::Path::new(&project.repo_path)),
+            ) {
+                seen.insert(name);
+                selected.push(SelectedSlashSkill::User { instructions });
+            }
         }
     }
     (selected, has_request)
@@ -2809,7 +2842,7 @@ fn selected_slash_skills(
 
 /// Bundled catalog only: user skill names are free text and stay local.
 pub(crate) fn builtin_slash_skill_names(project: &LocalProject, text: &str) -> Vec<&'static str> {
-    selected_slash_skills(project, text, None)
+    selected_slash_skills(project, text, None, None)
         .0
         .into_iter()
         .filter_map(|skill| match skill {
@@ -2821,8 +2854,13 @@ pub(crate) fn builtin_slash_skill_names(project: &LocalProject, text: &str) -> V
 
 /// Slash tokens select supplementary instructions. The transcript keeps the
 /// exact message, while every recognized selection shares that complete request.
-fn expand_slash_skills(project: &LocalProject, text: &str, harness: Option<&str>) -> String {
-    let (selected, has_request) = selected_slash_skills(project, text, harness);
+fn expand_slash_skills(
+    project: &LocalProject,
+    text: &str,
+    harness: Option<&str>,
+    session_id: Option<&str>,
+) -> String {
+    let (selected, has_request) = selected_slash_skills(project, text, harness, session_id);
     if selected.is_empty() {
         return text.to_string();
     }
@@ -2871,7 +2909,7 @@ mod slash_skill_tests {
     fn expands_multiple_inline_skills_with_one_shared_request() {
         let text =
             "Compare LoRA methods /LIT-REVIEW and draft the result /write-paper for an ML audience";
-        let expanded = expand_slash_skills(&project(), text, None);
+        let expanded = expand_slash_skills(&project(), text, None, None);
         assert!(expanded.contains("# Literature retrieval"));
         assert!(expanded.contains("Load the `orx-paper` skill first"));
         assert_eq!(expanded.matches("User request:").count(), 1);
@@ -2881,11 +2919,11 @@ mod slash_skill_tests {
     #[test]
     fn deduplicates_selected_skills_and_preserves_unknown_slashes() {
         let text = "/lit-review compare /unknown against prior work /lit-review";
-        let expanded = expand_slash_skills(&project(), text, None);
+        let expanded = expand_slash_skills(&project(), text, None, None);
         assert_eq!(expanded.matches("# Literature retrieval").count(), 1);
         assert!(expanded.ends_with(text));
         assert_eq!(
-            expand_slash_skills(&project(), "plain /unknown text", None),
+            expand_slash_skills(&project(), "plain /unknown text", None, None),
             "plain /unknown text"
         );
         assert_eq!(
@@ -2899,11 +2937,11 @@ mod slash_skill_tests {
 
     #[test]
     fn a_bare_selection_uses_the_workflows_empty_request_behavior() {
-        let expanded = expand_slash_skills(&project(), "/lit-review", None);
+        let expanded = expand_slash_skills(&project(), "/lit-review", None, None);
         assert!(expanded.contains("ask the user what topic to review"));
         assert!(!expanded.contains("User request:"));
 
-        let punctuation = expand_slash_skills(&project(), "/lit-review /unknown .", None);
+        let punctuation = expand_slash_skills(&project(), "/lit-review /unknown .", None, None);
         assert!(punctuation.contains("ask the user what topic to review"));
         assert!(!punctuation.contains("User request:"));
     }
@@ -4356,9 +4394,19 @@ impl ChatHost {
                     .get_chat_session(session_id)?
                     .ok_or_else(|| anyhow!("chat session not found"))?;
                 let project = store.get_local_project(&session.project_id)?;
+                if let Some(project) = &project {
+                    prepare_project_slash_worktree(project, &text, session_id).await;
+                }
                 let message = SteerMessage {
                     text: project
-                        .map(|project| expand_slash_skills(&project, &text, Some(&session.harness)))
+                        .map(|project| {
+                            expand_slash_skills(
+                                &project,
+                                &text,
+                                Some(&session.harness),
+                                Some(session_id),
+                            )
+                        })
                         .unwrap_or_else(|| text.clone()),
                     display: text.clone(),
                 };
@@ -5410,9 +5458,14 @@ impl ChatHost {
         )?);
         // Slash-skills: the transcript keeps the `/name` the user typed; the
         // harness gets the expanded prompt.
+        if prepared_input.is_none() {
+            for message in &messages {
+                prepare_project_slash_worktree(&project, &message.text, &session.id).await;
+            }
+        }
         let mut turn_text = prepared_input.unwrap_or_else(|| {
             let expanded = contextualize_messages(messages, |text| {
-                expand_slash_skills(&project, text, Some(&session.harness))
+                expand_slash_skills(&project, text, Some(&session.harness), Some(&session.id))
             });
             with_turn_context(
                 session.native_session_id.as_deref(),

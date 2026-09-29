@@ -476,7 +476,14 @@ pub fn parse_timeout(value: &str) -> Result<u64> {
     let n: u64 = num
         .parse()
         .map_err(|_| anyhow!("Bad --timeout '{}': use e.g. 30m, 4h, 1d.", value))?;
-    Ok(n * factor)
+    n.checked_mul(factor)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            anyhow!(
+                "Bad --timeout '{}': use a positive duration that fits in seconds.",
+                value
+            )
+        })
 }
 
 /// Where to watch the job on huggingface.co.

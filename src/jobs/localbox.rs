@@ -1,7 +1,7 @@
 //! Local backend — run an experiment as a detached process on this machine.
 //!
 //! The no-transport twin of `jobs/ssh.rs`: same run-dir layout
-//!   run.sh      the launcher (exported env + clone-and-run payload)
+//!   run.sh      the launcher (clone-and-run payload)
 //!   log         merged stdout/stderr
 //!   pid         the detached process-group leader
 //!   exit_code   written when the payload finishes
@@ -33,7 +33,7 @@ pub struct LocalJobSpec {
     pub run_id: String,
     /// The shared clone-and-run payload (`bash` script body).
     pub script: String,
-    /// Exported inside run.sh (tokens, synced env) — written owner-only.
+    /// Inherited by the launcher without being written into run.sh.
     pub env: HashMap<String, String>,
     /// Inherited by the controller without being written into run.sh.
     pub secret_env: HashMap<String, String>,
@@ -47,15 +47,10 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
     let env = super::default_python_env(&spec.env);
-    let exports: String = env
-        .iter()
-        .map(|(k, v)| format!("export {}={}", k, sh_quote(v)))
-        .collect::<Vec<_>>()
-        .join("\n");
     // Same subshell shape as the ssh backend: an `exit`/`set -e` failure inside
     // `( … )` ends the subshell, not run.sh, so exit_code is always written.
     let run_sh = format!(
-        "#!/usr/bin/env bash\n{exports}\ncd {dir} || exit 97\n(\n{script}\n) > log 2>&1\necho $? > exit_code\n",
+        "#!/usr/bin/env bash\ncd {dir} || exit 97\n(\n{script}\n) > log 2>&1\necho $? > exit_code\n",
         dir = sh_quote(&crate::local::bash::bash_path(&dir)),
         script = spec.script,
     );
@@ -64,7 +59,7 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
         .map_err(|e| anyhow!("Could not write {}: {}", run_sh_path.display(), e))?;
     #[cfg(unix)]
     {
-        // run.sh carries exported tokens — keep both it and the dir owner-only.
+        // The payload may write sensitive output, so keep its artifacts owner-only.
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::set_permissions(&run_sh_path, std::fs::Permissions::from_mode(0o600));
@@ -77,6 +72,7 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
         cmd.env("PATH", path);
     }
     cmd.arg("run.sh")
+        .envs(&env)
         .envs(&spec.secret_env)
         .current_dir(&dir)
         .stdin(std::process::Stdio::null())
@@ -418,22 +414,24 @@ mod tests {
 
         let dir = run_job(&LocalJobSpec {
             run_id: "lifecycle".into(),
-            script: "[ -n \"$TINKER_API_KEY\" ] && echo hello-$ORX_TEST_VAR".into(),
-            env: HashMap::from([("ORX_TEST_VAR".to_string(), "42".to_string())]),
+            script: "[ -n \"$TINKER_API_KEY\" ] && echo hello-$ORX_TEST_VAR-$HF_TOKEN".into(),
+            env: HashMap::from([
+                ("ORX_TEST_VAR".to_string(), "42".to_string()),
+                ("HF_TOKEN".to_string(), "fake-token".to_string()),
+            ]),
             secret_env: HashMap::from([("TINKER_API_KEY".to_string(), "s3cr3t-value".to_string())]),
         })
         .unwrap();
         let state = wait_terminal(&dir);
         assert_eq!(state.stage, "COMPLETED", "message: {:?}", state.message);
-        // Python is defaulted to unbuffered so tailed-`log` output streams live.
         let run_sh = std::fs::read_to_string(dir.join("run.sh")).unwrap();
-        assert!(run_sh.contains("export PYTHONUNBUFFERED='1'\n"));
+        assert!(!run_sh.contains("fake-token"));
         assert!(!run_sh.contains("s3cr3t-value"));
 
         let mut lines = Vec::new();
         let seen = stream_logs(&dir, 0, &mut |l| lines.push(l.to_string())).unwrap();
         assert_eq!(seen, 1);
-        assert_eq!(lines, ["hello-42"]);
+        assert_eq!(lines, ["hello-42-fake-token"]);
         // Re-poll past the consumed lines: nothing new.
         assert_eq!(stream_logs(&dir, seen, &mut |_| ()).unwrap(), seen);
         #[cfg(windows)]
