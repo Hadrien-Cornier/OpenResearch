@@ -483,7 +483,18 @@ pub struct SshJobSpec {
     pub container: Option<ContainerRun>,
 }
 
-const TERMINAL_TRAPS: &str = "trap 'code=$?; printf \"%s\\n\" \"$code\" > exit_code' EXIT\ntrap 'kill -TERM \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; exit 143' TERM\ntrap 'kill -INT \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; exit 130' INT";
+const TERMINAL_TRAPS: &str = r#"trap 'code=$?; printf "%s\n" "$code" > exit_code' EXIT
+stop_child() {
+    kill -"$1" "$child" 2>/dev/null
+    (sleep 2 & timer=$!; trap 'kill "$timer" 2>/dev/null; exit' TERM; wait "$timer" 2>/dev/null; kill -KILL "$child" 2>/dev/null) &
+    killer=$!
+    wait "$child" 2>/dev/null
+    kill "$killer" 2>/dev/null
+    wait "$killer" 2>/dev/null
+    exit "$2"
+}
+trap 'stop_child TERM 143' TERM
+trap 'stop_child INT 130' INT"#;
 
 fn host_script(dir: &str, exports: &str, script: &str) -> String {
     format!("#!/usr/bin/env bash\ncd \"$HOME/{dir}\" || exit 97\nchild=\n{TERMINAL_TRAPS}\n(\n{exports}\n{script}\n) > log 2>&1 &\nchild=$!\nwait \"$child\"\n")
@@ -724,14 +735,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn host_wrapper_stops_payload_and_records_term() {
+    fn host_wrapper_kills_term_ignoring_payload_and_records_term() {
         let home = crate::local::git::TemporaryDirectory::new("orx-ssh-term").unwrap();
         let dir = home.path().join("run");
         std::fs::create_dir(&dir).unwrap();
         let script = home.path().join("run.sh");
         std::fs::write(
             &script,
-            host_script("run", "", "sh -c 'echo $$ > child_pid; exec sleep 30'"),
+            host_script(
+                "run",
+                "",
+                "sh -c 'trap \"\" TERM; echo $$ > child_pid; exec sleep 30'",
+            ),
         )
         .unwrap();
         let mut wrapper = std::process::Command::new("bash")
