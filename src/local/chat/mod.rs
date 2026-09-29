@@ -7736,12 +7736,15 @@ fn run_wakeup_text(run: &crate::store::StoredRun) -> Option<String> {
 fn run_monitoring_text(runs: &[(crate::store::StoredRun, String)]) -> String {
     let lines = runs
         .iter()
-        .map(|(run, error)| format!("- `{}` (still **{}**): {error}", run.id, run.status))
+        .map(|(run, error)| {
+            let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("- `{}` (still **{}**): {error}", run.id, run.status)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
         "[orx] orx can no longer monitor these live runs:\n{lines}\nTell the user so they can \
-         restore access. orx wakes you once it can see a run finish; until then each run keeps \
+         fix it. orx wakes you once it can see a run finish; until then each run keeps \
          its current status."
     )
 }
@@ -10564,14 +10567,14 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
             "[orx] orx can no longer monitor these live runs:\n\
 - `run_x` (still **starting**): Monitoring unavailable: ssh failed.\n\
 - `run_y` (still **running**): Monitoring unavailable: no scheduler record.\n\
-Tell the user so they can restore access. orx wakes you once it can see a run finish; until then \
-each run keeps its current status."
+Tell the user so they can fix it. orx wakes you once it can see a run finish; until then each \
+run keeps its current status."
         );
     }
 
     #[tokio::test]
-    async fn undelivered_monitoring_alert_is_retried() {
-        let (store, dir) = temp_store("alert-undelivered");
+    async fn busy_session_leaves_monitoring_alert_unclaimed() {
+        let (store, dir) = temp_store("alert-busy");
         session(&store, "owner");
         store.upsert_run(&unmonitored_run()).unwrap();
         store.register_run_wakeup("run_x", "owner").unwrap();
@@ -10580,6 +10583,10 @@ each run keeps its current status."
             Arc::new(crate::local::codex::CodexHost::new()),
             Arc::new(crate::local::claude::ClaudeHost::new()),
         ));
+        host.turns
+            .lock()
+            .await
+            .insert("owner".into(), TurnState::Draining);
 
         drop(store);
         process_run_wakeups(&host, Store::open_at(dir.clone()).unwrap(), None)

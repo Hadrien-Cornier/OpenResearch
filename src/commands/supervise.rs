@@ -1115,6 +1115,7 @@ async fn run_slurm(
     let mut last_status = status_of(&stored)?;
     let mut cancel_sent = descriptor.cancellation_accepted;
     let mut failing_since = None;
+    let mut last_error = None;
 
     loop {
         if !cancel_sent && local_cancel_requested(&store, &run_id) {
@@ -1131,6 +1132,12 @@ async fn run_slurm(
             Ok(job) if matches!(job.stage.as_str(), "GONE" | "UNAVAILABLE") => Some("Monitoring unavailable: no exit status or scheduler record. Check cluster/accounting availability; the job has not been declared stopped.".into()),
             _ => None,
         };
+        if let Some(message) = &error {
+            if last_error.as_ref() != Some(message) {
+                eprintln!("supervise {run_id}: {message}");
+            }
+        }
+        last_error = error.clone();
         failing_since = error
             .as_ref()
             .map(|_| failing_since.unwrap_or_else(std::time::Instant::now));
@@ -1142,9 +1149,6 @@ async fn run_slurm(
         if reported != descriptor.monitoring_error
             || cancel_sent != descriptor.cancellation_accepted
         {
-            if let Some(error) = &reported {
-                eprintln!("supervise {run_id}: {error}");
-            }
             let mut updated = descriptor.clone();
             updated.monitoring_error = reported;
             updated.cancellation_accepted = cancel_sent;
