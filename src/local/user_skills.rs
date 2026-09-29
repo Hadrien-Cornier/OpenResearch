@@ -1003,7 +1003,38 @@ fn instructions_selected_in(
                 let base = file.parent()?.parent()?;
                 let owned = previously_managed(base)
                     .is_some_and(|names| names.iter().any(|managed| managed == name));
-                (!owned && file.exists()).then_some(file)?
+                let worktree = base.parent()?.parent()?;
+                let tracked = file
+                    .strip_prefix(worktree)
+                    .ok()
+                    .and_then(|path| path.to_str())
+                    .is_some_and(|path| super::git::is_tracked(worktree, path));
+                let matches_project = project_file.is_some_and(|project| {
+                    fs::read(file)
+                        .ok()
+                        .zip(fs::read(project).ok())
+                        .is_some_and(|(session, source)| session == source)
+                });
+                let personal_dir = source_dirs(root, mirrored)
+                    .into_iter()
+                    .find(|(skill_name, _)| skill_name == name)
+                    .map(|(_, dir)| dir);
+                let upload_copy = personal_dir.as_ref().is_some_and(|dir| {
+                    dir == &store_dir(root).join(name)
+                        && file
+                            .parent()
+                            .is_some_and(|parent| dest_matches_source(dir, tally_all(dir), parent))
+                });
+                if owned
+                    || !file.exists()
+                    || (personal_dir.is_some() && !tracked && !matches_project)
+                    || upload_copy
+                {
+                    return Some(format!(
+                        "Project skill `{name}` is unavailable in this chat's worktree. Do not read or apply a different source."
+                    ));
+                }
+                file
             }
             None => project_file.filter(|path| path.exists())?,
         };
@@ -1785,6 +1816,13 @@ mod tests {
         let session_file = repo.join("session/.agents/skills/shared/SKILL.md");
         fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         fs::write(&session_file, skill_md_desc("shared", "SESSION SOURCE")).unwrap();
+        let session_repo = repo.join("session");
+        crate::local::git::git(Some(&session_repo), &["init", "-q"]).unwrap();
+        crate::local::git::git(
+            Some(&session_repo),
+            &["add", ".agents/skills/shared/SKILL.md"],
+        )
+        .unwrap();
 
         let project = list_project_skills(&repo, Some("codex"));
         assert_eq!(project.len(), 1);
@@ -1827,6 +1865,19 @@ mod tests {
         ));
         assert!(project.contains(&session_file.display().to_string()));
         assert!(!project.contains(&project_file.display().to_string()));
+        let untracked_file = repo.join("untracked/.agents/skills/shared/SKILL.md");
+        fs::create_dir_all(untracked_file.parent().unwrap()).unwrap();
+        fs::copy(&project_file, &untracked_file).unwrap();
+        assert!(instructions_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Project,
+            Some(&untracked_file),
+            Some(&project_file)
+        )
+        .unwrap()
+        .contains(&untracked_file.display().to_string()));
         let manifest = session_file
             .parent()
             .unwrap()
@@ -1842,8 +1893,21 @@ mod tests {
             Some(&session_file),
             Some(&project_file)
         )
-        .is_none());
+        .unwrap()
+        .contains("unavailable"));
         fs::remove_file(manifest).unwrap();
+        fs::write(&session_file, &upload_md).unwrap();
+        assert!(instructions_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Project,
+            Some(&session_file),
+            Some(&project_file)
+        )
+        .unwrap()
+        .contains("unavailable"));
+        fs::write(&session_file, skill_md_desc("shared", "SESSION SOURCE")).unwrap();
         assert!(content_selected_in(
             &root,
             &[],
@@ -1871,7 +1935,8 @@ mod tests {
             Some(&session_file),
             Some(&project_file)
         )
-        .is_none());
+        .unwrap()
+        .contains("unavailable"));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(repo);
     }
