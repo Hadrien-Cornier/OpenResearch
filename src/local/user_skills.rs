@@ -1019,16 +1019,9 @@ fn instructions_selected_in(
                     .into_iter()
                     .find(|(skill_name, _)| skill_name == name)
                     .map(|(_, dir)| dir);
-                let upload_copy = personal_dir.as_ref().is_some_and(|dir| {
-                    dir == &store_dir(root).join(name)
-                        && file
-                            .parent()
-                            .is_some_and(|parent| dest_matches_source(dir, tally_all(dir), parent))
-                });
                 if owned
                     || !file.exists()
                     || (personal_dir.is_some() && !tracked && !matches_project)
-                    || upload_copy
                 {
                     return Some(format!(
                         "Project skill `{name}` is unavailable in this chat's worktree. Do not read or apply a different source."
@@ -1865,6 +1858,24 @@ mod tests {
         ));
         assert!(project.contains(&session_file.display().to_string()));
         assert!(!project.contains(&project_file.display().to_string()));
+        fs::write(&project_file, &upload_md).unwrap();
+        fs::write(&session_file, &upload_md).unwrap();
+        assert!(instructions_selected_in(
+            &root,
+            &[],
+            "shared",
+            SkillSelection::Project,
+            Some(&session_file),
+            Some(&project_file)
+        )
+        .unwrap()
+        .contains(&session_file.display().to_string()));
+        fs::write(
+            &project_file,
+            skill_md_desc("shared", "PROJECT SOURCE").replace("body", "PROJECT SOURCE"),
+        )
+        .unwrap();
+        fs::write(&session_file, skill_md_desc("shared", "SESSION SOURCE")).unwrap();
         let untracked_file = repo.join("untracked/.agents/skills/shared/SKILL.md");
         fs::create_dir_all(untracked_file.parent().unwrap()).unwrap();
         fs::copy(&project_file, &untracked_file).unwrap();
@@ -1896,18 +1907,17 @@ mod tests {
         .unwrap()
         .contains("unavailable"));
         fs::remove_file(manifest).unwrap();
-        fs::write(&session_file, &upload_md).unwrap();
+        fs::write(&untracked_file, &upload_md).unwrap();
         assert!(instructions_selected_in(
             &root,
             &[],
             "shared",
             SkillSelection::Project,
-            Some(&session_file),
+            Some(&untracked_file),
             Some(&project_file)
         )
         .unwrap()
         .contains("unavailable"));
-        fs::write(&session_file, skill_md_desc("shared", "SESSION SOURCE")).unwrap();
         assert!(content_selected_in(
             &root,
             &[],
