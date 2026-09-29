@@ -175,7 +175,7 @@ pub(crate) fn default_hf_image(flavor: &str) -> String {
 /// Spawn `orx supervise <runId>` fully detached (own process group, no stdio),
 /// so it outlives this command and any SSH session that launched it.
 pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
-    let exe = std::env::current_exe().map_err(|e| {
+    let exe = crate::paths::spawnable_exe().map_err(|e| {
         anyhow!(
             "Could not locate the orx binary to spawn the supervisor: {}",
             e

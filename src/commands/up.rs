@@ -5755,7 +5755,7 @@ async fn openresearch_terminal(
     ws: WebSocketUpgrade,
     args: Vec<String>,
 ) -> Response {
-    let program = std::env::current_exe()
+    let program = crate::paths::spawnable_exe()
         .map(|exe| exe.to_string_lossy().into_owned())
         .map_err(anyhow::Error::from);
     command_terminal(&headers, ws, program, args, false).await

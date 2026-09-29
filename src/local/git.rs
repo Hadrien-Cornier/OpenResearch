@@ -1718,7 +1718,7 @@ pub fn spawn_branch_publication(
     owner: &str,
     repo: &str,
 ) -> Result<()> {
-    let executable = std::env::current_exe()?;
+    let executable = crate::paths::spawnable_exe()?;
     let mut command = Command::new(executable);
     command
         .arg("publish-branch")

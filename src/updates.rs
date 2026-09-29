@@ -777,7 +777,7 @@ fn spawn_background_update() {
 /// config dir than the parent reads — losing the restart signal and the backoff,
 /// and failing to serialize against a terminal `orx update`.
 fn updater_command() -> Result<tokio::process::Command> {
-    let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
+    let mut cmd = tokio::process::Command::new(crate::paths::spawnable_exe()?);
     cmd.args(["update", "--background"])
         .stdin(std::process::Stdio::null());
     if let Some(path) = crate::local::shell_env::search_path() {
@@ -946,10 +946,10 @@ pub fn relaunch(port: u16) -> std::io::Error {
                 app
             }
             None => {
-                let Ok(exe) = std::env::current_exe() else {
+                let Ok(exe) = crate::paths::spawnable_exe() else {
                     return std::io::Error::other("could not resolve the running executable");
                 };
-                let mut app = std::process::Command::new(relaunch_target(exe));
+                let mut app = std::process::Command::new(exe);
                 app.arg(crate::commands::app::APP_ARG);
                 app
             }
@@ -962,10 +962,10 @@ pub fn relaunch(port: u16) -> std::io::Error {
 
     // Not the canonical helper: the launch path is what the installer swapped
     // under, and canonicalizing a replaced binary would pin the old inode.
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::paths::spawnable_exe() else {
         return std::io::Error::other("could not resolve the running executable");
     };
-    std::process::Command::new(relaunch_target(exe))
+    std::process::Command::new(exe)
         .args(relaunch_args(std::env::args_os().skip(1)))
         .exec()
 }
@@ -982,16 +982,6 @@ pub fn relaunch(port: u16) -> std::io::Error {
         );
     }
     windows::relaunch(relaunch_args(std::env::args_os().skip(1)), &[])
-}
-
-/// Linux reports a replaced binary as `<path> (deleted)`; the installer put the
-/// new file at `<path>`, which is what to exec.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn relaunch_target(exe: PathBuf) -> PathBuf {
-    exe.to_str()
-        .and_then(|exe| exe.strip_suffix(" (deleted)"))
-        .map(PathBuf::from)
-        .unwrap_or(exe)
 }
 
 /// The original arguments plus `--no-browser`: the tab that asked for the
@@ -1376,8 +1366,8 @@ mod tests {
     use super::{
         app_bundle_root, attempt_backoff, attempt_due, bold, detect_channel, exe_matches_prefix,
         now_unix, package_manager_owns, parse_manifest, portable_dir, portable_outside_prefix,
-        precedence, relaunch_args, relaunch_target, render, retired_path, warning_for, CheckCache,
-        InstallChannel, ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
+        precedence, relaunch_args, render, retired_path, warning_for, CheckCache, InstallChannel,
+        ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
     };
     use semver::Version;
     use std::ffi::OsString;
@@ -1555,18 +1545,6 @@ mod tests {
         // Anything not laid out as a bundle executable.
         assert_eq!(app_bundle_root(Path::new("/usr/local/bin/orx")), None);
         assert_eq!(app_bundle_root(Path::new("/a/Contents/orx")), None);
-    }
-
-    #[test]
-    fn relaunch_target_strips_the_deleted_marker() {
-        assert_eq!(
-            relaunch_target(PathBuf::from("/x/orx (deleted)")),
-            PathBuf::from("/x/orx")
-        );
-        assert_eq!(
-            relaunch_target(PathBuf::from("/x/orx")),
-            PathBuf::from("/x/orx")
-        );
     }
 
     #[test]
