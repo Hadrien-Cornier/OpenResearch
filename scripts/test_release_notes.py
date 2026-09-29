@@ -13,7 +13,8 @@ class ReleaseNotesTest(unittest.TestCase):
             "**Full Changelog**: https://github.com/alphaXiv/OpenResearch/compare/v1...v2\n"
         )
         issue = {"title": "Handle [arXiv] links", "url": "https://github.com/alphaXiv/OpenResearch/issues/457", "state": "CLOSED"}
-        response = {"data": {"repository": {"pullRequest": {"closingIssuesReferences": {"nodes": [issue]}}}}}
+        open_issue = {"title": "Still open", "url": "https://github.com/alphaXiv/OpenResearch/issues/999", "state": "OPEN"}
+        response = {"data": {"repository": {"pullRequest": {"closingIssuesReferences": {"nodes": [issue, open_issue]}}}}}
         with patch("release_notes.gh", return_value=response) as api:
             issues = fixed_issues(notes, "alphaXiv/OpenResearch")
         self.assertEqual(api.call_count, 2)
@@ -24,6 +25,7 @@ class ReleaseNotesTest(unittest.TestCase):
         self.assertLess(rendered.index("## Fixed issues"), rendered.index("**Full Changelog**"))
         self.assertLess(rendered.index("**Full Changelog**"), rendered.index("## Install"))
         self.assertIn("[Handle \\[arXiv\\] links]", rendered)
+        self.assertNotIn("Still open", rendered)
         self.assertNotIn("## Highlights", compose(notes, [], "", "## Install"))
 
 
