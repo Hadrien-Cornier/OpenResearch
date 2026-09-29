@@ -40,6 +40,9 @@ export interface RestartState {
   restart: () => void;
 }
 
+export const releaseNotesUrl = (tag: string) =>
+  `https://github.com/alphaXiv/OpenResearch/releases/tag/${tag.split("/").map(encodeURIComponent).join("/")}`;
+
 /** Ask the server to relaunch, then reload once a different server process
  *  answers — the page itself is the old build until it reloads. The old server answers the POST and then drops every connection,
  *  so the polling errors in between are expected and swallowed. */
@@ -112,6 +115,11 @@ export function UpdateBanner({ status }: { status: UpdateStatus | null }) {
           ? m.update_banner_restart_failed({ error })
           : m.update_banner_complete({ version: ltr(version) })}
       </span>
+      {status?.installedTag && (
+        <a href={releaseNotesUrl(status.installedTag)} target="_blank" rel="noreferrer" className="text-sm text-subtext underline shrink-0">
+          {m.settings_release_notes()}
+        </a>
+      )}
       {status?.canRestart && (
         <Button type="button" size="small" disabled={restarting} onClick={restart}>
           {restarting ? m.update_banner_restarting() : m.update_banner_restart()}

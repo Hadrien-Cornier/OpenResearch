@@ -977,6 +977,7 @@
   "settings_update_to_version": "वर्शन {version} पर अपडेट करें",
   "settings_check_for_updates": "अपडेट के लिए जाँचें",
   "settings_install_release_now": "बैकग्राउंड अपडेट का इंतज़ार करने की बजाय अभी नया रिलीज़ इंस्टॉल करें।",
+  "settings_release_notes": "रिलीज़ नोट्स",
   "settings_checks_automatically": "orx खुद दिन में कुछ बार जाँच करता है।",
   "settings_update_now": "अभी अपडेट करें",
   "settings_check_now": "अभी जाँचें",

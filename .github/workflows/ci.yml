@@ -46,6 +46,9 @@ jobs:
       - name: Dev-slot helper tests
         run: node --test scripts/dev-slot.test.mjs
 
+      - name: Release notes composition
+        run: python3 scripts/test_release_notes.py
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10
