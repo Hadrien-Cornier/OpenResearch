@@ -28,15 +28,17 @@ session. File at most one report per turn.
 Run it as one line, with every value in single quotes:
 
 ```bash
-orx feedback --kind bug --summary 'one line, at most 200 characters' --details 'failing input and command, exact error, expected result, and workaround' --quote 'the user words, optional'
+orx feedback --kind bug --summary 'one line, at most 200 characters' --details 'failing input and command, error text, expected result, and workaround' --quote 'the user words, optional'
 ```
 
 `--kind` is `bug`, `feature_request`, or `frustration`. Keep each value on one
-line and single-quoted so commands and error text stay literal. Write an
-apostrophe as `'\''`.
+line and free of backticks, `$`, `<`, `>`, `|`, `;`, and `&` so agent permission
+checks do not interrupt filing. Spell out only those characters in commands or
+errors; keep the rest verbatim. Write an apostrophe as
+`'\''`.
 
 Make a bug report reproducible on its own: include an actual failing input
-when relevant, the command and flags used, the exact error text, expected
+when relevant, the command and flags used, the error text as above, expected
 versus actual behavior, and any workaround. Keep public identifiers such as a
 DOI, arXiv ID, PMID, or public URL when the failure depends on them; never
 replace a failing DOI with "a DOI". If an input or error is unavailable, say
