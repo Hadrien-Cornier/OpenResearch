@@ -2766,6 +2766,29 @@ fn slash_skill_name(token: &str) -> Option<String> {
     Some(name.to_ascii_lowercase())
 }
 
+async fn prepare_project_slash_worktree(project: &LocalProject, text: &str, session_id: &str) {
+    let has_project_skill = text
+        .split_whitespace()
+        .filter_map(slash_skill_name)
+        .any(|name| {
+            matches!(
+                crate::local::user_skills::parse_selection(&name),
+                Some((_, crate::local::user_skills::SkillSelection::Project))
+            )
+        });
+    if !has_project_skill
+        || crate::local::git::existing_session_worktree_path(project, session_id).exists()
+    {
+        return;
+    }
+    let project = project.clone();
+    let session_id = session_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::local::git::ensure_session_worktree(&project, &session_id)
+    })
+    .await;
+}
+
 fn selected_slash_skills(
     project: &LocalProject,
     text: &str,
@@ -2801,16 +2824,6 @@ fn selected_slash_skills(
                 });
             }
         } else {
-            if matches!(
-                crate::local::user_skills::parse_selection(&name),
-                Some((_, crate::local::user_skills::SkillSelection::Project))
-            ) {
-                if let Some(id) = session_id {
-                    if !crate::local::git::existing_session_worktree_path(project, id).exists() {
-                        let _ = crate::local::git::ensure_session_worktree(project, id);
-                    }
-                }
-            }
             if let Some(instructions) = crate::local::user_skills::instructions(
                 &name,
                 harness,
@@ -4381,6 +4394,9 @@ impl ChatHost {
                     .get_chat_session(session_id)?
                     .ok_or_else(|| anyhow!("chat session not found"))?;
                 let project = store.get_local_project(&session.project_id)?;
+                if let Some(project) = &project {
+                    prepare_project_slash_worktree(project, &text, session_id).await;
+                }
                 let message = SteerMessage {
                     text: project
                         .map(|project| {
@@ -5442,6 +5458,11 @@ impl ChatHost {
         )?);
         // Slash-skills: the transcript keeps the `/name` the user typed; the
         // harness gets the expanded prompt.
+        if prepared_input.is_none() {
+            for message in &messages {
+                prepare_project_slash_worktree(&project, &message.text, &session.id).await;
+            }
+        }
         let mut turn_text = prepared_input.unwrap_or_else(|| {
             let expanded = contextualize_messages(messages, |text| {
                 expand_slash_skills(&project, text, Some(&session.harness), Some(&session.id))
