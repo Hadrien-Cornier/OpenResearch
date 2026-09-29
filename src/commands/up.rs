@@ -1502,7 +1502,7 @@ async fn create_project(
         .ok_or_else(|| bad_request("project deletion is in progress"))?;
     drop(create_admission);
     let (project, github_publication_error) = if github_sync_enabled {
-        match push_project_for_sync(project.clone()).await {
+        match push_project_for_sync(project.clone(), &state.chat).await {
             Ok((project, _)) => (project, None),
             Err(error) => {
                 let project = Store::open()?
@@ -1659,14 +1659,23 @@ fn github_push_was_rejected(error: &str) -> bool {
 
 async fn create_independent_project_repository(
     mut project: local::model::LocalProject,
+    chat: &ChatHost,
 ) -> Result<local::model::LocalProject> {
     let store = Store::open()?;
-    let session_ids = store
+    let legacy = store
         .list_chat_sessions_by_project(&project.id)?
         .into_iter()
         .map(|session| session.id)
+        .filter(|id| {
+            local::git::existing_session_worktree_path(&project, id)
+                != local::git::session_worktree_path(&project.id, id)
+        })
         .collect::<Vec<_>>();
-    local::git::migrate_legacy_project_worktrees(&project, &session_ids)?;
+    // `git worktree move` would pull a running turn's checkout out from under it.
+    chat.while_idle(&legacy, || {
+        local::git::migrate_legacy_project_worktrees(&project, &legacy)
+    })
+    .await?;
     let source_repository = project
         .has_github_repository()
         .then(|| (project.github_owner.clone(), project.github_repo.clone()));
@@ -1690,6 +1699,7 @@ async fn create_independent_project_repository(
 
 async fn push_project_for_sync(
     mut project: local::model::LocalProject,
+    chat: &ChatHost,
 ) -> Result<(local::model::LocalProject, local::github::Status)> {
     let github_status = local::github::status().await;
     if !github_status.installed {
@@ -1707,11 +1717,11 @@ async fn push_project_for_sync(
             .await?
             .is_some_and(|meta| meta.can_push && !meta.archived);
         if !can_push {
-            project = create_independent_project_repository(project).await?;
+            project = create_independent_project_repository(project, chat).await?;
             using_existing_repository = false;
         }
     } else {
-        project = create_independent_project_repository(project).await?;
+        project = create_independent_project_repository(project, chat).await?;
         using_existing_repository = false;
     }
 
@@ -1727,7 +1737,7 @@ async fn push_project_for_sync(
         if !using_existing_repository || !github_push_was_rejected(&error.to_string()) {
             return Err(error);
         }
-        project = create_independent_project_repository(project).await?;
+        project = create_independent_project_repository(project, chat).await?;
         push_once(&project)
             .await
             .map_err(|error| anyhow!("Git push task failed: {error}"))??;
@@ -1750,21 +1760,9 @@ async fn enable_project_github(State(state): State<AppState>, Path(id): Path<Str
     let project = store
         .get_local_project(&id)?
         .ok_or_else(|| not_found("project"))?;
-    // Publishing may `git worktree move` legacy-layout worktrees out from under a running turn.
-    for session in store.list_chat_sessions_by_project(&project.id)? {
-        let legacy = local::git::existing_session_worktree_path(&project, &session.id)
-            != local::git::session_worktree_path(&project.id, &session.id);
-        if legacy
-            && (state.chat.is_busy(&session.id).await || store.chat_turn_leased(&session.id)?)
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "Wait for this project's running chats to finish before enabling GitHub sync."
-                    .into(),
-            ));
-        }
-    }
-    let (project, github_status) = push_project_for_sync(project).await.map_err(bad_request)?;
+    let (project, github_status) = push_project_for_sync(project, &state.chat)
+        .await
+        .map_err(bad_request)?;
     let git_status = project_git_json(&project, github_status);
     Ok(Json(
         json!({ "project": project_json(&project), "git": git_status }),

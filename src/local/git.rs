@@ -1326,6 +1326,8 @@ fn ensure_worktree_from(
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("Could not create {}: {}", parent.display(), e))?;
     }
+    // An empty dir left at the path would make git refuse to treat the worktree as missing.
+    let _ = std::fs::remove_dir(&dir);
     let target = dir.to_string_lossy().to_string();
     // Read the lost checkout before the `worktree remove` below erases its registration.
     let lost = if restore_lost {
@@ -1349,17 +1351,10 @@ fn ensure_worktree_from(
             ),
         }
     }
-    let add = || {
-        git(
-            Some(repo),
-            &["worktree", "add", "--detach", &target, start_ref],
-        )
-    };
-    if add().is_err() {
-        // Last resort for a stale registration the targeted remove could not match.
-        let _ = git(Some(repo), &["worktree", "prune"]);
-        add()?;
-    }
+    git(
+        Some(repo),
+        &["worktree", "add", "--detach", &target, start_ref],
+    )?;
     Ok(dir)
 }
 
@@ -1399,7 +1394,7 @@ pub fn remove_session_worktree(project: &crate::local::model::LocalProject, sess
     let repo_path = Path::new(&project.repo_path);
     let dir = existing_session_worktree_path(project, session_id);
     let _ = std::fs::remove_dir_all(&dir);
-    // With the dir gone git always drops this registration, and no other session's (unlike prune).
+    // Once the dir is gone, `worktree remove` drops only this registration (unlike prune).
     if is_repository(repo_path) {
         let _ = git(
             Some(repo_path),
@@ -2774,5 +2769,20 @@ mod tests {
         for path in [&link, &real, &hub] {
             let _ = std::fs::remove_dir_all(path);
         }
+    }
+
+    #[test]
+    fn vanished_worktree_behind_an_empty_dir_is_restored() {
+        let hub = temp_repo();
+        let dir = hub.with_extension("session");
+        ensure_worktree_from(&hub, dir.clone(), "main", true).unwrap();
+        run(&dir, &["switch", "-q", "-c", "exp/empty"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+
+        ensure_worktree_from(&hub, dir.clone(), "main", true).unwrap();
+        assert_eq!(run(&dir, &["branch", "--show-current"]), "exp/empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&hub);
     }
 }

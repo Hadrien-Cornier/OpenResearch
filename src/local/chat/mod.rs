@@ -3615,6 +3615,24 @@ impl ChatHost {
         self.turns.lock().await.contains_key(session_id)
     }
 
+    /// Run `f` only if none of `session_ids` has a turn, holding the turn map so none can start
+    /// until it returns.
+    pub async fn while_idle<T>(
+        &self,
+        session_ids: &[String],
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let turns = self.turns.lock().await;
+        for session_id in session_ids {
+            if turns.contains_key(session_id) || Store::open()?.chat_turn_leased(session_id)? {
+                return Err(anyhow!(
+                    "Wait for the running chats to finish, then try again."
+                ));
+            }
+        }
+        f()
+    }
+
     fn claim_durable_turn(&self, session_id: &str) -> bool {
         let mut claims = self.durable_turns.lock().unwrap();
         if claims.contains_key(session_id) {
@@ -9469,6 +9487,25 @@ mod bridge_tests {
             Arc::new(crate::local::codex::CodexHost::new()),
             Arc::new(crate::local::claude::ClaudeHost::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn while_idle_refuses_a_running_session_and_runs_otherwise() {
+        let host = test_host();
+        host.turns
+            .lock()
+            .await
+            .insert("busy".into(), TurnState::Reserved { turn_id: None });
+        let mut ran = false;
+        assert!(host
+            .while_idle(&["busy".into()], || {
+                ran = true;
+                Ok(())
+            })
+            .await
+            .is_err());
+        assert!(!ran);
+        assert_eq!(host.while_idle(&[], || Ok(7)).await.unwrap(), 7);
     }
 
     #[tokio::test]
