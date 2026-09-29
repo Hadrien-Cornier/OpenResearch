@@ -636,6 +636,11 @@ pub async fn detect_harness(id: &str) -> Option<HarnessInfo> {
     detect_one(harness.as_ref(), false).await
 }
 
+/// The snapshot pass of [`detect_harness`] (see [`Harness::detect_snapshot`]).
+pub async fn detect_harness_snapshot(id: &str) -> Option<HarnessInfo> {
+    detect_one(chat_harness(id)?.as_ref(), true).await
+}
+
 /// Detect every chat-capable harness, in registry order. This is what the
 /// `orx up` dashboard renders in its harness picker.
 pub async fn detect_harnesses() -> Vec<HarnessInfo> {

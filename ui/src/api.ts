@@ -841,6 +841,7 @@ export interface UpdateStatus {
   /** Latest release this install can actually move to — the macOS app and the
    *  CLI read different manifests, and the app's can lag. */
   latest: string | null;
+  latestTag: string | null;
   channel: InstallChannel;
   /** Whether this install is one orx can replace at all. */
   selfUpdates: boolean;
@@ -851,6 +852,7 @@ export interface UpdateStatus {
   /** The newer version already on disk. Distinct from `latest`: a release can
    *  land between the install and the restart. */
   installedVersion: string | null;
+  installedTag: string | null;
   restartRequired: boolean;
   /** Whether `restartApp` is honored; always true today, kept for a channel that cannot. */
   canRestart: boolean;

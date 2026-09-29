@@ -487,7 +487,7 @@ fn stop_turn_process(pid: u32) {
     let snapshot = std::process::Command::new("ps")
         .args(["-ww", "-axo", "pid=,ppid=,args="])
         .output();
-    let supervisor_exe = std::env::current_exe().ok();
+    let supervisor_exe = crate::paths::spawnable_exe().ok();
     match snapshot {
         Ok(output) if output.status.success() => {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -569,7 +569,7 @@ fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
     let object = hooks
         .as_object_mut()
         .ok_or_else(|| anyhow!("Antigravity hooks must be an object"))?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::paths::spawnable_exe()?;
     #[cfg(not(windows))]
     let command = format!(
         "{} antigravity-gate",

@@ -9,9 +9,10 @@
 //! disagree about which database they are looking at.
 //!
 //! App mode on macOS and Linux probes the shell once at startup
-//! ([`crate::commands::app`]) and installs the answer here; every other entry
-//! point falls through to the process environment unchanged. The Linux AppImage
-//! also hands host programs the session's GTK settings ([`host_gui_env`]).
+//! ([`crate::commands::app`]) and installs the answer here (only PATH if it
+//! arrives after startup has moved on); every other entry point falls through
+//! to the process environment unchanged. The Linux AppImage also hands host
+//! programs the session's GTK settings ([`host_gui_env`]).
 //!
 //! Scope is orx's own resolution, the children it spawns, and the dashboard's
 //! PTY terminals. The other things orx shells out to — `git`, `kubectl`, and

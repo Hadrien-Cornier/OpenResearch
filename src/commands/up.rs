@@ -678,6 +678,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
             get(lit_sources_settings).post(set_lit_sources_settings),
         )
         .route("/api/harnesses", get(list_harnesses))
+        .route("/api/harnesses/{id}/snapshot", get(harness_snapshot))
         .route(
             "/api/harnesses/setup/commands",
             get(harness_setup::commands),
@@ -819,6 +820,13 @@ fn remote_route_forbidden(path: &str) -> bool {
 }
 
 fn is_remote_callback_route(method: &Method, path: &str) -> bool {
+    if method == Method::GET {
+        // `orx agent spawn`'s install preflight (read-only).
+        return path
+            .strip_prefix("/api/harnesses/")
+            .and_then(|path| path.strip_suffix("/snapshot"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    }
     if method != Method::POST {
         return false;
     }
@@ -2115,6 +2123,24 @@ pub(crate) async fn submit_run_via_up(
         experiment_id: args.exp_id.clone(),
         job_id,
     })
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct HarnessInstall {
+    pub name: String,
+    pub installed: bool,
+}
+
+/// `orx up`'s install evidence for `harness`, from its own PATH rather than the caller's.
+pub(crate) async fn harness_install_via_up(port: u16, harness: &str) -> Result<HarnessInstall> {
+    let response = authenticate_up_request(local_client()?.get(format!(
+        "http://127.0.0.1:{port}/api/harnesses/{harness}/snapshot"
+    )))
+    .timeout(Duration::from_secs(10))
+    .send()
+    .await
+    .map_err(|error| anyhow!("Could not reach the trusted orx up process: {error}"))?;
+    decode_local_response(response, "check the harness").await
 }
 
 pub(crate) async fn cancel_run_via_up(port: u16, run_id: &str) -> Result<()> {
@@ -5755,7 +5781,7 @@ async fn openresearch_terminal(
     ws: WebSocketUpgrade,
     args: Vec<String>,
 ) -> Response {
-    let program = std::env::current_exe()
+    let program = crate::paths::spawnable_exe()
         .map(|exe| exe.to_string_lossy().into_owned())
         .map_err(anyhow::Error::from);
     command_terminal(&headers, ws, program, args, false).await
@@ -6136,6 +6162,13 @@ fn replace_claude_entry(payload: &mut Value, replacement: Value) {
     {
         *claude = replacement;
     }
+}
+
+async fn harness_snapshot(Path(id): Path<String>) -> ApiResult {
+    let info = local::harness::detect_harness_snapshot(&id)
+        .await
+        .ok_or_else(|| not_found("harness"))?;
+    Ok(Json(json!(info)))
 }
 
 async fn list_harnesses(
@@ -7742,7 +7775,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_callback_token_is_limited_to_run_submission_and_cancellation() {
+    fn remote_callback_token_is_limited_to_runs_and_the_spawn_preflight() {
         assert!(is_remote_callback_route(&Method::POST, "/api/runs"));
         assert!(is_remote_callback_route(
             &Method::POST,
@@ -7756,6 +7789,19 @@ mod tests {
         assert!(!is_remote_callback_route(
             &Method::POST,
             "/api/chat/sessions/s1/message"
+        ));
+        assert!(is_remote_callback_route(
+            &Method::GET,
+            "/api/harnesses/codex/snapshot"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::POST,
+            "/api/harnesses/codex/snapshot"
+        ));
+        assert!(!is_remote_callback_route(&Method::GET, "/api/harnesses"));
+        assert!(!is_remote_callback_route(
+            &Method::GET,
+            "/api/harnesses/setup/commands"
         ));
     }
 

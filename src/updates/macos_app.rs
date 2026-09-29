@@ -81,8 +81,8 @@ pub async fn update(root: &Path, current: &Version, dry_run: bool, background: b
 
     // Keep the cache honest even when this install can't apply the update: it is
     // what the dashboard and the outdated warning read.
-    if let Some(latest) = &latest {
-        super::write_check_cache(&latest.to_string());
+    if let (Some(manifest), Some(latest)) = (&published, &latest) {
+        super::write_check_cache(&latest.to_string(), &manifest.tag);
     }
 
     let Some((manifest, latest)) = published
@@ -134,7 +134,7 @@ pub async fn update(root: &Path, current: &Version, dry_run: bool, background: b
     let _ = std::fs::remove_dir_all(&staging);
     swapped?;
 
-    super::record_installed(&latest.to_string());
+    super::record_installed(&latest.to_string(), &manifest.tag);
     if !background {
         println!("✓ Updated OpenResearch {} → {}.", current, latest);
         println!("Restart the app to run the new version.");

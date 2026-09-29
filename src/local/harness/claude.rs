@@ -1115,7 +1115,7 @@ const MCP_CONFIG_REL: &str = ".openresearch/agent/claude-mcp.json";
 /// The hook command is this executable's absolute path, so it resolves without
 /// depending on `orx` being on Claude's `PATH`.
 pub(crate) fn write_plan_settings(repo: &std::path::Path) -> Result<PathBuf> {
-    let orx = std::env::current_exe()
+    let orx = crate::paths::spawnable_exe()
         .map_err(|e| anyhow!("cannot resolve orx binary path for plan-mode hook: {e}"))?;
     let hook = serde_json::json!([{
         "type": "command",
@@ -1153,7 +1153,7 @@ pub(crate) fn write_mcp_config(
     session_id: &str,
     token: &str,
 ) -> Result<PathBuf> {
-    let orx = std::env::current_exe()
+    let orx = crate::paths::spawnable_exe()
         .map_err(|e| anyhow!("cannot resolve orx binary path for the mcp bridge: {e}"))?;
     let config = serde_json::json!({
         "mcpServers": {

@@ -639,6 +639,8 @@ struct CheckCache {
     checked_at: u64,
     /// Latest version seen at that time.
     latest: String,
+    #[serde(default)]
+    latest_tag: String,
     /// Unix seconds of the last background update *attempt* (distinct from the
     /// version check above, which is only a fetch).
     #[serde(default)]
@@ -652,6 +654,8 @@ struct CheckCache {
     /// rather than in memory because the updater is a separate process.
     #[serde(default)]
     installed_version: String,
+    #[serde(default)]
+    installed_tag: String,
 }
 
 fn cache_path() -> PathBuf {
@@ -688,10 +692,11 @@ fn read_cache() -> Option<CheckCache> {
 }
 
 /// Record the latest known release.
-pub fn write_check_cache(latest: &str) {
+pub fn write_check_cache(latest: &str, tag: &str) {
     mutate_cache(|cache| {
         cache.checked_at = now_unix();
         cache.latest = latest.to_string();
+        cache.latest_tag = tag.to_string();
     });
 }
 
@@ -718,11 +723,13 @@ pub fn record_contended() {
 
 /// Record a version as installed on disk. Also refreshes the check fields — an
 /// install is the freshest possible answer to "what is the latest release".
-pub fn record_installed(version: &str) {
+pub fn record_installed(version: &str, tag: &str) {
     mutate_cache(|cache| {
         cache.checked_at = now_unix();
         cache.latest = version.to_string();
+        cache.latest_tag = tag.to_string();
         cache.installed_version = version.to_string();
+        cache.installed_tag = tag.to_string();
     });
 }
 
@@ -777,7 +784,7 @@ fn spawn_background_update() {
 /// config dir than the parent reads — losing the restart signal and the backoff,
 /// and failing to serialize against a terminal `orx update`.
 fn updater_command() -> Result<tokio::process::Command> {
-    let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
+    let mut cmd = tokio::process::Command::new(crate::paths::spawnable_exe()?);
     cmd.args(["update", "--background"])
         .stdin(std::process::Stdio::null());
     if let Some(path) = crate::local::shell_env::search_path() {
@@ -848,6 +855,7 @@ pub struct UpdateStatus {
     /// Latest release this install can actually move to. `None` before the first
     /// check.
     pub latest: Option<String>,
+    pub latest_tag: Option<String>,
     /// How orx was installed — see [`InstallChannel::as_str`].
     pub channel: &'static str,
     /// Whether this install can update itself at all.
@@ -864,6 +872,7 @@ pub struct UpdateStatus {
     /// restart of *this* process is missing. Named separately from `latest`
     /// because a release can land between the install and the restart.
     pub installed_version: Option<String>,
+    pub installed_tag: Option<String>,
     pub restart_required: bool,
     /// Whether `POST /api/update/restart` is honored (see [`relaunch`]); pair
     /// with `restart_required`. Always true now that every platform relaunches;
@@ -890,7 +899,15 @@ pub fn status() -> UpdateStatus {
         restart_required: installed.is_some(),
         can_restart: true,
         instance: instance_id(),
+        installed_tag: installed
+            .as_ref()
+            .and(cache.as_ref())
+            .and_then(|c| (!c.installed_tag.is_empty()).then(|| c.installed_tag.clone())),
         installed_version: installed.map(|v| v.to_string()),
+        latest_tag: latest
+            .as_ref()
+            .and(cache.as_ref())
+            .and_then(|c| (!c.latest_tag.is_empty()).then(|| c.latest_tag.clone())),
         latest: latest.map(|v| v.to_string()),
         channel: channel.map(InstallChannel::as_str).unwrap_or("unknown"),
         self_updates: channel.map(InstallChannel::self_updates).unwrap_or(false),
@@ -946,10 +963,10 @@ pub fn relaunch(port: u16) -> std::io::Error {
                 app
             }
             None => {
-                let Ok(exe) = std::env::current_exe() else {
+                let Ok(exe) = crate::paths::spawnable_exe() else {
                     return std::io::Error::other("could not resolve the running executable");
                 };
-                let mut app = std::process::Command::new(relaunch_target(exe));
+                let mut app = std::process::Command::new(exe);
                 app.arg(crate::commands::app::APP_ARG);
                 app
             }
@@ -962,10 +979,10 @@ pub fn relaunch(port: u16) -> std::io::Error {
 
     // Not the canonical helper: the launch path is what the installer swapped
     // under, and canonicalizing a replaced binary would pin the old inode.
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::paths::spawnable_exe() else {
         return std::io::Error::other("could not resolve the running executable");
     };
-    std::process::Command::new(relaunch_target(exe))
+    std::process::Command::new(exe)
         .args(relaunch_args(std::env::args_os().skip(1)))
         .exec()
 }
@@ -982,16 +999,6 @@ pub fn relaunch(port: u16) -> std::io::Error {
         );
     }
     windows::relaunch(relaunch_args(std::env::args_os().skip(1)), &[])
-}
-
-/// Linux reports a replaced binary as `<path> (deleted)`; the installer put the
-/// new file at `<path>`, which is what to exec.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn relaunch_target(exe: PathBuf) -> PathBuf {
-    exe.to_str()
-        .and_then(|exe| exe.strip_suffix(" (deleted)"))
-        .map(PathBuf::from)
-        .unwrap_or(exe)
 }
 
 /// The original arguments plus `--no-browser`: the tab that asked for the
@@ -1038,18 +1045,29 @@ fn relaunch_app_bundle(root: &Path, port: u16) -> std::io::Error {
 /// behind the CLI's `dist-manifest.json`. Reporting the CLI's version to an app
 /// install would advertise — and endlessly re-attempt — a build that does not
 /// exist for it. `Ok(None)` means "nothing newer published for this channel".
-pub async fn fetch_latest_for_channel(timeout: Duration) -> Result<Option<Version>> {
-    let app_version = match current_channel() {
-        Ok(InstallChannel::AppBundle(_)) => {
-            macos_app::fetch_manifest(timeout).await?.map(|m| m.version)
-        }
+pub async fn fetch_latest_for_channel(timeout: Duration) -> Result<Option<LatestRelease>> {
+    match current_channel() {
+        Ok(InstallChannel::AppBundle(_)) => macos_app::fetch_manifest(timeout)
+            .await?
+            .map(|m| {
+                Ok(LatestRelease {
+                    version: Version::parse(&m.version)?,
+                    tag: m.tag,
+                })
+            })
+            .transpose(),
         #[cfg(target_os = "linux")]
-        Ok(InstallChannel::AppImage(_)) => {
-            linux_app::fetch_manifest(timeout).await?.map(|m| m.version)
-        }
-        _ => return Ok(Some(fetch_latest(timeout).await?.version)),
-    };
-    Ok(app_version.map(|v| Version::parse(&v)).transpose()?)
+        Ok(InstallChannel::AppImage(_)) => linux_app::fetch_manifest(timeout)
+            .await?
+            .map(|m| {
+                Ok(LatestRelease {
+                    version: Version::parse(&m.version)?,
+                    tag: m.tag,
+                })
+            })
+            .transpose(),
+        _ => Ok(Some(fetch_latest(timeout).await?)),
+    }
 }
 
 /// Fetches a desktop app's release manifest. `Ok(None)` for a 404 — the expected
@@ -1136,7 +1154,7 @@ pub async fn periodic_update_pass() {
         return;
     }
     if let Ok(Some(latest)) = fetch_latest_for_channel(Duration::from_secs(10)).await {
-        write_check_cache(&latest.to_string());
+        write_check_cache(&latest.version.to_string(), &latest.tag);
     }
     if !auto_update_eligible() {
         return;
@@ -1236,7 +1254,13 @@ pub(crate) fn is_outdated(current: &Version, latest: &Version) -> bool {
 /// downloading and the *next* invocation will be current. Installs orx doesn't
 /// own (cargo/Homebrew/Nix), and anyone who turned auto-update off, keep the
 /// manual instruction.
-fn warning_for(current: &Version, latest: &Version, orx: &str, automatic: bool) -> Option<String> {
+fn warning_for(
+    current: &Version,
+    latest: &Version,
+    orx: &str,
+    automatic: bool,
+    tag: Option<&str>,
+) -> Option<String> {
     if !is_outdated(current, latest) {
         return None;
     }
@@ -1245,9 +1269,12 @@ fn warning_for(current: &Version, latest: &Version, orx: &str, automatic: bool) 
     } else {
         format!("Run `{orx} update` to upgrade.")
     };
+    let notes = tag
+        .map(|tag| format!(" Release notes: {REPO_URL}/releases/tag/{tag}"))
+        .unwrap_or_default();
     Some(format!(
         "{WARNING_LABEL} orx {current} is outdated (latest {latest}). A newer release is \
-         available; upgrade to stay compatible with the API. {remedy}"
+         available; upgrade to stay compatible with the API. {remedy}{notes}"
     ))
 }
 
@@ -1293,10 +1320,18 @@ impl UpdateWarning {
             .is_some_and(|latest| is_outdated(&current, latest))
             && auto_update_eligible();
 
-        if let Some(message) = cached_latest
-            .as_ref()
-            .and_then(|latest| warning_for(&current, latest, crate::invocation::orx(), automatic))
-        {
+        if let Some(message) = cached_latest.as_ref().and_then(|latest| {
+            warning_for(
+                &current,
+                latest,
+                crate::invocation::orx(),
+                automatic,
+                cache
+                    .as_ref()
+                    .map(|c| c.latest_tag.as_str())
+                    .filter(|tag| !tag.is_empty()),
+            )
+        }) {
             // Infallible: a closed/broken stderr (e.g. `2>&-`, or a reader that
             // already exited) must not panic the process before the command even
             // runs. `eprintln!` would; a swallowed `writeln!` won't.
@@ -1322,13 +1357,13 @@ impl UpdateWarning {
             return UpdateWarning { refresh: None };
         }
 
-        let prev_latest = cache.map(|c| c.latest);
+        let prev_latest = cache.map(|c| (c.latest, c.latest_tag));
         let handle = tokio::spawn(async move {
             let latest = fetch_latest_for_channel(Duration::from_secs(3))
                 .await
                 .ok()
                 .flatten()
-                .map(|v| v.to_string());
+                .map(|release| (release.version.to_string(), release.tag));
             // On fetch failure, refresh checked_at with the old answer so errors
             // don't cause a retry on every invocation. Only fabricate `current`
             // as a last resort (no cache, no previous answer): a one-off failed
@@ -1336,8 +1371,8 @@ impl UpdateWarning {
             // the price of not re-fetching on every offline invocation.
             let value = latest
                 .or(prev_latest)
-                .unwrap_or_else(|| current.to_string());
-            write_check_cache(&value);
+                .unwrap_or_else(|| (current.to_string(), String::new()));
+            write_check_cache(&value.0, &value.1);
         });
 
         UpdateWarning {
@@ -1376,8 +1411,8 @@ mod tests {
     use super::{
         app_bundle_root, attempt_backoff, attempt_due, bold, detect_channel, exe_matches_prefix,
         now_unix, package_manager_owns, parse_manifest, portable_dir, portable_outside_prefix,
-        precedence, relaunch_args, relaunch_target, render, retired_path, warning_for, CheckCache,
-        InstallChannel, ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
+        precedence, relaunch_args, render, retired_path, warning_for, CheckCache, InstallChannel,
+        ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
     };
     use semver::Version;
     use std::ffi::OsString;
@@ -1441,13 +1476,13 @@ mod tests {
     fn no_warning_when_current_or_ahead() {
         let v = |s: &str| Version::parse(s).unwrap();
         // Exactly current.
-        assert!(warning_for(&v("0.1.29"), &v("0.1.29"), "orx", false).is_none());
+        assert!(warning_for(&v("0.1.29"), &v("0.1.29"), "orx", false, None).is_none());
         // Local build ahead of the latest release.
-        assert!(warning_for(&v("0.2.0"), &v("0.1.29"), "orx", false).is_none());
+        assert!(warning_for(&v("0.2.0"), &v("0.1.29"), "orx", false, None).is_none());
         // Build metadata is ignored by semver ordering, so it's not "outdated".
-        assert!(warning_for(&v("0.1.29"), &v("0.1.29+build.5"), "orx", false).is_none());
+        assert!(warning_for(&v("0.1.29"), &v("0.1.29+build.5"), "orx", false, None).is_none());
         // Running ahead of the latest stable on a local pre-release: not outdated.
-        assert!(warning_for(&v("0.3.0-dev.1"), &v("0.2.0"), "orx", false).is_none());
+        assert!(warning_for(&v("0.3.0-dev.1"), &v("0.2.0"), "orx", false, None).is_none());
     }
 
     #[test]
@@ -1467,7 +1502,7 @@ mod tests {
             ("0.1.29", "0.2.0-rc.1"), // behind the next minor's pre-release
         ] {
             assert_warns(
-                &warning_for(&v(cur), &v(latest), "orx", false).unwrap_or_else(|| {
+                &warning_for(&v(cur), &v(latest), "orx", false, None).unwrap_or_else(|| {
                     panic!("expected a warning for {cur} -> {latest}");
                 }),
             );
@@ -1479,12 +1514,30 @@ mod tests {
         let v = |s: &str| Version::parse(s).unwrap();
         // Auto-updating installs are told what is happening, not what to run:
         // the command would be busywork for something already underway.
-        let auto = warning_for(&v("0.1.28"), &v("0.1.29"), "orx", true).unwrap();
+        let auto = warning_for(&v("0.1.28"), &v("0.1.29"), "orx", true, None).unwrap();
         assert!(auto.contains("outdated"), "{auto}");
         assert!(auto.contains("in the background"), "{auto}");
         assert!(!auto.contains("Run `orx update`"), "{auto}");
         // The manual form is unchanged for the channels orx doesn't own.
-        assert_warns(&warning_for(&v("0.1.28"), &v("0.1.29"), "orx", false).unwrap());
+        assert_warns(&warning_for(&v("0.1.28"), &v("0.1.29"), "orx", false, None).unwrap());
+
+        let notes = warning_for(
+            &v("0.1.28"),
+            &v("0.1.29"),
+            "orx",
+            false,
+            Some("releases/v0.1.29"),
+        )
+        .unwrap();
+        assert!(notes.contains("/releases/tag/releases/v0.1.29"), "{notes}");
+    }
+
+    #[test]
+    fn old_update_cache_without_tags_still_loads() {
+        let cache: CheckCache =
+            serde_json::from_str(r#"{"checked_at":1,"latest":"0.2.13"}"#).unwrap();
+        assert!(cache.latest_tag.is_empty());
+        assert!(cache.installed_tag.is_empty());
     }
 
     #[test]
@@ -1555,18 +1608,6 @@ mod tests {
         // Anything not laid out as a bundle executable.
         assert_eq!(app_bundle_root(Path::new("/usr/local/bin/orx")), None);
         assert_eq!(app_bundle_root(Path::new("/a/Contents/orx")), None);
-    }
-
-    #[test]
-    fn relaunch_target_strips_the_deleted_marker() {
-        assert_eq!(
-            relaunch_target(PathBuf::from("/x/orx (deleted)")),
-            PathBuf::from("/x/orx")
-        );
-        assert_eq!(
-            relaunch_target(PathBuf::from("/x/orx")),
-            PathBuf::from("/x/orx")
-        );
     }
 
     #[test]
