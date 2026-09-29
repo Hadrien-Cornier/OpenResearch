@@ -337,6 +337,7 @@ pub struct RunWakeup {
     pub run: StoredRun,
     pub chat_session_id: String,
     pub state: String,
+    pub monitoring_alerted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,6 +555,7 @@ impl Store {
                 claim_token     TEXT,
                 claimed_at      INTEGER,
                 delivered_at    INTEGER,
+                monitoring_alerted INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(run_id, chat_session_id)
             );
             CREATE INDEX IF NOT EXISTS idx_chat_run_wakeups_requested
@@ -639,6 +641,7 @@ impl Store {
             "ALTER TABLE chat_run_wakeups ADD COLUMN claim_token TEXT",
             "ALTER TABLE chat_run_wakeups ADD COLUMN claimed_at INTEGER",
             "ALTER TABLE chat_run_wakeups ADD COLUMN delivered_at INTEGER",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN monitoring_alerted INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_messages ADD COLUMN parent_id TEXT",
             "ALTER TABLE chat_messages ADD COLUMN base_native_session_id TEXT",
             "ALTER TABLE chat_messages ADD COLUMN result_native_session_id TEXT",
@@ -1172,24 +1175,56 @@ impl Store {
     }
 
     pub fn list_ready_run_wakeups(&self) -> Result<Vec<RunWakeup>> {
-        let mut stmt = self.conn.prepare(
+        self.list_run_wakeups(
+            "w.state IN ('pending', 'claimed') AND r.status IN ('done', 'failed')
+             ORDER BY COALESCE(r.ended_at, r.updated_at), w.requested_at, r.id",
+        )
+    }
+
+    /// Pending wake-ups whose run is still live, for monitoring alerts.
+    pub fn list_active_run_wakeups(&self) -> Result<Vec<RunWakeup>> {
+        self.list_run_wakeups(
+            "w.state = 'pending' AND r.status IN ('starting', 'running')
+             ORDER BY w.requested_at, r.id",
+        )
+    }
+
+    fn list_run_wakeups(&self, filter: &'static str) -> Result<Vec<RunWakeup>> {
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT r.id, r.experiment_id, r.project_id, r.status, r.backend_json, r.command,
                     r.created_at, r.updated_at, r.ended_at, r.exit_code,
                     r.commit_sha, r.result_markdown, r.cancel_requested, r.chat_session_id,
-                    w.chat_session_id, w.state
+                    w.chat_session_id, w.state, w.monitoring_alerted
              FROM chat_run_wakeups w
              JOIN runs r ON r.id = w.run_id
-             WHERE w.state IN ('pending', 'claimed') AND r.status IN ('done', 'failed')
-             ORDER BY COALESCE(r.ended_at, r.updated_at), w.requested_at, r.id",
-        )?;
+             WHERE {filter}"
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(RunWakeup {
                 run: row_to_run(row)?,
                 chat_session_id: row.get(14)?,
                 state: row.get(15)?,
+                monitoring_alerted: row.get(16)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Flips a pending wake-up's monitoring alert flag; `true` when this call changed it,
+    /// which makes setting it an atomic claim across `orx up` processes.
+    pub fn set_run_wakeup_monitoring_alerted(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+        alerted: bool,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE chat_run_wakeups SET monitoring_alerted = ?3
+             WHERE run_id = ?1 AND chat_session_id = ?2
+               AND state = 'pending' AND monitoring_alerted != ?3",
+            params![run_id, chat_session_id, alerted],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn claim_run_wakeup(&self, run_id: &str, chat_session_id: &str) -> Result<Option<String>> {
@@ -4997,6 +5032,65 @@ mod tests {
             .all(|wakeup| wakeup.run.id != "run_done"));
 
         drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn monitoring_alert_claims_once_and_keeps_the_terminal_wakeup() {
+        let dir = std::env::temp_dir().join(format!("orx-store-alert-{}", uuid::Uuid::new_v4()));
+        let first = Store::open_at(dir.clone()).unwrap();
+        first
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        for (id, status) in [("run_live", "starting"), ("run_done", "done")] {
+            first
+                .upsert_run(&run_fixture(id, status, Some("chat_A")))
+                .unwrap();
+            first.register_run_wakeup(id, "chat_A").unwrap();
+        }
+        let second = Store::open_at(dir.clone()).unwrap();
+
+        let active = first.list_active_run_wakeups().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].run.id, "run_live");
+        assert!(!active[0].monitoring_alerted);
+        assert!(first
+            .set_run_wakeup_monitoring_alerted("run_live", "chat_A", true)
+            .unwrap());
+        assert!(!second
+            .set_run_wakeup_monitoring_alerted("run_live", "chat_A", true)
+            .unwrap());
+        assert!(second.list_active_run_wakeups().unwrap()[0].monitoring_alerted);
+
+        assert!(second
+            .set_run_wakeup_monitoring_alerted("run_live", "chat_A", false)
+            .unwrap());
+        assert!(!first
+            .set_run_wakeup_monitoring_alerted("run_live", "chat_A", false)
+            .unwrap());
+
+        first
+            .set_run_wakeup_monitoring_alerted("run_live", "chat_A", true)
+            .unwrap();
+        assert!(first
+            .update_status("run_live", RunStatus::Done, Some(2), Some(0))
+            .unwrap());
+        assert!(first.list_active_run_wakeups().unwrap().is_empty());
+        assert!(first
+            .list_ready_run_wakeups()
+            .unwrap()
+            .iter()
+            .any(|wakeup| wakeup.run.id == "run_live" && wakeup.state == "pending"));
+        first
+            .claim_run_wakeup("run_live", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(!first
+            .set_run_wakeup_monitoring_alerted("run_live", "chat_A", false)
+            .unwrap());
+
+        drop(second);
+        drop(first);
         let _ = std::fs::remove_dir_all(dir);
     }
 

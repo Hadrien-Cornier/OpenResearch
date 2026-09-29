@@ -7786,6 +7786,26 @@ fn run_wakeup_text(run: &crate::store::StoredRun) -> Option<String> {
     })
 }
 
+// Only local identifiers here: the error text includes remote ssh stderr, so the agent reads it
+// as command output instead of inside an `[orx]` instruction.
+fn run_monitoring_text(runs: &[crate::store::StoredRun]) -> String {
+    let lines = runs
+        .iter()
+        .map(|run| {
+            format!(
+                "- run `{}` of experiment `{}` (still **{}**)",
+                run.id, run.experiment_id, run.status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "[orx] orx can no longer monitor these live runs:\n{lines}\nRun `orx exp status <expId>` \
+         for the reason and tell the user so they can fix it. orx wakes you once it can see a run \
+         finish; until then each run keeps its current status."
+    )
+}
+
 fn first_wakeup_per_session(wakeups: Vec<crate::store::RunWakeup>) -> Vec<crate::store::RunWakeup> {
     let mut seen_sessions = HashSet::new();
     wakeups
@@ -7856,6 +7876,70 @@ async fn process_run_wakeups(
             Err(err) => {
                 store.release_run_wakeup(&wakeup.run.id, &wakeup.chat_session_id, &token)?;
                 if !chat.is_busy(&wakeup.chat_session_id).await {
+                    eprintln!("orx up: run watcher: {err}");
+                }
+            }
+        }
+    }
+    process_run_monitoring_alerts(chat, store, data_dir_move_in_progress).await
+}
+
+/// Tells each waiting session, once per outage, which of its live runs can no
+/// longer be monitored, leaving their terminal wake-ups pending.
+async fn process_run_monitoring_alerts(
+    chat: &Arc<ChatHost>,
+    store: Store,
+    data_dir_move_in_progress: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let mut unalerted = Vec::new();
+    for wakeup in store.list_active_run_wakeups()? {
+        let unmonitored = crate::jobs::BackendDescriptor::parse(&wakeup.run.backend_json)
+            .is_ok_and(|descriptor| descriptor.monitoring_error.is_some());
+        if unmonitored && !wakeup.monitoring_alerted {
+            unalerted.push(wakeup);
+        } else if !unmonitored && wakeup.monitoring_alerted {
+            store.set_run_wakeup_monitoring_alerted(
+                &wakeup.run.id,
+                &wakeup.chat_session_id,
+                false,
+            )?;
+        }
+    }
+    let mut by_session: HashMap<String, Vec<crate::store::RunWakeup>> = HashMap::new();
+    for wakeup in unalerted {
+        by_session
+            .entry(wakeup.chat_session_id.clone())
+            .or_default()
+            .push(wakeup);
+    }
+    for (session_id, alerts) in by_session {
+        let Some(mut guard) = TurnGuard::claim_hidden(chat, &session_id).await else {
+            continue;
+        };
+        if data_dir_move_in_progress
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            guard.release().await;
+            return Ok(());
+        }
+        let mut claimed = Vec::new();
+        for wakeup in alerts {
+            if store.set_run_wakeup_monitoring_alerted(&wakeup.run.id, &session_id, true)? {
+                claimed.push(wakeup.run);
+            }
+        }
+        if claimed.is_empty() {
+            guard.release().await;
+            continue;
+        }
+        let text = run_monitoring_text(&claimed);
+        let started = chat.send_hidden_message(&session_id, text, guard).await;
+        if !matches!(started, Ok(TurnSubmission::Started(_))) {
+            for run in &claimed {
+                store.set_run_wakeup_monitoring_alerted(&run.id, &session_id, false)?;
+            }
+            if let Err(err) = started {
+                if !chat.is_busy(&session_id).await {
                     eprintln!("orx up: run watcher: {err}");
                 }
             }
@@ -10332,11 +10416,13 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
                 run: first,
                 chat_session_id: "owner".into(),
                 state: "pending".into(),
+                monitoring_alerted: false,
             },
             crate::store::RunWakeup {
                 run: second,
                 chat_session_id: "owner".into(),
                 state: "pending".into(),
+                monitoring_alerted: false,
             },
         ]);
 
@@ -10503,6 +10589,93 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
 
         let store = Store::open_at(dir.clone()).unwrap();
         assert_eq!(store.list_ready_run_wakeups().unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn unmonitored_run() -> StoredRun {
+        StoredRun {
+            backend_json:
+                r#"{"kind":"slurm_job","monitoringError":"Monitoring unavailable: ssh failed."}"#
+                    .into(),
+            ..run("starting")
+        }
+    }
+
+    #[test]
+    fn monitoring_message_names_runs_without_remote_text() {
+        let first = StoredRun {
+            backend_json: r#"{"kind":"slurm_job","monitoringError":"REMOTE_SENTINEL"}"#.into(),
+            ..run("starting")
+        };
+        let mut second = run("running");
+        second.id = "run_y".into();
+        let text = run_monitoring_text(&[first, second]);
+        assert!(!text.contains("REMOTE_SENTINEL"));
+        assert_eq!(
+            text,
+            "[orx] orx can no longer monitor these live runs:\n\
+- run `run_x` of experiment `exp_1` (still **starting**)\n\
+- run `run_y` of experiment `exp_1` (still **running**)\n\
+Run `orx exp status <expId>` for the reason and tell the user so they can fix it. orx wakes you \
+once it can see a run finish; until then each run keeps its current status."
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_session_leaves_monitoring_alert_unclaimed() {
+        let (store, dir) = temp_store("alert-busy");
+        session(&store, "owner");
+        store.upsert_run(&unmonitored_run()).unwrap();
+        store.register_run_wakeup("run_x", "owner").unwrap();
+        let host = Arc::new(ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+        host.turns
+            .lock()
+            .await
+            .insert("owner".into(), TurnState::Draining);
+
+        drop(store);
+        process_run_wakeups(&host, Store::open_at(dir.clone()).unwrap(), None)
+            .await
+            .unwrap();
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert!(!store.list_active_run_wakeups().unwrap()[0].monitoring_alerted);
+        assert!(matches!(
+            host.turns.lock().await.get("owner"),
+            Some(TurnState::Draining)
+        ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn restored_monitoring_rearms_the_alert() {
+        let (store, dir) = temp_store("alert-restored");
+        session(&store, "owner");
+        store.upsert_run(&run("running")).unwrap();
+        store.register_run_wakeup("run_x", "owner").unwrap();
+        store
+            .set_run_wakeup_monitoring_alerted("run_x", "owner", true)
+            .unwrap();
+        let host = Arc::new(ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+
+        drop(store);
+        process_run_wakeups(&host, Store::open_at(dir.clone()).unwrap(), None)
+            .await
+            .unwrap();
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert!(!store.list_active_run_wakeups().unwrap()[0].monitoring_alerted);
+        assert!(!host.is_busy("owner").await);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

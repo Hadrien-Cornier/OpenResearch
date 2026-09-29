@@ -113,6 +113,19 @@ export function runDisplayStatus(run: Pick<Run, "status" | "cancelRequested">): 
   return live && run.cancelRequested ? "cancelling" : run.status;
 }
 
+/** Why the supervisor can't currently observe a live run, if it can't. */
+export function runMonitoringError(run: Pick<Run, "status" | "backend">): string | null {
+  if (run.status !== "running" && run.status !== "starting") return null;
+  const error = run.backend?.monitoringError;
+  return typeof error === "string" && error ? error : null;
+}
+
+/** The newest live run's monitoring error: a forced relaunch can leave an older run live. */
+export function experimentMonitoringError(runs: Pick<Run, "status" | "backend" | "createdAt">[]): string | null {
+  const newestFirst = [...runs].sort((a, b) => b.createdAt - a.createdAt);
+  return newestFirst.map(runMonitoringError).find((error) => error !== null) ?? null;
+}
+
 const writeScopes = new WeakMap<Response, ReturnType<typeof workspaceScope>>();
 
 async function json<T>(res: Response): Promise<T> {

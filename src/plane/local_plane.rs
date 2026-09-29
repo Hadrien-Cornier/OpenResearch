@@ -206,6 +206,18 @@ impl LocalPlane {
             }
             None => println!("  last run: — (never run)"),
         }
+        // A forced relaunch can leave an older run live; monitoring alerts send agents here.
+        for older in store.list_runs_by_experiment(&exp.id)?.iter().skip(1) {
+            if !matches!(older.status.as_str(), "starting" | "running") {
+                continue;
+            }
+            let error = crate::jobs::BackendDescriptor::parse(&older.backend_json)
+                .ok()
+                .and_then(|backend| backend.monitoring_error);
+            if let Some(error) = error {
+                println!("  older live run {}: {error}", older.id);
+            }
+        }
         Ok(())
     }
 
