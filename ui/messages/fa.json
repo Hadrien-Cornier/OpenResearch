@@ -971,6 +971,7 @@
   "settings_update_to_version": "به‌روزرسانی به {version}",
   "settings_check_for_updates": "بررسی به‌روزرسانی",
   "settings_install_release_now": "نسخهٔ جدید را اکنون نصب کنید و منتظر به‌روزرسانی پس‌زمینه نمانید.",
+  "settings_release_notes": "یادداشت‌های انتشار",
   "settings_checks_automatically": "orx روزی چند بار خودکار بررسی می‌کند.",
   "settings_update_now": "اکنون به‌روزرسانی کن",
   "settings_check_now": "اکنون بررسی کن",

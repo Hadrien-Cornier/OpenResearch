@@ -1247,7 +1247,8 @@ fn warning_for(current: &Version, latest: &Version, orx: &str, automatic: bool) 
     };
     Some(format!(
         "{WARNING_LABEL} orx {current} is outdated (latest {latest}). A newer release is \
-         available; upgrade to stay compatible with the API. {remedy}"
+         available; upgrade to stay compatible with the API. {remedy} \
+         Release notes: {REPO_URL}/releases/tag/v{latest}"
     ))
 }
 
@@ -1435,6 +1436,7 @@ mod tests {
         assert!(msg.contains("outdated"), "{msg}");
         assert!(msg.contains("stay compatible with the API"), "{msg}");
         assert!(msg.contains("orx update"), "{msg}");
+        assert!(msg.contains("/releases/tag/v"), "{msg}");
     }
 
     #[test]

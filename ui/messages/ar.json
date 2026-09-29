@@ -976,6 +976,7 @@
   "settings_update_to_version": "التحديث إلى {version}",
   "settings_check_for_updates": "التحقق من التحديثات",
   "settings_install_release_now": "ثبّت الإصدار الجديد الآن بدلًا من انتظار التحديث في الخلفية.",
+  "settings_release_notes": "ملاحظات الإصدار",
   "settings_checks_automatically": "يتحقق orx بضع مرات يوميًا تلقائيًا.",
   "settings_update_now": "التحديث الآن",
   "settings_check_now": "التحقق الآن",
