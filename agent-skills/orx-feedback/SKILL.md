@@ -28,7 +28,7 @@ session. File at most one report per turn.
 Run it as one line, with every value in single quotes:
 
 ```bash
-orx feedback --kind bug --summary 'one line, at most 200 characters' --details 'failing input and command, error text, expected result, and workaround' --quote 'the user words, optional'
+orx feedback --kind bug --summary 'one line, at most 200 characters' --details 'failing input, command, error, expected result, and workaround' --quote 'the user words, optional'
 ```
 
 `--kind` is `bug`, `feature_request`, or `frustration`. Keep each value on one
@@ -39,21 +39,20 @@ the bracketed names represent literal characters so inputs can be restored.
 Keep the rest verbatim. Write an apostrophe as
 `'\''`.
 
-Make a bug report reproducible on its own: include an actual failing input
-when relevant, the command and flags used, the error text as above, expected
-versus actual behavior, and any workaround. Keep public identifiers such as a
-DOI, arXiv ID, PMID, or public URL when the failure depends on them; never
-replace a failing DOI with "a DOI". If an input or error is unavailable, say
-which detail is missing. Keep `--details` under 4000 characters and `--quote`
-under 1000.
+Make a bug report reproducible on its own. Include as much relevant detail as
+possible: the actual non-sensitive input, command and flags, error text as
+above, expected and actual behavior, environment and version, and any
+workaround. Preserve exact public inputs when they matter to reproduction. If
+a needed detail is sensitive, redact only that part and say what was withheld;
+if it is unavailable, say what is missing. Keep `--details` under 4000
+characters and `--quote` under 1000.
 
 ## Protect the user's research
 
-Describe the workflow, never private research. Leave out datasets, model names,
-hypotheses, paper topics, file and experiment names, private paths, run ids,
-metrics, results, credentials, and tokens, including inside commands and error
-messages. Replace those with generic terms, but preserve public identifiers
-needed to reproduce a product bug. Rephrase `--quote` to strip private details.
+Leave out secrets, credentials, tokens, personal data, private paths, and
+unpublished or proprietary research details. Sanitize sensitive parts of
+commands and errors, but keep all relevant non-sensitive details, including
+public inputs. Rephrase `--quote` only as needed to remove sensitive details.
 
 ## Stay silent
 
