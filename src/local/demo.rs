@@ -205,16 +205,8 @@ thread_local! {
 /// speed rather than at yield priority.
 static FOREGROUND_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Build the embedded demo worktree off the request path while the onboarding
-/// screen is up. `seed_at` only writes its store rows once the user confirms,
-/// so a fresh install's "Get started" click stops paying the ~15 sequential
-/// git spawns — on Windows that was several seconds of "Setting things up".
-/// `install_repository`'s lock makes a click that beats the warm-up wait for
-/// it and then validate, rather than build a second copy. `data_dir_gate`
-/// keeps it from writing into a data dir while a directory move is in flight —
-/// a contended gate just skips the warm-up; `seed_at` covers the confirm path.
-/// (`try_lock`, not `blocking_lock`: that panics under a runtime context, and
-/// `spawn_blocking` still carries one.)
+/// Prepare the demo's bare origin during onboarding, leaving the final repo
+/// absent so `seed_at` still creates the full snapshot on confirmation.
 pub fn prewarm(
     move_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     data_dir_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -244,18 +236,24 @@ pub fn prewarm(
             .map(|state| state.onboarding_completed)
             .unwrap_or(true)
     };
-    // A move that starts here races the install's writes — acceptable:
-    // `seed_at` re-validates and repairs the worktree on the confirm path.
+    // A move that starts here races the install's writes; `seed_at` repairs
+    // the origin on the confirm path.
     if !onboarding_pending || move_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    // `install_repository` decides for itself: an existing worktree is
-    // validated (and repaired) rather than rebuilt, so a half-written repo
-    // from a killed boot still gets finished before the user clicks.
-    if let Err(error) = install_repository(&super::git::clone_path(OWNER, REPO), &demo_bare_path())
+    if let Err(error) = prewarm_repository(&super::git::clone_path(OWNER, REPO), &demo_bare_path())
     {
         eprintln!("orx up: demo pre-install failed: {error}");
     }
+}
+
+fn prewarm_repository(repo: &Path, bare: &Path) -> Result<()> {
+    if repo.exists() {
+        return Ok(());
+    }
+    let staging = super::git::TemporaryDirectory::new("orx-demo-prewarm")?;
+    install_repository(&staging.path().join(REPO), bare)?;
+    Ok(())
 }
 
 /// The bare repository the demo worktree's `origin` points at.
@@ -1855,6 +1853,52 @@ mod tests {
         assert!(error.contains("reserved demo origin"), "{error}");
         assert!(!repo.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prewarmed_onboarding_seeds_full_demo() {
+        for prewarmed in [false, true] {
+            let root = super::super::git::TemporaryDirectory::new("orx-demo-onboarding").unwrap();
+            let data = root.path().join("data");
+            let repo = data.join("repos").join(OWNER).join(REPO);
+            let bare = data.join("demo-repos").join("nanochat.git");
+            let store = Store::open_at(data.clone()).unwrap();
+            if prewarmed {
+                prewarm_repository(&repo, &bare).unwrap();
+                assert!(!repo.exists());
+                assert!(bare.join("HEAD").is_file());
+            }
+            let started = std::time::Instant::now();
+            let completion = seed_at(
+                &store,
+                &data,
+                &repo,
+                DemoSelection {
+                    harness: "codex".into(),
+                    model: None,
+                    permission_mode: None,
+                    reasoning_level: None,
+                },
+            )
+            .unwrap();
+            println!(
+                "onboarding_{}_ms={}",
+                if prewarmed { "warm" } else { "cold" },
+                started.elapsed().as_millis()
+            );
+            assert_eq!(completion.project.id, PROJECT_ID);
+            assert_eq!(
+                store.list_experiments_by_project(PROJECT_ID).unwrap().len(),
+                3
+            );
+            assert_eq!(
+                store
+                    .list_chat_sessions_by_project(PROJECT_ID)
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
     }
 
     #[test]
