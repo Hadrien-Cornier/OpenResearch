@@ -1750,6 +1750,20 @@ async fn enable_project_github(State(state): State<AppState>, Path(id): Path<Str
     let project = store
         .get_local_project(&id)?
         .ok_or_else(|| not_found("project"))?;
+    // Publishing may `git worktree move` legacy-layout worktrees out from under a running turn.
+    for session in store.list_chat_sessions_by_project(&project.id)? {
+        let legacy = local::git::existing_session_worktree_path(&project, &session.id)
+            != local::git::session_worktree_path(&project.id, &session.id);
+        if legacy
+            && (state.chat.is_busy(&session.id).await || store.chat_turn_leased(&session.id)?)
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "Wait for this project's running chats to finish before enabling GitHub sync."
+                    .into(),
+            ));
+        }
+    }
     let (project, github_status) = push_project_for_sync(project).await.map_err(bad_request)?;
     let git_status = project_git_json(&project, github_status);
     Ok(Json(
