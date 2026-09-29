@@ -8,7 +8,7 @@
 //! Data dir: `$ORX_DATA_DIR`, else `$XDG_DATA_HOME/openresearch`, else
 //! `~/.local/share/openresearch`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -37,23 +37,39 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub(crate) fn open_lifecycle_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
+    open_lifecycle_lock_in(&crate::config::config_dir())
+}
+
+fn open_lifecycle_lock_in(config_dir: &Path) -> Result<fd_lock::RwLock<std::fs::File>> {
     // The config dir stays put while the user can move the live data directory.
-    let path = lifecycle_lock_path();
+    let path = lifecycle_lock_path_in(config_dir);
+    let legacy = config_dir.join("orx.lifecycle.lock");
     if !path.exists() {
-        let legacy = crate::config::config_dir().join("orx.lifecycle.lock");
         drop(open_lifecycle_lock_at(&legacy)?);
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        // Keep the legacy lock if this filesystem cannot share its inode.
+        if std::fs::create_dir_all(path.parent().unwrap()).is_err() {
+            return open_lifecycle_lock_at(&legacy);
+        }
         match std::fs::hard_link(&legacy, &path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+            Err(_) => return open_lifecycle_lock_at(&legacy),
         }
+    }
+    if !same_file::is_same_file(&legacy, &path)? {
+        return Err(anyhow!(
+            "Lifecycle lock paths differ; refusing to run without a shared lock"
+        ));
     }
     open_lifecycle_lock_at(&path)
 }
 
 pub(crate) fn lifecycle_lock_path() -> PathBuf {
-    crate::config::config_dir().join("locks/orx.lifecycle.lock")
+    lifecycle_lock_path_in(&crate::config::config_dir())
+}
+
+fn lifecycle_lock_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("locks/orx.lifecycle.lock")
 }
 
 pub(crate) fn open_lifecycle_lock_at(
@@ -3206,17 +3222,40 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn lifecycle_lock_keeps_legacy_inode() {
-        use std::os::unix::fs::MetadataExt;
+        let config_dir = std::env::temp_dir().join(format!("orx-lock-{}", uuid::Uuid::new_v4()));
+        let lock = open_lifecycle_lock_in(&config_dir).unwrap();
+        let legacy = config_dir.join("orx.lifecycle.lock");
+        let path = lifecycle_lock_path_in(&config_dir);
+        assert!(same_file::is_same_file(legacy, &path).unwrap());
+        assert!(path.parent().unwrap().is_dir());
+        assert!(!config_dir
+            .join("credentials.json")
+            .starts_with(path.parent().unwrap()));
+        drop(lock);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
 
-        let _lock = open_lifecycle_lock().unwrap();
-        let legacy = crate::config::config_dir().join("orx.lifecycle.lock");
-        assert_eq!(
-            std::fs::metadata(legacy).unwrap().ino(),
-            std::fs::metadata(lifecycle_lock_path()).unwrap().ino()
-        );
+    #[test]
+    fn lifecycle_lock_rejects_replaced_entry() {
+        let config_dir = std::env::temp_dir().join(format!("orx-lock-{}", uuid::Uuid::new_v4()));
+        let lock = open_lifecycle_lock_in(&config_dir).unwrap();
+        let path = lifecycle_lock_path_in(&config_dir);
+        drop(lock);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        assert!(open_lifecycle_lock_in(&config_dir).is_err());
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_lock_uses_legacy_when_dedicated_dir_cannot_be_created() {
+        let config_dir = std::env::temp_dir().join(format!("orx-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("locks"), "not a directory").unwrap();
+        assert!(open_lifecycle_lock_in(&config_dir).is_ok());
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]

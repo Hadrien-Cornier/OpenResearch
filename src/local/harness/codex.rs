@@ -3336,7 +3336,10 @@ pub(crate) fn ensure_orx_data_dir() -> Option<PathBuf> {
 fn ensure_orx_lifecycle_lock_dir() -> Option<PathBuf> {
     let lock = crate::store::open_lifecycle_lock().ok()?;
     drop(lock);
-    crate::paths::canonicalize(crate::store::lifecycle_lock_path().parent()?).ok()
+    let path = crate::store::lifecycle_lock_path();
+    let root = crate::paths::canonicalize(path.parent()?).ok()?;
+    let file = crate::paths::canonicalize(path).ok()?;
+    (file.parent() == Some(root.as_path())).then_some(root)
 }
 
 /// Session reasoning id → Codex `model_reasoning_effort` value.
@@ -5170,17 +5173,6 @@ requires_openai_auth = false
         // No roots → no flag at all; `=[]` would clobber the user's own
         // config.toml roots for the turn.
         assert_eq!(writable_roots_override(&[]), None);
-    }
-
-    #[test]
-    fn lifecycle_lock_writable_root_is_a_directory() {
-        let root = ensure_orx_lifecycle_lock_dir().unwrap();
-        assert!(root.is_dir(), "writable root must be a directory: {root:?}");
-        let lock = crate::paths::canonicalize(crate::store::lifecycle_lock_path()).unwrap();
-        assert_eq!(lock.parent(), Some(root.as_path()));
-        assert!(!crate::config::config_dir()
-            .join("credentials.json")
-            .starts_with(root));
     }
 
     #[test]
