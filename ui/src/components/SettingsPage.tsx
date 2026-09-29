@@ -113,7 +113,7 @@ import {
   type InstalledCli,
 } from "../api";
 import { onDataDirMove } from "../events";
-import { useRestartApp, useUpdateStatus } from "./UpdateBanner";
+import { releaseNotesUrl, useRestartApp, useUpdateStatus } from "./UpdateBanner";
 import { useThemePreference, type ThemePreference } from "../theme";
 import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
@@ -2774,6 +2774,9 @@ function UpdatesTab() {
                   {status.updateAvailable
                     ? m.settings_install_release_now()
                     : m.settings_checks_automatically()}
+                  {status.updateAvailable && status.latestTag && (
+                    <> <a href={releaseNotesUrl(status.latestTag)} target="_blank" rel="noreferrer" className="underline">{m.settings_release_notes()}</a></>
+                  )}
                 </p>
               </div>
               <Button size="small"

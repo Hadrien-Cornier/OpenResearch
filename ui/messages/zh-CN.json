@@ -971,6 +971,7 @@
   "settings_update_to_version": "更新到 {version}",
   "settings_check_for_updates": "检查更新",
   "settings_install_release_now": "立即安装新版本，无需等待后台更新。",
+  "settings_release_notes": "版本说明",
   "settings_checks_automatically": "orx 每天会自动检查几次。",
   "settings_update_now": "立即更新",
   "settings_check_now": "立即检查",
