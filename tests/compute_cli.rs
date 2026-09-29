@@ -255,8 +255,10 @@ esac
         }
     };
     let wait = |condition: &dyn Fn() -> bool| wait_for(Duration::from_secs(15), condition);
-    // Brief outages stay unreported; a sustained one is reported after about a minute,
-    // which also exceeds the old one-minute GONE-to-failed threshold.
+    // A missing scheduler record is reported only after about a minute, without failing the run.
+    wait(&|| {
+        std::fs::read_to_string(sandbox.0.join("calls")).is_ok_and(|c| c.contains("exit_code"))
+    });
     std::thread::sleep(Duration::from_secs(10));
     assert!(metadata()["monitoringError"].is_null());
     wait_for(Duration::from_secs(75), &|| {
