@@ -28,11 +28,16 @@ def fixed_issues(notes, repository):
     issues = []
     seen = set()
     for number in dict.fromkeys(re.findall(pattern, notes)):
-        result = gh(
-            "graphql", "-f", f"query={ISSUES_QUERY}", "-f", f"owner={owner}",
-            "-f", f"repo={repo}", "-F", f"number={number}",
-        )
-        for issue in result["data"]["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"]:
+        try:
+            result = gh(
+                "graphql", "-f", f"query={ISSUES_QUERY}", "-f", f"owner={owner}",
+                "-f", f"repo={repo}", "-F", f"number={number}",
+            )
+            linked = result["data"]["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"]
+        except (subprocess.CalledProcessError, KeyError, TypeError, ValueError) as error:
+            print(f"::warning::Could not list fixed issues for PR #{number}: {error}", file=sys.stderr)
+            continue
+        for issue in linked:
             if issue["state"] == "CLOSED" and issue["url"] not in seen:
                 seen.add(issue["url"])
                 title = issue["title"].replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")

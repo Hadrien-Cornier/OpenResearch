@@ -2774,8 +2774,8 @@ function UpdatesTab() {
                   {status.updateAvailable
                     ? m.settings_install_release_now()
                     : m.settings_checks_automatically()}
-                  {status.updateAvailable && status.latest && (
-                    <> <a href={releaseNotesUrl(status.latest)} target="_blank" rel="noreferrer" className="underline">{m.settings_release_notes()}</a></>
+                  {status.updateAvailable && status.latestTag && (
+                    <> <a href={releaseNotesUrl(status.latestTag)} target="_blank" rel="noreferrer" className="underline">{m.settings_release_notes()}</a></>
                   )}
                 </p>
               </div>

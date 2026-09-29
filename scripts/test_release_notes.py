@@ -1,4 +1,5 @@
 import unittest
+import subprocess
 from unittest.mock import patch
 
 from release_notes import compose, fixed_issues
@@ -27,6 +28,17 @@ class ReleaseNotesTest(unittest.TestCase):
         self.assertIn("[Handle \\[arXiv\\] links]", rendered)
         self.assertNotIn("Still open", rendered)
         self.assertNotIn("## Highlights", compose(notes, [], "", "## Install"))
+
+    def test_issue_lookup_failure_keeps_other_issues(self):
+        notes = (
+            "* First in https://github.com/alphaXiv/OpenResearch/pull/1\n"
+            "* Second in https://github.com/alphaXiv/OpenResearch/pull/2"
+        )
+        issue = {"title": "Fixed", "url": "https://github.com/alphaXiv/OpenResearch/issues/3", "state": "CLOSED"}
+        response = {"data": {"repository": {"pullRequest": {"closingIssuesReferences": {"nodes": [issue]}}}}}
+        with patch("release_notes.gh", side_effect=[subprocess.CalledProcessError(1, "gh"), response]):
+            issues = fixed_issues(notes, "alphaXiv/OpenResearch")
+        self.assertEqual(len(issues), 1)
 
 
 if __name__ == "__main__":
