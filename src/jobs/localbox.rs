@@ -47,10 +47,23 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
     let env = super::default_python_env(&spec.env);
-    // Same subshell shape as the ssh backend: an `exit`/`set -e` failure inside
-    // `( … )` ends the subshell, not run.sh, so exit_code is always written.
+    #[cfg(not(windows))]
+    // Keep the launcher identifiable until background children exit, including after a payload cd.
+    let completion = format!(
+        "trap 'exit 143' TERM\ntrap {} EXIT\n",
+        sh_quote(&format!(
+            "code=$?; echo \"$code\" > {}; wait; exit \"$code\"",
+            sh_quote(&crate::local::bash::bash_path(&dir.join("exit_code")))
+        ))
+    );
+    #[cfg(windows)]
+    let completion = "";
+    #[cfg(not(windows))]
+    let record_exit = "";
+    #[cfg(windows)]
+    let record_exit = "echo $? > exit_code\n";
     let run_sh = format!(
-        "#!/usr/bin/env bash\ncd {dir} || exit 97\n(\n{script}\n) > log 2>&1\necho $? > exit_code\n",
+        "#!/usr/bin/env bash\ncd {dir} || exit 97\n(\n{completion}{script}\n) > log 2>&1\n{record_exit}",
         dir = sh_quote(&crate::local::bash::bash_path(&dir)),
         script = spec.script,
     );
@@ -257,9 +270,6 @@ pub fn stream_logs(dir: &Path, skip: u64, sink: &mut (dyn FnMut(&str) + Send)) -
 
 /// TERM the process group (pid == pgid), else the pid alone; on Windows, the process tree.
 pub fn cancel_job(dir: &Path) -> Result<()> {
-    if exit_code_state(dir).is_some() {
-        return Ok(());
-    }
     let pid = std::fs::read_to_string(dir.join("pid"))
         .map_err(|e| anyhow!("Could not read the run's pid: {}", e))?;
     let pid = pid.trim().to_string();
@@ -560,6 +570,27 @@ mod tests {
             std::fs::read(descendants.join("heartbeat")).unwrap(),
             heartbeat
         );
+
+        #[cfg(unix)]
+        {
+            let background = run_job(&LocalJobSpec {
+                run_id: "background".into(),
+                script: "mkdir repo; cd repo; (for i in {1..100}; do echo tick >> ../heartbeat; sleep 0.1; done) &".into(),
+                env: HashMap::new(),
+                secret_env: HashMap::new(),
+            })
+            .unwrap();
+            assert_eq!(wait_terminal(&background).stage, "COMPLETED");
+            cancel_job(&background).unwrap();
+            assert_reaped(&background);
+            let heartbeat = std::fs::read(background.join("heartbeat")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert_eq!(
+                std::fs::read(background.join("heartbeat")).unwrap(),
+                heartbeat,
+                "rollback must terminate descendants after the payload finishes"
+            );
+        }
 
         #[cfg(unix)]
         {
