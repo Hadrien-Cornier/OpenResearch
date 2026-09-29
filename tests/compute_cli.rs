@@ -218,7 +218,7 @@ esac
     .unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
     let phase = sandbox.0.join("phase");
-    std::fs::write(&phase, "outage").unwrap();
+    std::fs::write(&phase, "missing").unwrap();
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
         fn drop(&mut self) {
@@ -244,8 +244,8 @@ esac
             .unwrap();
         serde_json::from_str(&raw).unwrap()
     };
-    let wait = |condition: &dyn Fn() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(15);
+    let wait_for = |timeout: Duration, condition: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + timeout;
         while !condition() {
             assert!(
                 Instant::now() < deadline,
@@ -254,19 +254,22 @@ esac
             std::thread::sleep(Duration::from_millis(100));
         }
     };
+    let wait = |condition: &dyn Fn() -> bool| wait_for(Duration::from_secs(15), condition);
+    // Brief outages stay unreported; a sustained one is reported after about a minute,
+    // which also exceeds the old one-minute GONE-to-failed threshold.
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(metadata()["monitoringError"].is_null());
+    wait_for(Duration::from_secs(75), &|| {
+        metadata()["monitoringError"]
+            .as_str()
+            .is_some_and(|s| s.contains("scheduler record"))
+    });
+    std::fs::write(&phase, "outage").unwrap();
     wait(&|| {
         metadata()["monitoringError"]
             .as_str()
             .is_some_and(|s| s.contains("Reconnect"))
     });
-    std::fs::write(&phase, "missing").unwrap();
-    wait(&|| {
-        metadata()["monitoringError"]
-            .as_str()
-            .is_some_and(|s| s.contains("scheduler record"))
-    });
-    // Exceeds the old one-minute GONE-to-failed threshold.
-    std::thread::sleep(Duration::from_secs(61));
     let status: String = db
         .query_row("SELECT status FROM runs WHERE id='run'", [], |r| r.get(0))
         .unwrap();
