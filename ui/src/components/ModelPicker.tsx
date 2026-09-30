@@ -18,6 +18,7 @@ import {
   type OptionChoice,
   type AgentSelection,
   type Autonomy,
+  DEFAULT_AUTONOMY,
 } from "../api";
 import { renderNote } from "./agentNote";
 import { HarnessLogo } from "./HarnessLogo";
@@ -502,7 +503,7 @@ export function ModelPicker({
           {page === "autonomy" && (
             <>
               {submenuHeader(m.model_picker_autonomy())}
-              {choiceList(autonomyChoices, autonomy, "agentic", chooseAutonomy)}
+              {choiceList(autonomyChoices, autonomy, DEFAULT_AUTONOMY, chooseAutonomy)}
             </>
           )}
           {page === "speed" && (

@@ -5241,7 +5241,7 @@ struct SetUiStateReq {
     #[serde(default)]
     preferred_agent: Option<StoredAgentSelectionReq>,
     workspace: Option<GlobalWorkspaceState>,
-    preferred_autonomy: Option<String>,
+    preferred_autonomy: Option<Autonomy>,
 }
 
 #[derive(Deserialize)]
@@ -5258,11 +5258,6 @@ async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
     if let Some(workspace) = &req.workspace {
         workspace.validate().map_err(bad_request)?;
     }
-    let preferred_autonomy = req
-        .preferred_autonomy
-        .as_deref()
-        .map(|id| Autonomy::from_id(id).ok_or_else(|| bad_request("invalid autonomy level")))
-        .transpose()?;
     tokio::task::spawn_blocking(move || -> Result<Json<Value>> {
         let store = Store::open()?;
         let selection = req
@@ -5299,7 +5294,7 @@ async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
         if let Some(selection) = selection {
             store.set_preferred_agent(&selection)?;
         }
-        if let Some(autonomy) = preferred_autonomy {
+        if let Some(autonomy) = req.preferred_autonomy {
             store.set_preferred_autonomy(autonomy.id())?;
         }
         if let Some(workspace) = req.workspace {
@@ -6818,7 +6813,7 @@ struct CreateChatSessionReq {
     #[serde(default)]
     plan_mode: bool,
     reasoning_level: Option<String>,
-    autonomy: Option<String>,
+    autonomy: Option<Autonomy>,
 }
 
 async fn create_chat_session(
@@ -6857,12 +6852,6 @@ async fn create_chat_session(
             "this harness activates Plan through permissions",
         ));
     }
-    let autonomy = req
-        .autonomy
-        .as_deref()
-        .map(|id| Autonomy::from_id(id).ok_or_else(|| bad_request("invalid autonomy level")))
-        .transpose()?
-        .map(|autonomy| autonomy.id().to_string());
     let session = StoredChatSession {
         id: format!("chat_{}", uuid::Uuid::new_v4()),
         project_id: req.project_id,
@@ -6880,7 +6869,7 @@ async fn create_chat_session(
         context_usage_json: None,
         bootstrap_context: None,
         goal: None,
-        autonomy,
+        autonomy: req.autonomy.map(|autonomy| autonomy.id().to_string()),
         active_leaf_id: None,
         parent_session_id: None,
         created_at: now_ms(),
@@ -6981,7 +6970,7 @@ struct UpdateChatSessionReq {
     /// Present-and-null clears the goal, which is why it is doubly wrapped.
     #[serde(default, deserialize_with = "present_nullable_string")]
     goal: Option<Option<String>>,
-    autonomy: Option<String>,
+    autonomy: Option<Autonomy>,
 }
 
 async fn update_chat_session(
@@ -7028,8 +7017,6 @@ async fn update_chat_session(
             .await?
             .ok_or_else(|| not_found("chat session"))?
     } else if let Some(autonomy) = req.autonomy {
-        let autonomy =
-            Autonomy::from_id(&autonomy).ok_or_else(|| bad_request("invalid autonomy level"))?;
         state
             .chat
             .set_autonomy(&id, autonomy)

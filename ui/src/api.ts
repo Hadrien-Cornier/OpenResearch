@@ -227,6 +227,7 @@ export interface UiState {
 
 /** How much of the research the agent owns before checking in. */
 export type Autonomy = "copilot" | "agentic";
+export const DEFAULT_AUTONOMY: Autonomy = "agentic";
 
 export const getUiState = (signal?: AbortSignal) => get<UiState>("/api/settings/ui-state", signal);
 

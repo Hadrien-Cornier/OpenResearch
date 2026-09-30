@@ -2,7 +2,10 @@
 //! Unlike permission modes this is harness-independent: it rides every turn as
 //! an `<orx-autonomy>` block, so changing it never restarts the agent.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Autonomy {
     Copilot,
     #[default]
@@ -53,7 +56,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_or_missing_levels_default_to_agentic() {
+    fn unknown_levels_default_to_agentic_which_adds_no_context() {
         assert_eq!(Autonomy::from_stored(None), Autonomy::Agentic);
         assert_eq!(Autonomy::from_stored(Some("reckless")), Autonomy::Agentic);
         assert_eq!(Autonomy::from_stored(Some("copilot")), Autonomy::Copilot);

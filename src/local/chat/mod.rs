@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 use crate::error::{anyhow, Result};
+use crate::local::autonomy::Autonomy;
 use crate::local::harness::ResumeAction;
 use crate::local::model::LocalProject;
 use crate::local::opencode::AgentHost;
@@ -1242,7 +1243,7 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         "activeLeafId": s.active_leaf_id,
         "parentSessionId": s.parent_session_id,
         "goal": s.goal,
-        "autonomy": crate::local::autonomy::Autonomy::from_stored(s.autonomy.as_deref()).id(),
+        "autonomy": Autonomy::from_stored(s.autonomy.as_deref()).id(),
     })
 }
 
@@ -5535,8 +5536,7 @@ impl ChatHost {
                 session.native_session_id.as_deref(),
                 session.bootstrap_context.as_deref(),
                 session.goal.as_deref(),
-                crate::local::autonomy::Autonomy::from_stored(session.autonomy.as_deref())
-                    .turn_context(),
+                Autonomy::from_stored(session.autonomy.as_deref()).turn_context(),
                 super::demo::turn_context(&project.id),
                 shell_context.as_deref(),
                 expanded,
@@ -6336,7 +6336,7 @@ impl ChatHost {
     pub async fn set_autonomy(
         &self,
         session_id: &str,
-        autonomy: crate::local::autonomy::Autonomy,
+        autonomy: Autonomy,
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
         store.set_chat_session_autonomy(session_id, autonomy.id())?;

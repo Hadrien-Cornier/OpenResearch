@@ -962,7 +962,10 @@ impl Store {
                     workspace: workspace_json
                         .as_deref()
                         .and_then(GlobalWorkspaceState::from_stored),
-                    preferred_autonomy: row.get(8)?,
+                    preferred_autonomy: row
+                        .get::<_, Option<String>>(8)?
+                        .as_deref()
+                        .and_then(crate::local::autonomy::Autonomy::from_id),
                 })
             },
         )?)
@@ -3141,7 +3144,7 @@ pub struct StoredUiState {
     pub tour_completed: bool,
     pub preferred_agent: Option<StoredAgentSelection>,
     pub workspace: Option<GlobalWorkspaceState>,
-    pub preferred_autonomy: Option<String>,
+    pub preferred_autonomy: Option<crate::local::autonomy::Autonomy>,
 }
 
 /// Normalized transcript entry; `parts_json` is the wire-format parts array
@@ -3571,7 +3574,7 @@ mod tests {
                 tour_completed: true,
                 preferred_agent: Some(selection),
                 workspace: None,
-                preferred_autonomy: Some("copilot".into()),
+                preferred_autonomy: Some(crate::local::autonomy::Autonomy::Copilot),
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4420,7 +4423,7 @@ mod tests {
         session.autonomy = Some("copilot".into());
         store.create_chat_session(&session).unwrap();
         let autonomy = |store: &Store| store.get_chat_session("chat_a").unwrap().unwrap().autonomy;
-        assert_eq!(autonomy(&store).as_deref(), Some("collaborator"));
+        assert_eq!(autonomy(&store).as_deref(), Some("copilot"));
         store
             .set_chat_session_autonomy("chat_a", "agentic")
             .unwrap();

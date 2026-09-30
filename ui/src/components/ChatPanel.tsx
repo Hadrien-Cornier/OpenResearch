@@ -4681,17 +4681,24 @@ export function ChatPanel({
   };
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
   const setAutonomy = (autonomy: Autonomy) => {
-    onPreferredAutonomyChange(autonomy);
-    if (!openSession) return;
+    if (!openSession) {
+      onPreferredAutonomyChange(autonomy);
+      return;
+    }
     const sessionId = openSession.id;
     const previous = openSession.autonomy;
+    const mutation = ++settingsMutationSeq.current;
     const replace = (session: ChatSession) =>
       setSessions((current) => current.map((row) => (row.id === session.id ? session : row)));
     replace({ ...openSession, autonomy });
     setSettingsError(null);
     void queueSessionMutation(() => setChatSessionAutonomyMutation.mutateAsync([sessionId, autonomy]))
-      .then(replace)
+      .then((session) => {
+        replace(session);
+        onPreferredAutonomyChange(session.autonomy);
+      })
       .catch(() => {
+        if (settingsMutationSeq.current !== mutation) return;
         setSessions((current) =>
           current.map((row) => (row.id === sessionId ? { ...row, autonomy: previous } : row)),
         );
