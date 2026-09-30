@@ -261,7 +261,7 @@ pub(crate) fn auth_recovery_note(method: Option<&str>, provider: Option<&str>) -
     }
 }
 
-fn external_provider(method: Option<&str>, provider: Option<&str>) -> bool {
+pub(crate) fn external_provider(method: Option<&str>, provider: Option<&str>) -> bool {
     method == Some("thirdParty") || provider.is_some_and(|provider| provider != "firstParty")
 }
 
@@ -374,6 +374,13 @@ async fn claude_models_response(bin: PathBuf) -> Option<Value> {
         .await
         .ok()
         .flatten()
+}
+
+pub(crate) async fn external_model_catalog(bin: PathBuf, ultracode: bool) -> Vec<ModelInfo> {
+    super::detect::timed_probe("claude-code", "models", claude_models_response(bin))
+        .await
+        .map(|response| parse_claude_model_list(&response, ultracode))
+        .unwrap_or_default()
 }
 
 /// The Full pass's probes on one binary. Auth and the ultracode parser check
@@ -631,6 +638,7 @@ impl ClaudeCode {
         let (spec_auth, ultracode, spec_models) = spec_probes
             .map(|(auth, ultracode, models)| (Some(auth), ultracode, models))
             .unwrap_or((None, false, None));
+        info.claude_ultracode = ultracode;
         // The CLI owns OAuth and Keychain refresh. Its live status decides
         // whether this harness can run; a broken binary would only fail it too.
         if info.installed && !info.install_broken {
@@ -679,11 +687,12 @@ impl ClaudeCode {
                 let parsed = parse_claude_model_list(&resp, ultracode);
                 (!parsed.is_empty()).then_some(parsed)
             });
-            if models.is_none()
-                && !snapshot
-                && !external_provider(info.auth_method, info.auth_provider.as_deref())
-            {
-                info.agent_note = Some("Could not load Claude Code models. Re-check this harness or update Claude Code; the CLI default model is still available.".to_string());
+            if models.is_none() && !snapshot {
+                info.agent_note = Some(if external_provider(info.auth_method, info.auth_provider.as_deref()) {
+                    "Loading Claude Code models; the CLI default model is available now."
+                } else {
+                    "Could not load Claude Code models. Re-check this harness or update Claude Code; the CLI default model is still available."
+                }.to_string());
             }
             info = info.with_models(models.unwrap_or_default());
         } else if info.install_broken {

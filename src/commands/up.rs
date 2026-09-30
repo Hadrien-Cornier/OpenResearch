@@ -117,6 +117,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         project_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
         publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         harness_fill_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        claude_catalog_queue: Arc::new(std::sync::Mutex::new(ClaudeCatalogQueue::default())),
         data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         data_dir_gate: Arc::new(tokio::sync::Mutex::new(())),
         remote_sessions: crate::commands::up_remote::RemoteSessionManager::new(),
@@ -353,6 +354,7 @@ struct AppState {
     /// Single-flight guard for the background catalog fill: without it every
     /// expired read would start its own full detection sweep.
     harness_fill_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    claude_catalog_queue: Arc<std::sync::Mutex<ClaudeCatalogQueue>>,
     /// Set while a data-dir move is running. New chat turns and run launches
     /// check it and refuse (409) so nothing starts writing the store mid-move —
     /// closing the window between the move's in-flight check and its completion.
@@ -6220,6 +6222,101 @@ fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapsh
     });
 }
 
+struct ClaudeCatalogRequest {
+    bin: std::path::PathBuf,
+    ultracode: bool,
+    method: Option<&'static str>,
+    provider: Option<String>,
+}
+
+#[derive(Default)]
+struct ClaudeCatalogQueue {
+    running: bool,
+    latest: Option<(std::time::Instant, ClaudeCatalogRequest)>,
+}
+
+fn claude_catalog_request(
+    harnesses: &[local::harness::HarnessInfo],
+) -> Option<ClaudeCatalogRequest> {
+    let claude = harnesses
+        .iter()
+        .find(|h| h.id == "claude-code" && h.agent_ready)?;
+    if !local::harness::claude::external_provider(
+        claude.auth_method,
+        claude.auth_provider.as_deref(),
+    ) {
+        return None;
+    }
+    Some(ClaudeCatalogRequest {
+        bin: claude.bin_path.as_ref()?.into(),
+        ultracode: claude.claude_ultracode,
+        method: claude.auth_method,
+        provider: claude.auth_provider.clone(),
+    })
+}
+
+fn enqueue_claude_catalog(
+    state: AppState,
+    cached_at: std::time::Instant,
+    request: ClaudeCatalogRequest,
+) {
+    let mut queue = state.claude_catalog_queue.lock().unwrap();
+    queue.latest = Some((cached_at, request));
+    if queue.running {
+        return;
+    }
+    queue.running = true;
+    drop(queue);
+    tokio::spawn(async move {
+        loop {
+            let next = {
+                let mut queue = state.claude_catalog_queue.lock().unwrap();
+                match queue.latest.take() {
+                    Some(next) => next,
+                    None => {
+                        queue.running = false;
+                        return;
+                    }
+                }
+            };
+            let (cached_at, request) = next;
+            let models =
+                local::harness::claude::external_model_catalog(request.bin, request.ultracode)
+                    .await;
+            let empty = models.is_empty();
+            let mut cache = state.harnesses.lock().await;
+            let Some((at, payload)) = cache.as_mut() else {
+                continue;
+            };
+            if *at != cached_at {
+                continue;
+            }
+            let auth = state.claude.auth_snapshot();
+            if auth.state != local::harness::HarnessAuthState::Ready
+                || auth.runtime_rejected
+                || auth.method != request.method
+                || auth.provider != request.provider
+            {
+                continue;
+            }
+            let Some(claude) = payload["harnesses"].as_array_mut().and_then(|all| {
+                all.iter_mut()
+                    .find(|h| h["id"] == "claude-code" && h["agentReady"] == true)
+            }) else {
+                continue;
+            };
+            claude["models"] = json!(models);
+            if empty {
+                claude["agentNote"] = json!("Could not load Claude Code models. Re-check this harness or update Claude Code; the CLI default model is still available.");
+            } else if let Some(object) = claude.as_object_mut() {
+                object.remove("agentNote");
+            }
+            drop(cache);
+            state.chat.emit_event("harness.catalog", json!({}));
+        }
+    });
+}
+
 fn claude_entry(payload: &Value) -> Option<&Value> {
     payload
         .get("harnesses")?
@@ -6292,10 +6389,14 @@ async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
         // it. Last writer wins — concurrent refreshes may duplicate a sweep.
         state.claude.reserve_auth_check();
         let harnesses = local::harness::detect_harnesses().await;
+        let catalog = claude_catalog_request(&harnesses);
         let (mut payload, announce) = finish_harnesses_payload(state, harnesses, false).await;
         let cached_at = std::time::Instant::now();
         spawn_cursor_account_details(state, &mut payload, cached_at);
         *state.harnesses.lock().await = Some((cached_at, payload.clone()));
+        if let Some(catalog) = catalog {
+            enqueue_claude_catalog(state.clone(), cached_at, catalog);
+        }
         emit_auth_announcement(state, announce);
         return payload;
     }
@@ -6369,14 +6470,8 @@ async fn seed_harnesses_locked(
 /// the ClaudeHost's tracked auth state, then overlay and report. Shared by
 /// the snapshot and full passes, and by the background catalog fill.
 ///
-/// `provisional` marks a snapshot answer. A snapshot's claude auth is still
-/// worth adopting when it is conclusive — a signed-out credential store, or
-/// the fallback probe's live verdict — so shared state does not lag what the
-/// file evidence already proved. Two outcomes are not conclusive: `Unknown`
-/// is a guess, and an oauth-method `Ready` skipped the minimum-version gate
-/// (the snapshot never ran `--version`), so both wait for the fill. The
-/// first-install telemetry capture is likewise restricted to completed
-/// answers.
+/// `provisional` marks a discovery-only snapshot. Only full passes publish
+/// live Claude auth observations and first-install telemetry.
 /// The returned `Option` is a claimed auth announcement: the caller emits it
 /// only after committing the payload, so a discarded pass never sends the
 /// dashboard on a `refresh=1` sweep for results nobody will see.
@@ -6575,6 +6670,7 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
             ordered.sort_by_key(|(index, _)| *index);
             let harnesses: Vec<local::harness::HarnessInfo> =
                 ordered.into_iter().map(|(_, info)| info).collect();
+            let catalog = claude_catalog_request(&harnesses);
             // Finish before touching the cache: the Claude re-probe inside can
             // cost a child process, and holding the lock across it stalls every
             // reader the snapshot was meant to unblock.
@@ -6593,6 +6689,7 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
                         .count()
                 })
                 .unwrap_or(0);
+            let mut catalog_at = None;
             let committed = {
                 let mut cache = state.harnesses.lock().await;
                 // A refresh or retry that landed in between owns the cache. No
@@ -6612,6 +6709,7 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
                     let filled_at = std::time::Instant::now();
                     spawn_cursor_account_details(&state, &mut payload, filled_at);
                     *cache = Some((filled_at, payload));
+                    catalog_at = Some(filled_at);
                     true
                 }
             };
@@ -6637,6 +6735,9 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
             });
             if !committed {
                 return;
+            }
+            if let (Some(catalog), Some(at)) = (catalog, catalog_at) {
+                enqueue_claude_catalog(state.clone(), at, catalog);
             }
             state.chat.emit_event("harness.catalog", json!({}));
             emit_auth_announcement(&state, announce);

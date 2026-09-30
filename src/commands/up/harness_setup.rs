@@ -670,6 +670,7 @@ mod tests {
             login_eligible: false,
             auth_check_failed: false,
             auth_observation: None,
+            claude_ultracode: false,
             account: None,
             org: None,
             plan: None,
