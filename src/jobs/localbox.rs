@@ -16,6 +16,8 @@ use crate::error::{anyhow, Result};
 use crate::jobs::ssh::{sh_quote, JobState};
 
 #[cfg(windows)]
+mod python;
+#[cfg(windows)]
 mod windows;
 
 /// The run's working directory: `<data dir>/local-runs/<run id>`.
@@ -49,7 +51,7 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     let env = super::default_python_env(&spec.env);
     #[cfg(not(windows))]
     // Keep the launcher identifiable until background children exit, including after a payload cd.
-    let completion = format!(
+    let prelude = format!(
         "trap 'exit 143' TERM\ntrap {} EXIT\n",
         sh_quote(&format!(
             "code=$?; wait; echo \"$code\" > {}; exit \"$code\"",
@@ -57,13 +59,14 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
         ))
     );
     #[cfg(windows)]
-    let completion = "";
+    let prelude = python::prelude(&dir)
+        .map_err(|e| anyhow!("Could not set up Python for {}: {}", dir.display(), e))?;
     #[cfg(not(windows))]
     let record_exit = "";
     #[cfg(windows)]
     let record_exit = "echo $? > exit_code\n";
     let run_sh = format!(
-        "#!/usr/bin/env bash\ncd {dir} || exit 97\n(\n{completion}{script}\n) > log 2>&1\n{record_exit}",
+        "#!/usr/bin/env bash\ncd {dir} || exit 97\n(\n{prelude}{script}\n) > log 2>&1\n{record_exit}",
         dir = sh_quote(&crate::local::bash::bash_path(&dir)),
         script = spec.script,
     );
