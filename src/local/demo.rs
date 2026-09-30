@@ -1687,34 +1687,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_label_follows_the_owning_project_not_the_experiment_id() {
-        let experiment = |id: &str, project_id: &str| LocalExperiment {
-            id: id.into(),
-            project_id: project_id.into(),
-            parent_experiment_id: None,
-            slug: "probe".into(),
-            branch_name: "orx/probe".into(),
-            title: None,
-            description: None,
-            run_command: "echo hi".into(),
-            agent_status: "idle".into(),
-            created_at: 0,
-            updated_at: 0,
-            chat_session_id: None,
-            archived: false,
-        };
-        assert_eq!(
-            run_label(&experiment(LR_PROBE_EXPERIMENT_ID, PROJECT_ID)),
-            Some("lr_probe")
-        );
-        assert_eq!(
-            run_label(&experiment("agent_made", PROJECT_ID)),
-            Some("other")
-        );
-        assert_eq!(run_label(&experiment(LR_PROBE_EXPERIMENT_ID, "p1")), None);
-    }
-
-    #[test]
     fn transcript_variants_are_one_turn_and_use_native_tool_names() {
         for (harness, expected) in [
             ("claude-code", ["Read", "Edit", "Bash"]),

@@ -35,6 +35,13 @@ impl LocalPlane {
             .ok_or_else(|| anyhow!("internal: local plane missing its experiment row"))
     }
 
+    /// Demo analytics label for a launch, keyed on the experiment's owning project.
+    pub(super) fn demo_run_label(&self) -> Option<&'static str> {
+        self.experiment
+            .as_ref()
+            .and_then(crate::local::demo::run_label)
+    }
+
     pub async fn list_runs(&self) -> Result<RunListing> {
         let store = &self.store;
         let project_id = &self.id;
@@ -315,11 +322,7 @@ impl LocalPlane {
             crate::telemetry::capture_experiment_started("run", true, Some(target));
             // A launch out of the bundled demo is the clearest signal the demo
             // converted into real work, so it is counted separately.
-            if let Some(label) = self
-                .experiment
-                .as_ref()
-                .and_then(crate::local::demo::run_label)
-            {
+            if let Some(label) = self.demo_run_label() {
                 crate::telemetry::capture_demo_experiment_started("run", label);
                 crate::telemetry::capture_first_action("demo", "run_experiment");
             }
