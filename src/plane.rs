@@ -213,6 +213,7 @@ mod tests {
         assert_eq!(label("demo_nanochat_lr_probe_v1"), Some("lr_probe"));
         assert_eq!(label("agent_made"), Some("other"));
         assert_eq!(label("user_exp"), None);
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
