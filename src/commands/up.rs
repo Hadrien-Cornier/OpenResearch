@@ -33,6 +33,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 
 use crate::commands::remote_host::{DashboardLock, DashboardLockMode, HostDescriptor, RemoteAuth};
+use crate::commands::up_remote::RemoteSessionStatus;
 use crate::error::{anyhow, Result};
 use crate::local;
 use crate::local::chat::ChatHost;
@@ -4384,7 +4385,12 @@ fn spawn_restart_when_idle(state: AppState) {
             DRAINING.store(true, Ordering::SeqCst);
             if ACTIVE.load(Ordering::SeqCst) == 0
                 && !state.data_dir_move_in_progress.load(Ordering::SeqCst)
-                && state.remote_sessions.list().await.is_empty()
+                && state
+                    .remote_sessions
+                    .list()
+                    .await
+                    .iter()
+                    .all(|session| session.status == RemoteSessionStatus::Disconnected)
                 && state.chat.stop_admitting_if_idle().await
             {
                 state.restart.notify_one();
