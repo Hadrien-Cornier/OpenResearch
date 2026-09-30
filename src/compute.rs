@@ -1067,6 +1067,7 @@ mod tests {
 
     #[test]
     fn forwarded_launches_never_take_origin_from_the_server_environment() {
+        let _env = crate::telemetry::tests::EnvGuard::new(&["CODEX_THREAD_ID"]);
         std::env::set_var("CODEX_THREAD_ID", "backend-launcher-thread");
         let mut args = tinker_args();
         assert!(args.launching_agent_origin().is_some());

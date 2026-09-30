@@ -1841,17 +1841,17 @@ struct V1Capture {
 }
 
 /// One watcher poll of a held execution's background subagents and the runs their results natively
-/// woke (no app turn) in each session they report to: whether any of the tree is still busy
-/// (native `GET /session/status` lists only non-idle sessions), and whether a result is undelivered.
+/// woke (no app turn) in each session they report to: the tree's busy sessions (native
+/// `GET /session/status` lists only non-idle sessions), and whether a result is undelivered.
 async fn poll_v1_background(
     sink: &impl UsageSink,
     endpoint: &AgentEndpoint,
     started_at: i64,
     roots: &mut Vec<(String, Option<String>)>,
-    parents: &HashSet<String>,
+    parents: &mut HashSet<String>,
     owned: &mut HashSet<String>,
     delivered: &mut HashSet<String>,
-) -> Result<(bool, bool)> {
+) -> Result<(Vec<String>, bool)> {
     let (http, base) = (&endpoint.client, endpoint.base_url.as_str());
     // Read before capturing, so a session idle here has persisted everything captured below.
     let busy: Value = http
@@ -1861,7 +1861,7 @@ async fn poll_v1_background(
         .error_for_status()?
         .json()
         .await?;
-    for parent in parents {
+    for parent in parents.iter() {
         let (seen, spawned) =
             capture_v1_continuations(sink, http, base, parent, owned, started_at).await?;
         delivered.extend(seen);
@@ -1878,11 +1878,16 @@ async fn poll_v1_background(
     if let Some(error) = captured.failed {
         return Err(error);
     }
+    // Background subagents the tree spawned since the turn: await their results where they report.
+    owned.extend(captured.background.into_iter().map(|(child, _)| child));
+    parents.extend(captured.parents);
     let active = captured
         .visited
         .iter()
-        .chain(parents)
-        .any(|session| busy.get(session).is_some());
+        .chain(parents.iter())
+        .filter(|session| busy.get(session.as_str()).is_some())
+        .cloned()
+        .collect();
     Ok((active, owned.iter().any(|child| !delivered.contains(child))))
 }
 
@@ -2300,10 +2305,12 @@ async fn settle_watch<F: std::future::Future<Output = Result<Option<AgentEndpoin
         loop {
             if let Some(endpoint) = endpoint(missing.take()).await? {
                 match watch.poll(sink, &endpoint).await {
-                    Ok((false, undelivered)) if !undelivered || waited >= DELIVERY_GRACE_POLLS => {
+                    Ok((busy, undelivered))
+                        if busy.is_empty() && (!undelivered || waited >= DELIVERY_GRACE_POLLS) =>
+                    {
                         return Ok(())
                     }
-                    Ok((busy, _)) => waited += usize::from(!busy),
+                    Ok((busy, _)) => waited += usize::from(busy.is_empty()),
                     Err(error) => {
                         missing = not_found_session(&error);
                         eprintln!("orx up: retrying OpenCode background capture: {error}");
@@ -2412,12 +2419,12 @@ impl Watch {
         })
     }
 
-    /// Whether any of the tree is still busy, and whether a subagent's result is undelivered.
+    /// The tree's busy sessions, and whether a subagent's result is undelivered.
     async fn poll(
         &mut self,
         sink: &impl UsageSink,
         endpoint: &AgentEndpoint,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<(Vec<String>, bool)> {
         match &mut self.tree {
             WatchTree::V1 {
                 roots,
@@ -2524,9 +2531,9 @@ async fn start_background_server(
     Ok(Ok(agent.endpoint_for(session_id).await))
 }
 
-/// A deleted session's server is about to stop: read each background tree it holds one last time,
-/// then release it. A failed read stays held for the watcher, which closes it once the deletion
-/// commits or resumes if the deletion fails.
+/// A deleted session's server is about to stop: stop each background tree it holds natively, read
+/// it to the end, then release it. One that did not stop, or a failed read, stays held for the
+/// watcher, which closes it once the deletion commits or resumes if the deletion fails.
 pub(crate) async fn reconcile_retiring(endpoint: &AgentEndpoint, session_id: &str) {
     let scopes =
         match crate::store::Store::open().and_then(|store| store.native_scopes(BACKGROUND_SCOPE)) {
@@ -2543,16 +2550,37 @@ pub(crate) async fn reconcile_retiring(endpoint: &AgentEndpoint, session_id: &st
             execution_id,
             session_id: session_id.to_string(),
         };
-        let read = tokio::time::timeout(Duration::from_secs(10), async {
-            Watch::from_scope(&scope)?.poll(&sink, endpoint).await
+        let stopped = tokio::time::timeout(Duration::from_secs(10), async {
+            stop_tree(&mut Watch::from_scope(&scope)?, &sink, endpoint).await
         })
         .await
         .unwrap_or_else(|_| Err(anyhow!("timed out")));
-        match read {
-            Ok(_) => sink.release(),
+        match stopped {
+            Ok(true) => sink.release(),
+            Ok(false) => eprintln!("orx up: OpenCode background subagents did not stop; kept held"),
             Err(error) => eprintln!("orx up: OpenCode background usage stays held: {error}"),
         }
     }
+}
+
+/// Aborts the tree's busy sessions (a stopped subagent's result can wake its parent, so repeat)
+/// until a read finds none busy, which settles every run it captured. `false`: still running.
+async fn stop_tree(
+    watch: &mut Watch,
+    sink: &impl UsageSink,
+    endpoint: &AgentEndpoint,
+) -> Result<bool> {
+    for _ in 0..20 {
+        let (busy, _) = watch.poll(sink, endpoint).await?;
+        if busy.is_empty() {
+            return Ok(true);
+        }
+        for session in &busy {
+            crate::local::opencode::abort_session(endpoint, session).await?;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
 }
 
 /// What an interrupt needs to capture the turn it aborts, held by the session's `AgentHost`.
@@ -4546,6 +4574,155 @@ opencode/unknown
                 reason: crate::store::Missing::ChildModelUnknown
             }
         );
+    }
+
+    /// A background grandchild the watched subagent spawns only after the first poll is tracked:
+    /// the watch waits for its result, which natively wakes the subagent, and captures that run.
+    #[tokio::test]
+    async fn v1_watch_tracks_a_background_grandchild_spawned_after_the_first_poll() {
+        use axum::{extract::Path, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = polls.clone();
+        let step = |session: &str, message: &str, part: &str| {
+            vec![
+                json!({"id":format!("{part}_s"),"messageID":message,"sessionID":session,"type":"step-start"}),
+                json!({"id":format!("{part}_f"),"messageID":message,"sessionID":session,"type":"step-finish",
+                    "tokens":{"input":3,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}),
+            ]
+        };
+        let assistant = move |session: &str,
+                              id: &str,
+                              parent: &str,
+                              created: i64,
+                              parts: Vec<Value>| {
+            json!({"info":{"id":id,"sessionID":session,"role":"assistant","parentID":parent,
+                "modelID":format!("{session}-model"),"providerID":"p","time":{"created":created}},"parts":parts})
+        };
+        let delivery = |session: &str, id: &str, child: &str, created: i64| {
+            json!({"info":{"id":id,"sessionID":session,"role":"user","time":{"created":created}},
+                "parts":[{"id":format!("{id}_p"),"type":"text","synthetic":true,
+                    "text":format!("<task id=\"{child}\" state=\"completed\">")}]})
+        };
+        let app = Router::new()
+            .route(
+                "/session/status",
+                get(move || {
+                    let poll = polls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        Json(match poll {
+                            0 => json!({"ses_b":{"type":"busy"}}),
+                            1 => json!({"ses_x":{"type":"busy"}}),
+                            _ => json!({}),
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/session/{id}/message",
+                get(move |Path(id): Path<String>| {
+                    let polls = seen.load(Ordering::SeqCst);
+                    let listing = match id.as_str() {
+                        "ses_main" => json!([delivery("ses_main", "msg_delivery_b", "ses_b", 25)]),
+                        "ses_x" => json!([assistant("ses_x", "msg_x", "msg_px", 20, step("ses_x", "msg_x", "prt_x"))]),
+                        _ => {
+                            let mut parts = step("ses_b", "msg_b", "prt_b");
+                            // Spawned only from the second poll on; its result arrives after idle.
+                            if polls >= 2 {
+                                parts.push(json!({"id":"prt_task_x","messageID":"msg_b","sessionID":"ses_b","type":"tool","tool":"task",
+                                    "state":{"status":"completed","input":{},"output":"","metadata":{"sessionId":"ses_x","background":true}}}));
+                            }
+                            let mut listing = vec![assistant("ses_b", "msg_b", "msg_pb", 11, parts)];
+                            if polls >= 4 {
+                                listing.push(delivery("ses_b", "msg_delivery_x", "ses_x", 30));
+                                listing.push(assistant("ses_b", "msg_b_woken", "msg_delivery_x", 31, step("ses_b", "msg_b_woken", "prt_bw")));
+                            }
+                            json!(listing)
+                        }
+                    };
+                    async move { Json(listing) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let recorded = Recorded::default();
+        settle_watch(
+            &recorded,
+            &json!({"native":"ses_main","startedAt":10,"roots":[["ses_b","prt_task_b"]]}),
+            live(v1_endpoint(&base)),
+        )
+        .await;
+        server.abort();
+        let samples = recorded.samples.into_inner().unwrap();
+        assert!(samples["prt_x_s"].2, "the grandchild's step");
+        assert!(samples["prt_bw_s"].2, "the run its result woke");
+    }
+
+    /// Deletion stops the held tree natively before the server dies; the execution is released
+    /// only once a read finds nothing still running.
+    #[tokio::test]
+    async fn retirement_releases_only_a_tree_that_stopped() {
+        use axum::{extract::Path, routing::get, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let honored = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let aborts = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (honor, stop, log) = (honored.clone(), stopped.clone(), aborts.clone());
+        let app = Router::new()
+            .route(
+                "/session/status",
+                get(move || {
+                    let busy = !stopped.load(Ordering::SeqCst);
+                    async move {
+                        Json(if busy { json!({"ses_bg":{"type":"busy"}}) } else { json!({}) })
+                    }
+                }),
+            )
+            .route(
+                "/session/{id}/abort",
+                post(move |Path(id): Path<String>| {
+                    log.lock().unwrap().push(id);
+                    if honor.load(Ordering::SeqCst) {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    async { Json(json!(true)) }
+                }),
+            )
+            .route(
+                "/session/{id}/message",
+                get(|Path(id): Path<String>| async move {
+                    Json(if id == "ses_bg" {
+                        json!([{"info":{"id":"msg_bg","sessionID":"ses_bg","role":"assistant","modelID":"bg-model",
+                            "providerID":"p","time":{"created":10}},"parts":[
+                            {"id":"prt_start","messageID":"msg_bg","sessionID":"ses_bg","type":"step-start"}]}])
+                    } else {
+                        json!([])
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = v1_endpoint(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let scope = json!({"native":"ses_main","startedAt":10,"roots":[["ses_bg","prt_task"]]});
+
+        // A read succeeds, but the subagent keeps running: not complete, so it stays held.
+        let recorded = Recorded::default();
+        let mut watch = Watch::from_scope(&scope).unwrap();
+        assert!(!stop_tree(&mut watch, &recorded, &endpoint).await.unwrap());
+        assert!(aborts.lock().unwrap().iter().all(|id| id == "ses_bg"));
+
+        honored.store(true, Ordering::SeqCst);
+        aborts.lock().unwrap().clear();
+        let mut watch = Watch::from_scope(&scope).unwrap();
+        assert!(stop_tree(&mut watch, &recorded, &endpoint).await.unwrap());
+        server.abort();
+        assert_eq!(*aborts.lock().unwrap(), ["ses_bg"]);
+        assert!(recorded
+            .samples
+            .into_inner()
+            .unwrap()
+            .contains_key("prt_start"));
     }
 
     pub(super) fn live(

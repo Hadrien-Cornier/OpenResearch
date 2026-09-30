@@ -498,6 +498,22 @@ async fn spawn_agent(
     })
 }
 
+/// Natively stops one OpenCode session's run.
+pub(crate) async fn abort_session(endpoint: &AgentEndpoint, native_id: &str) -> Result<()> {
+    let path = match endpoint.protocol {
+        Protocol::V1 => format!("/session/{native_id}/abort"),
+        Protocol::V2 => format!("/api/session/{native_id}/interrupt"),
+    };
+    endpoint
+        .client
+        .post(format!("{}{path}", endpoint.base_url))
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
 /// Why a summarize attempt did or did not compact in place.
 pub(crate) enum SummarizeOutcome {
     Compacted,
@@ -616,17 +632,7 @@ impl AgentHost {
         let Some(endpoint) = self.endpoint_for(session_id).await else {
             return Ok(());
         };
-        let path = match endpoint.protocol {
-            Protocol::V1 => format!("/session/{native_id}/abort"),
-            Protocol::V2 => format!("/api/session/{native_id}/interrupt"),
-        };
-        endpoint
-            .client
-            .post(format!("{}{path}", endpoint.base_url))
-            .json(&json!({}))
-            .send()
-            .await?
-            .error_for_status()?;
+        abort_session(&endpoint, native_id).await?;
         if let Some(turn) = turn {
             crate::local::harness::opencode::capture_interrupted(&endpoint, &turn).await;
         }

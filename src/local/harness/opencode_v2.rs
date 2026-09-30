@@ -526,7 +526,7 @@ pub(super) async fn capture_interrupted(
 }
 
 /// One watcher poll of a held execution's background subagents and the runs their results natively
-/// woke (no app turn) in each session they report to: whether any of the tree is still active, and
+/// woke (no app turn) in each session they report to: the tree's still-active sessions, and
 /// whether a subagent's result is still undelivered.
 pub(super) async fn poll_background(
     sink: &dyn UsageSink,
@@ -535,7 +535,7 @@ pub(super) async fn poll_background(
     roots: &[(String, String)],
     started_at: i64,
     captured: &mut Captured,
-) -> Result<(bool, bool)> {
+) -> Result<(Vec<String>, bool)> {
     // Read before capturing, so a session idle here has settled everything captured below.
     let active = get(endpoint, "/api/session/active").await?;
     for (child, parent) in roots {
@@ -556,7 +556,9 @@ pub(super) async fn poll_background(
     let busy = parents
         .iter()
         .chain(captured.descendants.keys())
-        .any(|session| active["data"].get(session).is_some());
+        .filter(|session| active["data"].get(session.as_str()).is_some())
+        .cloned()
+        .collect();
     let undelivered = captured
         .background
         .iter()

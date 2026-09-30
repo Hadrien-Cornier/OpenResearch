@@ -72,14 +72,13 @@ fn inspect_connection(connection: &Connection) -> Result<DatabaseState> {
                 "Unsupported or incomplete OpenCode V2 database schema"
             ));
         }
-        let schema_applied: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM migration WHERE id = '20260910120000_clear_v1_session_permission' AND time_completed IS NOT NULL)",
-            [],
-            |row| row.get(0),
-        )?;
-        if !schema_applied {
-            return Ok(DatabaseState::V2Pending);
-        }
+        let applied = |id: &str| -> Result<bool> {
+            Ok(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM migration WHERE id = ?1 AND time_completed IS NOT NULL)",
+                [id],
+                |row| row.get(0),
+            )?)
+        };
         let has_legacy = has_columns(connection, "session", &["id"])?;
         let marker: Option<String> = connection
             .query_row(
@@ -88,6 +87,18 @@ fn inspect_connection(connection: &Connection) -> Result<DatabaseState> {
                 |row| row.get(0),
             )
             .optional()?;
+        if !applied("20260910120000_clear_v1_session_permission")? {
+            // Beta 19271 ends at this migration and bootstraps fresh stores atomically;
+            // its V1 upgrade is unverified, so any legacy history stays pending.
+            let fresh_beta = !has_legacy
+                && marker.is_none()
+                && applied("20260823191254_nullable_workspace_binding")?;
+            return Ok(if fresh_beta {
+                DatabaseState::V2Ready
+            } else {
+                DatabaseState::V2Pending
+            });
+        }
         return match marker {
             None if !has_legacy => Ok(DatabaseState::V2Ready),
             None => Ok(DatabaseState::V2Pending),
@@ -375,6 +386,10 @@ impl DatabaseLease {
         self.migration
     }
 
+    pub fn state(&self) -> DatabaseState {
+        self.state
+    }
+
     pub fn prepare_migration(&self) -> Result<Option<PathBuf>> {
         if !self.migration {
             return Ok(None);
@@ -631,6 +646,11 @@ mod tests {
         CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER);
         INSERT INTO migration VALUES ('20260910120000_clear_v1_session_permission', 1);";
+    const BETA: &str = "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT);
+        CREATE TABLE session_message (id TEXT, session_id TEXT, data TEXT);
+        CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER);
+        INSERT INTO migration VALUES ('20260823191254_nullable_workspace_binding', 1);";
 
     struct Fixture(crate::local::git::TemporaryDirectory);
 
@@ -830,6 +850,47 @@ mod tests {
         assert!(DatabaseLease::acquire(&path, 1).is_err());
         let unsupported = DatabaseLease::acquire(&path, 2).err().unwrap();
         assert!(unsupported.downcast_ref::<DatabaseBusy>().is_none());
+    }
+
+    #[test]
+    fn official_beta_is_ready_only_for_fresh_v2_stores() {
+        let fixture = Fixture::new();
+        let path = fixture.path();
+        let mut lease = DatabaseLease::acquire(&path, 2).unwrap();
+        assert!(lease
+            .prepare_with_sessions(BTreeSet::new())
+            .unwrap()
+            .is_none());
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(BETA).unwrap();
+        connection.execute_batch("DELETE FROM migration;").unwrap();
+        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Pending);
+        assert!(lease.complete_migration().is_err());
+        connection
+            .execute_batch(
+                "INSERT INTO migration VALUES ('20260823191254_nullable_workspace_binding', 1);",
+            )
+            .unwrap();
+        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Ready);
+        lease.complete_migration().unwrap();
+        assert!(!lease.requires_migration());
+        drop(lease);
+        assert!(DatabaseLease::acquire(&path, 1).is_err());
+
+        connection
+            .execute_batch(
+                "INSERT INTO kv VALUES ('migration.v1-v2', '{\"phase\":\"completed\"}');",
+            )
+            .unwrap();
+        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Pending);
+        connection
+            .execute_batch("DELETE FROM kv; CREATE TABLE session (id TEXT PRIMARY KEY);")
+            .unwrap();
+        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Pending);
+        connection
+            .execute_batch("INSERT INTO kv VALUES ('migration.v1-v2', '{\"phase\":\"completed\"}'); INSERT INTO migration VALUES ('20260910120000_clear_v1_session_permission', 1);")
+            .unwrap();
+        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Ready);
     }
 
     #[test]
