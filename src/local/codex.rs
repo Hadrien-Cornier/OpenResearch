@@ -875,10 +875,9 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let process_group_id = child.id().unwrap();
         let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut line = String::new();
-        BufReader::new(stdout).read_line(&mut line).await.unwrap();
-        let native_pid: i32 = line.trim().parse().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut native_pid = String::new();
+        stdout.read_line(&mut native_pid).await.unwrap();
         let client = CodexClient {
             child: Mutex::new(child),
             process_group_id,
@@ -900,16 +899,18 @@ mod tests {
         client.terminate().await;
         assert!(client.terminated.load(Ordering::Acquire));
 
-        let mut live = true;
-        for _ in 0..50 {
-            // SAFETY: signal 0 only probes whether the pid exists.
-            live = unsafe { libc::kill(native_pid, 0) == 0 };
-            if !live {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(!live, "native child {native_pid} survived terminate");
+        // EOF, not a pid probe: a killed child can linger as an unreaped zombie.
+        let mut rest = Vec::new();
+        let eof = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut rest),
+        )
+        .await;
+        assert!(
+            eof.is_ok(),
+            "native child {} survived terminate",
+            native_pid.trim()
+        );
     }
 
     #[test]
