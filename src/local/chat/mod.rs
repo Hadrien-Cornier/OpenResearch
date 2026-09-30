@@ -7048,9 +7048,13 @@ impl TurnCtx {
             for part in parts {
                 if part.get("type").and_then(Value::as_str) == Some("tool_use") {
                     if let Some(call_id) = part.get("id").and_then(Value::as_str) {
-                        if let Err(error) = Store::open()
-                            .and_then(|store| store.record_native_invocation(call_id, &identity))
-                        {
+                        if let Err(error) = Store::open().and_then(|store| {
+                            store.record_native_invocation(
+                                call_id,
+                                &identity,
+                                Some(&self.session_id),
+                            )
+                        }) {
                             eprintln!("orx up: could not capture native tool identity: {error}");
                         }
                     }

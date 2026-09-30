@@ -210,6 +210,7 @@ pub async fn run_antigravity() -> Result<()> {
             crate::store::Store::open()?.record_native_invocation(
                 &crate::local::harness::antigravity::invocation_sample_id(conversation, step),
                 &identity,
+                Some(conversation),
             )?;
             println!("{{}}");
             return Ok(());

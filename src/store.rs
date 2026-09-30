@@ -665,6 +665,8 @@ impl Store {
         // Best-effort migrations for pre-existing dbs; re-runs fail with
         // "duplicate column name", which is exactly the no-op we want.
         for ddl in [
+            "ALTER TABLE native_invocation_identities ADD COLUMN session_id TEXT",
+            "ALTER TABLE native_invocation_identities ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_usage_samples ADD COLUMN complete INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE runs ADD COLUMN commit_sha TEXT",
             "ALTER TABLE runs ADD COLUMN result_markdown TEXT",
@@ -706,6 +708,11 @@ impl Store {
         ] {
             let _ = conn.execute(ddl, []);
         }
+        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
+        conn.execute(
+            "DELETE FROM native_invocation_identities WHERE session_id IS NULL AND created_at < ?1",
+            [now_ms() - 7 * 24 * 60 * 60 * 1000],
+        )?;
         // Legacy tool failures cannot identify the missing dependency, so require one fresh check.
         conn.execute(
             "DELETE FROM ssh_host_tests
