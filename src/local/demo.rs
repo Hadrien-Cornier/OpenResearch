@@ -275,6 +275,16 @@ pub(crate) fn installed_origin(owner: &str, repo: &str) -> Option<PathBuf> {
     origin.exists().then_some(origin)
 }
 
+/// Analytics label for launching `experiment`, or `None` outside the demo project.
+pub(crate) fn run_label(experiment: &LocalExperiment) -> Option<&'static str> {
+    (experiment.project_id == PROJECT_ID).then_some(match experiment.id.as_str() {
+        EXPERIMENT_ID => "cpu_end_to_end",
+        LR_PROBE_EXPERIMENT_ID => "lr_probe",
+        VOCAB_PROBE_EXPERIMENT_ID => "vocab_probe",
+        _ => "other",
+    })
+}
+
 pub(crate) fn turn_context(project_id: &str) -> Option<&'static str> {
     (project_id == PROJECT_ID).then_some(TURN_CONTEXT)
 }
@@ -1675,6 +1685,34 @@ fn set_executable(path: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_label_follows_the_owning_project_not_the_experiment_id() {
+        let experiment = |id: &str, project_id: &str| LocalExperiment {
+            id: id.into(),
+            project_id: project_id.into(),
+            parent_experiment_id: None,
+            slug: "probe".into(),
+            branch_name: "orx/probe".into(),
+            title: None,
+            description: None,
+            run_command: "echo hi".into(),
+            agent_status: "idle".into(),
+            created_at: 0,
+            updated_at: 0,
+            chat_session_id: None,
+            archived: false,
+        };
+        assert_eq!(
+            run_label(&experiment(LR_PROBE_EXPERIMENT_ID, PROJECT_ID)),
+            Some("lr_probe")
+        );
+        assert_eq!(
+            run_label(&experiment("agent_made", PROJECT_ID)),
+            Some("other")
+        );
+        assert_eq!(run_label(&experiment(LR_PROBE_EXPERIMENT_ID, "p1")), None);
+    }
 
     #[test]
     fn transcript_variants_are_one_turn_and_use_native_tool_names() {

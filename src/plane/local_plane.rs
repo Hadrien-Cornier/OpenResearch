@@ -315,8 +315,12 @@ impl LocalPlane {
             crate::telemetry::capture_experiment_started("run", true, Some(target));
             // A launch out of the bundled demo is the clearest signal the demo
             // converted into real work, so it is counted separately.
-            if self.id == crate::local::demo::PROJECT_ID {
-                crate::telemetry::capture_demo_experiment_started("run", target);
+            if let Some(label) = self
+                .experiment
+                .as_ref()
+                .and_then(crate::local::demo::run_label)
+            {
+                crate::telemetry::capture_demo_experiment_started("run", label);
                 crate::telemetry::capture_first_action("demo", "run_experiment");
             }
         }
