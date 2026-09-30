@@ -61,35 +61,610 @@ use crate::local::opencode::ensure_playbook;
 use crate::local::shell_env::find_on_path;
 use crate::store::{Store, StoredChatMessage};
 
+/// App-server notifications are camelCase; rollout `token_count` records are snake_case.
 fn codex_native_usage(usage: &Value) -> crate::store::TokenUsage {
-    let field = |name| usage.get(name).and_then(Value::as_u64);
+    let field = |camel, snake| {
+        usage
+            .get(camel)
+            .or_else(|| usage.get(snake))
+            .and_then(Value::as_u64)
+    };
     crate::store::TokenUsage {
-        input_tokens: field("inputTokens"),
-        output_tokens: field("outputTokens"),
-        cache_read_tokens: field("cachedInputTokens"),
-        cache_write_tokens: field("cacheWriteInputTokens"),
-        reasoning_tokens: field("reasoningOutputTokens"),
+        input_tokens: field("inputTokens", "input_tokens"),
+        output_tokens: field("outputTokens", "output_tokens"),
+        cache_read_tokens: field("cachedInputTokens", "cached_input_tokens"),
+        cache_write_tokens: field("cacheWriteInputTokens", "cache_write_input_tokens"),
+        reasoning_tokens: field("reasoningOutputTokens", "reasoning_output_tokens"),
     }
 }
 
-fn capture_token_notification(ctx: &mut TurnCtx, method: &str, params: &Value) {
-    if method != "thread/tokenUsage/updated" {
-        return;
+/// Per app-server connection: the model each (thread, turn) actually ran — notifications carry
+/// none (`Thread.model` is configuration), so read the thread's own rollout `turn_context`, and
+/// `model/rerouted` overrides — plus sub-agent usage, which can outlive the turn that spawned it.
+#[derive(Default)]
+pub(crate) struct NativeTurnModels {
+    /// Thread id → (rollout path, bytes already scanned, model of its latest `turn_context`).
+    rollouts: HashMap<String, (PathBuf, u64, Option<String>)>,
+    models: HashMap<(String, String), String>,
+    /// (thread, turn, model) identities already recorded.
+    identities: std::collections::HashSet<(String, String, String)>,
+    invokers: std::collections::HashSet<String>,
+    /// Sub-agent thread → its native cumulative token total already accounted on this connection.
+    children: HashMap<String, u64>,
+    /// Thread → turn id of its latest `turn_context`.
+    turns: HashMap<String, String>,
+    /// Session and usage execution of the turn currently reading this connection.
+    session: String,
+    current: Option<String>,
+    /// Sub-agent thread → the execution its requests belong to: the turn that last drove it.
+    owners: HashMap<String, String>,
+    /// Sub-agent thread → its latest native turn is still running (rollout task start/complete).
+    running: HashMap<String, bool>,
+    /// Executions held open for sub-agents that outlived their turn.
+    held: std::collections::HashSet<String>,
+    watching: bool,
+    /// Sub-agent requests read from rollouts, with their owning execution, not yet recorded.
+    pending: Vec<(Option<String>, NativeRecord)>,
+    /// Records owned by an execution other than the current turn's.
+    foreign: Vec<(String, NativeRecord)>,
+}
+
+#[derive(Debug, PartialEq)]
+enum NativeRecord {
+    Identity(String, crate::store::Attribution),
+    Cumulative {
+        thread: String,
+        turn: String,
+        attribution: crate::store::Attribution,
+        total: crate::store::TokenUsage,
+        last: crate::store::TokenUsage,
+    },
+    /// One complete native request.
+    Request(String, crate::store::Attribution, crate::store::TokenUsage),
+    Invoker(String, String),
+}
+
+impl NativeRecord {
+    /// Store directly: the owning execution outlived its `TurnCtx`.
+    fn record(self, store: &Store, execution: &str, session: &str) -> Result<()> {
+        match self {
+            Self::Identity(sample_id, attribution) => store.record_attributed_sample(
+                execution,
+                &sample_id,
+                "codex",
+                &attribution,
+                &crate::store::TokenUsage::default(),
+                false,
+            ),
+            Self::Cumulative {
+                thread,
+                turn,
+                attribution,
+                total,
+                last,
+            } => store.record_cumulative_usage(
+                execution,
+                "codex",
+                &thread,
+                &turn,
+                &attribution,
+                &total,
+                &last,
+            ),
+            Self::Request(sample_id, attribution, usage) => store.record_attributed_sample(
+                execution,
+                &sample_id,
+                "codex",
+                &attribution,
+                &usage,
+                true,
+            ),
+            Self::Invoker(part_id, model) => store.record_native_invocation(
+                &part_id,
+                &crate::store::InvocationIdentity {
+                    harness: "codex".into(),
+                    model,
+                    provider: None,
+                },
+                Some(session),
+            ),
+        }
     }
-    let (Some(thread), Some(turn), Some(total), Some(last)) = (
-        params.get("threadId").and_then(Value::as_str),
-        params.get("turnId").and_then(Value::as_str),
-        params.pointer("/tokenUsage/total"),
-        params.pointer("/tokenUsage/last"),
-    ) else {
-        return;
+
+    fn apply(self, ctx: &TurnCtx) {
+        match self {
+            Self::Identity(sample_id, attribution) => ctx.record_attributed_usage(
+                &sample_id,
+                attribution,
+                crate::store::TokenUsage::default(),
+                false,
+            ),
+            Self::Cumulative {
+                thread,
+                turn,
+                attribution,
+                total,
+                last,
+            } => ctx.record_attributed_cumulative_usage(&thread, &turn, attribution, total, last),
+            Self::Request(sample_id, attribution, usage) => {
+                ctx.record_attributed_usage(&sample_id, attribution, usage, true)
+            }
+            Self::Invoker(part_id, model) => ctx.record_tool_invoker(&part_id, &model, None),
+        }
+    }
+}
+
+/// A sub-agent request this connection has not accounted yet, keyed by the thread's native
+/// cumulative total so its live notification and its rollout line are the same sample.
+fn child_request(
+    children: &mut HashMap<String, u64>,
+    thread: &str,
+    turn: &str,
+    model: Option<&str>,
+    total: &crate::store::TokenUsage,
+    last: crate::store::TokenUsage,
+) -> Option<NativeRecord> {
+    let seen = children.get_mut(thread)?;
+    let total = total.total().filter(|total| total > seen)?;
+    *seen = total;
+    Some(NativeRecord::Request(
+        format!("{thread}:{turn}:request:{total}"),
+        crate::store::Attribution::native(
+            "codex",
+            model,
+            None,
+            crate::store::Missing::ChildModelUnknown,
+        ),
+        last,
+    ))
+}
+
+impl NativeTurnModels {
+    async fn model(&mut self, thread: &str, turn: &str) -> Option<String> {
+        let key = (thread.to_string(), turn.to_string());
+        if !self.models.contains_key(&key) {
+            self.scan(thread).await;
+        }
+        self.models.get(&key).cloned()
+    }
+
+    /// Read the complete lines `thread`'s rollout gained since the last scan.
+    async fn scan(&mut self, thread: &str) {
+        if !self.rollouts.contains_key(thread) {
+            if let Ok(Some(session)) = codex_native_session(thread).await {
+                self.rollouts
+                    .insert(thread.to_string(), (session.path, 0, None));
+            }
+        }
+        let Some((path, offset, current)) = self.rollouts.get_mut(thread) else {
+            return;
+        };
+        for record in read_rollout(path, offset) {
+            match record {
+                RolloutRecord::Context { turn, model } => {
+                    if let Some(turn) = turn {
+                        if let Some(model) = &model {
+                            self.models
+                                .insert((thread.to_string(), turn.clone()), model.clone());
+                        }
+                        self.turns.insert(thread.to_string(), turn);
+                    }
+                    *current = model;
+                }
+                RolloutRecord::Tokens { total, last } => {
+                    let turn = self.turns.get(thread).cloned().unwrap_or_default();
+                    if let Some(record) = child_request(
+                        &mut self.children,
+                        thread,
+                        &turn,
+                        current.as_deref(),
+                        &total,
+                        last,
+                    ) {
+                        self.pending
+                            .push((self.owners.get(thread).cloned(), record));
+                    }
+                }
+                RolloutRecord::Task { running } => {
+                    self.running.insert(thread.to_string(), running);
+                }
+            }
+        }
+    }
+
+    /// Records owned by the current turn; the rest wait in `foreign` for their own execution.
+    fn take_pending(&mut self) -> Vec<NativeRecord> {
+        let mut records = Vec::new();
+        for (owner, record) in std::mem::take(&mut self.pending) {
+            match owner {
+                Some(owner) if Some(&owner) != self.current.as_ref() => {
+                    self.foreign.push((owner, record))
+                }
+                _ => records.push(record),
+            }
+        }
+        records
+    }
+
+    /// Sub-agent requests not seen live: a child keeps running after its spawning turn settles,
+    /// and notifications between turns reach no listener, so its rollout is the record.
+    async fn catch_up_children(&mut self) -> Vec<NativeRecord> {
+        let children: Vec<String> = self.children.keys().cloned().collect();
+        for thread in children {
+            self.scan(&thread).await;
+        }
+        self.take_pending()
+    }
+
+    /// Usage, identity and tool-invoker records for one parent or sub-agent notification.
+    async fn capture(
+        &mut self,
+        method: &str,
+        params: &Value,
+        sub_agent: bool,
+    ) -> Vec<NativeRecord> {
+        // A collab item that drives a sub-agent makes this turn own its requests from here on.
+        if matches!(method, "item/started" | "item/completed") {
+            if let Some(item) = params.get("item").filter(|item| item_arms_thread(item)) {
+                let parent = params.get("threadId").and_then(Value::as_str);
+                for thread in subagent_thread_ids(item) {
+                    if Some(thread.as_str()) != parent {
+                        self.adopt(&thread).await;
+                    }
+                }
+            }
+        }
+        let mut records = self.notification_records(method, params, sub_agent).await;
+        records.extend(self.take_pending());
+        records
+    }
+
+    /// The current turn now drives `thread`: requests it already made stay with their owner.
+    async fn adopt(&mut self, thread: &str) {
+        let Some(current) = self.current.clone() else {
+            return;
+        };
+        if self.owners.get(thread) == Some(&current) {
+            return;
+        }
+        if self.children.contains_key(thread) {
+            self.scan(thread).await;
+        }
+        self.owners.insert(thread.to_string(), current);
+        self.persist_owner(thread);
+    }
+
+    /// Durable, so recovery after a crash reads the rest of this child's rollout into its owner.
+    fn persist_owner(&self, thread: &str) {
+        let (Some(owner), Some(start), Some((path, _, _))) = (
+            self.owners.get(thread),
+            self.children.get(thread),
+            self.rollouts.get(thread),
+        ) else {
+            return;
+        };
+        if let Err(error) = Store::open().and_then(|store| {
+            store.set_native_scope(
+                owner,
+                &format!("codex-child:{thread}"),
+                &serde_json::json!({ "path": path, "start": start }),
+            )
+        }) {
+            eprintln!("orx up: could not persist codex sub-agent ownership: {error}");
+        }
+    }
+
+    /// Start of a turn on this connection: its records belong to `ctx`'s execution.
+    async fn begin_turn(&mut self, ctx: &TurnCtx, thread: &str, turn: &str) {
+        // Late sub-agent records of earlier turns go to their owners before this turn begins.
+        let late = self.drain_late().await;
+        record_late(&self.session, late);
+        self.session = ctx.session_id.clone();
+        self.current = ctx.usage_execution_id().map(str::to_string);
+        let Some(current) = self.current.clone() else {
+            return;
+        };
+        self.scan(thread).await;
+        if let Some((path, _, _)) = self.rollouts.get(thread) {
+            if let Err(error) = Store::open().and_then(|store| {
+                store.set_native_scope(
+                    &current,
+                    &format!("codex-turn:{thread}:{turn}"),
+                    &serde_json::json!({ "path": path, "thread": thread, "turn": turn }),
+                )
+            }) {
+                eprintln!("orx up: could not persist codex turn rollout: {error}");
+            }
+        }
+    }
+
+    /// Every unrecorded sub-agent record with its owner (the last turn's, if it had none).
+    async fn drain_late(&mut self) -> Vec<(String, NativeRecord)> {
+        let children: Vec<String> = self.children.keys().cloned().collect();
+        for thread in children {
+            self.scan(&thread).await;
+        }
+        let current = self.current.clone();
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .filter_map(|(owner, record)| {
+                owner
+                    .or_else(|| current.clone())
+                    .map(|owner| (owner, record))
+            })
+            .chain(std::mem::take(&mut self.foreign))
+            .collect()
+    }
+
+    /// End of a turn: holds its execution open while sub-agents it owns are still live.
+    fn hold_live(&mut self, ctx: &TurnCtx, live: &[String]) {
+        let Some(current) = self.current.clone() else {
+            return;
+        };
+        let owned: Vec<&String> = live
+            .iter()
+            .filter(|thread| self.owners.get(*thread) == Some(&current))
+            .collect();
+        if owned.is_empty() {
+            return;
+        }
+        for thread in owned {
+            self.running.insert(thread.clone(), true);
+        }
+        ctx.hold_usage();
+        self.held.insert(current);
+    }
+
+    /// Held executions with no owned sub-agent still running natively (or all, when retiring).
+    fn releasable(&mut self, all: bool) -> Vec<String> {
+        let done: Vec<String> = self
+            .held
+            .iter()
+            .filter(|execution| {
+                all || !self.owners.iter().any(|(thread, owner)| {
+                    owner == *execution && self.running.get(thread) == Some(&true)
+                })
+            })
+            .cloned()
+            .collect();
+        for execution in &done {
+            self.held.remove(execution);
+        }
+        done
+    }
+
+    async fn notification_records(
+        &mut self,
+        method: &str,
+        params: &Value,
+        sub_agent: bool,
+    ) -> Vec<NativeRecord> {
+        let mut records = Vec::new();
+        let (Some(thread), Some(turn)) = (
+            params.get("threadId").and_then(Value::as_str),
+            event_turn_id(params),
+        ) else {
+            return records;
+        };
+        let key = (thread.to_string(), turn.to_string());
+        let model = match method {
+            // Names the model that runs next, not proof it ran: its identity waits for output.
+            "model/rerouted" => {
+                if let Some(model) = params.get("toModel").and_then(Value::as_str) {
+                    self.models.insert(key, model.to_string());
+                }
+                return records;
+            }
+            // Model output (never the echoed input), so the turn ran and its `turn_context` is on disk.
+            "item/started" | "item/completed"
+                if params
+                    .get("item")
+                    .and_then(|item| item_to_part(item, false, &[]))
+                    .is_some() =>
+            {
+                self.model(thread, turn).await
+            }
+            "item/commandExecution/outputDelta" | "thread/tokenUsage/updated" => {
+                self.model(thread, turn).await
+            }
+            _ => return records,
+        };
+        let missing = if sub_agent {
+            crate::store::Missing::ChildModelUnknown
+        } else {
+            crate::store::Missing::IdentityNotReported
+        };
+        let attribution =
+            crate::store::Attribution::native("codex", model.as_deref(), None, missing);
+        // One marker per model that produced output in the turn, so a rerouted-away model stays.
+        if let Some(model) = &model {
+            if self
+                .identities
+                .insert((thread.to_string(), turn.to_string(), model.clone()))
+            {
+                records.push(NativeRecord::Identity(
+                    format!("{thread}:{turn}:identity:{model}"),
+                    attribution.clone(),
+                ));
+            }
+        }
+        if method == "thread/tokenUsage/updated" {
+            if let (Some(total), Some(last)) = (
+                params.pointer("/tokenUsage/total"),
+                params.pointer("/tokenUsage/last"),
+            ) {
+                let (total, last) = (codex_native_usage(total), codex_native_usage(last));
+                if sub_agent {
+                    // The first request seen live is where this connection's share of the child begins.
+                    let before = total
+                        .total()
+                        .zip(last.total())
+                        .map_or(0, |(total, last)| total.saturating_sub(last));
+                    if !self.children.contains_key(thread) {
+                        self.children.insert(thread.to_string(), before);
+                        if let Some(current) = self.current.clone() {
+                            self.owners.entry(thread.to_string()).or_insert(current);
+                        }
+                        self.persist_owner(thread);
+                    }
+                    records.extend(child_request(
+                        &mut self.children,
+                        thread,
+                        turn,
+                        model.as_deref(),
+                        &total,
+                        last,
+                    ));
+                } else {
+                    records.push(NativeRecord::Cumulative {
+                        thread: thread.to_string(),
+                        turn: turn.to_string(),
+                        attribution,
+                        total,
+                        last,
+                    });
+                }
+            }
+            return records;
+        }
+        let (Some(model), Some(item_id)) = (
+            model,
+            params
+                .pointer("/item/id")
+                .or_else(|| params.get("itemId"))
+                .and_then(Value::as_str),
+        ) else {
+            return records;
+        };
+        let tool = method == "item/commandExecution/outputDelta"
+            || params
+                .get("item")
+                .and_then(|item| item_to_part(item, false, &[]))
+                .is_some_and(|part| part.kind == "tool");
+        let part_id = if sub_agent {
+            namespaced_part_id(thread, item_id)
+        } else {
+            item_id.to_string()
+        };
+        if tool && self.invokers.insert(part_id.clone()) {
+            records.push(NativeRecord::Invoker(part_id, model));
+        }
+        records
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RolloutRecord {
+    /// Written before a turn's first request: the model that turn runs.
+    Context {
+        turn: Option<String>,
+        model: Option<String>,
+    },
+    /// After each request: the thread's cumulative `total` and that request's own `last`.
+    Tokens {
+        total: crate::store::TokenUsage,
+        last: crate::store::TokenUsage,
+    },
+    /// `task_started` / `task_complete`: whether the thread's latest turn is still running.
+    Task { running: bool },
+}
+
+/// `turn_context` and `token_count` records from complete rollout lines appended since `offset`.
+// ponytail: the first scan of a thread reads its whole rollout; seek from the tail if huge threads stall turns.
+fn read_rollout(path: &Path, offset: &mut u64) -> Vec<RolloutRecord> {
+    use std::io::{Read, Seek};
+    let mut bytes = Vec::new();
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
     };
-    ctx.record_cumulative_usage(
-        thread,
-        turn,
-        codex_native_usage(total),
-        codex_native_usage(last),
-    );
+    if file.seek(std::io::SeekFrom::Start(*offset)).is_err()
+        || file.read_to_end(&mut bytes).is_err()
+    {
+        return Vec::new();
+    }
+    let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        return Vec::new();
+    };
+    *offset += end as u64 + 1;
+    String::from_utf8_lossy(&bytes[..end])
+        .lines()
+        .filter(|line| {
+            [
+                "\"turn_context\"",
+                "\"token_count\"",
+                "\"task_started\"",
+                "\"task_complete\"",
+            ]
+            .iter()
+            .any(|kind| line.contains(kind))
+        })
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|record| {
+            let payload = record.get("payload")?;
+            let text = |key| payload.get(key).and_then(Value::as_str).map(str::to_string);
+            match (
+                record.get("type").and_then(Value::as_str)?,
+                payload.get("type").and_then(Value::as_str),
+            ) {
+                ("turn_context", _) => Some(RolloutRecord::Context {
+                    turn: text("turn_id"),
+                    model: text("model"),
+                }),
+                ("event_msg", Some("token_count")) => Some(RolloutRecord::Tokens {
+                    total: codex_native_usage(payload.pointer("/info/total_token_usage")?),
+                    last: codex_native_usage(payload.pointer("/info/last_token_usage")?),
+                }),
+                ("event_msg", Some("task_started")) => Some(RolloutRecord::Task { running: true }),
+                ("event_msg", Some("task_complete")) => {
+                    Some(RolloutRecord::Task { running: false })
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// `codex exec --json` reports no model and no per-request usage, so read this run's own rollout
+/// lines: each request's usage under the `turn_context` model before it.
+fn exec_rollout_records(
+    thread: &str,
+    path: &Path,
+    mut offset: u64,
+    tools: &[String],
+) -> Vec<NativeRecord> {
+    let mut records = Vec::new();
+    let mut current: (String, Option<String>) = Default::default();
+    let mut models = std::collections::HashSet::new();
+    for record in read_rollout(path, &mut offset) {
+        match record {
+            RolloutRecord::Context { turn, model } => {
+                models.insert(model.clone());
+                current = (turn.unwrap_or_default(), model);
+            }
+            RolloutRecord::Tokens { total, last } => records.push(NativeRecord::Cumulative {
+                thread: thread.to_string(),
+                turn: current.0.clone(),
+                attribution: crate::store::Attribution::native(
+                    "codex",
+                    current.1.as_deref(),
+                    None,
+                    crate::store::Missing::IdentityNotReported,
+                ),
+                total,
+                last,
+            }),
+            RolloutRecord::Task { .. } => {}
+        }
+    }
+    // Exec items carry no request id, so only a run on one model names their invoker.
+    if let [Some(model)] = Vec::from_iter(models).as_slice() {
+        records.extend(
+            tools
+                .iter()
+                .map(|id| NativeRecord::Invoker(id.clone(), model.clone())),
+        );
+    }
+    records
 }
 
 /// Codex usage occupying the context window: `input_tokens + output_tokens`
@@ -1461,6 +2036,7 @@ fn apply_item(ctx: &mut TurnCtx, item: &Value, completed: bool) {
 async fn reconcile_turn_items(
     ctx: &mut TurnCtx,
     client: &CodexClient,
+    models: &mut NativeTurnModels,
     thread_id: &str,
     turn_id: Option<&str>,
 ) {
@@ -1468,7 +2044,288 @@ async fn reconcile_turn_items(
     let Some(items) = client.read_turn_items(thread_id, turn_id).await else {
         return;
     };
+    for record in recovered_item_records(models, thread_id, turn_id, &items).await {
+        record.apply(ctx);
+    }
     reconcile_items(&mut ctx.assistant.parts, &items);
+}
+
+/// Items the live stream lost exist only in `thread/read`; they ran on this thread's turn.
+async fn recovered_item_records(
+    models: &mut NativeTurnModels,
+    thread_id: &str,
+    turn_id: &str,
+    items: &[Value],
+) -> Vec<NativeRecord> {
+    let mut records = Vec::new();
+    for item in items {
+        let params = serde_json::json!({ "threadId": thread_id, "turnId": turn_id, "item": item });
+        records.extend(models.capture("item/completed", &params, false).await);
+    }
+    records
+}
+
+/// Records whose execution outlived its `TurnCtx`: late sub-agent requests, cancel capture.
+fn record_late(session: &str, records: Vec<(String, NativeRecord)>) {
+    if records.is_empty() {
+        return;
+    }
+    let store = match Store::open() {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("orx up: could not record late codex usage: {error}");
+            return;
+        }
+    };
+    for (execution, record) in records {
+        if let Err(error) = record.record(&store, &execution, session) {
+            eprintln!("orx up: could not record late codex usage: {error}");
+        }
+    }
+}
+
+const LATE_USAGE_POLL: Duration = Duration::from_secs(15);
+
+/// Reads sub-agent rollouts into their owning executions and releases the ones whose sub-agents
+/// finished natively (every one when `retiring`). True while holds remain.
+pub(crate) async fn flush_late_usage(client: &CodexClient, retiring: bool) -> bool {
+    let mut models = client.native.lock().await;
+    let late = models.drain_late().await;
+    record_late(&models.session, late);
+    for execution in models.releasable(retiring) {
+        if let Err(error) =
+            Store::open().and_then(|store| store.release_usage_execution(&execution))
+        {
+            eprintln!("orx up: could not close held codex usage: {error}");
+        }
+    }
+    models.watching = !models.held.is_empty();
+    models.watching
+}
+
+/// Between turns no listener hears sub-agent notifications, so poll their rollouts while held.
+fn watch_late_usage(client: &Arc<CodexClient>, models: &mut NativeTurnModels) {
+    if models.held.is_empty() || models.watching {
+        return;
+    }
+    models.watching = true;
+    let client = Arc::downgrade(client);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LATE_USAGE_POLL).await;
+            let Some(client) = client.upgrade() else {
+                return;
+            };
+            if !flush_late_usage(&client, false).await {
+                return;
+            }
+        }
+    });
+}
+
+/// Turn-end native accounting: late sub-agent records, then a hold while owned sub-agents run.
+async fn settle_turn_usage(
+    ctx: &TurnCtx,
+    client: &Arc<CodexClient>,
+    models: &mut NativeTurnModels,
+    live: Vec<String>,
+) {
+    for record in models.catch_up_children().await {
+        record.apply(ctx);
+    }
+    record_late(&models.session, std::mem::take(&mut models.foreign));
+    models.hold_live(ctx, &live);
+    for execution in models.releasable(false) {
+        if let Err(error) =
+            Store::open().and_then(|store| store.release_usage_execution(&execution))
+        {
+            eprintln!("orx up: could not close held codex usage: {error}");
+        }
+    }
+    watch_late_usage(client, models);
+}
+
+/// A turn's own requests from its thread rollout after the last total already recorded: the
+/// cancel window (task aborted, child still spending) and a turn a crashed process never closed.
+fn record_turn_rollout(
+    store: &Store,
+    execution: &str,
+    thread: &str,
+    turn: &str,
+    path: &Path,
+) -> Result<()> {
+    let seen = store
+        .cumulative_usage_total(execution, thread)?
+        .and_then(|usage| usage.total())
+        .unwrap_or(0);
+    let (mut in_turn, mut model) = (false, None);
+    for record in read_rollout(path, &mut 0) {
+        match record {
+            RolloutRecord::Context {
+                turn: context,
+                model: context_model,
+            } => {
+                in_turn = context.as_deref() == Some(turn);
+                if in_turn {
+                    model = context_model;
+                }
+            }
+            RolloutRecord::Tokens { total, last }
+                if in_turn && total.total().is_some_and(|total| total > seen) =>
+            {
+                store.record_cumulative_usage(
+                    execution,
+                    "codex",
+                    thread,
+                    turn,
+                    &crate::store::Attribution::native(
+                        "codex",
+                        model.as_deref(),
+                        None,
+                        crate::store::Missing::IdentityNotReported,
+                    ),
+                    &total,
+                    &last,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A sub-agent's requests with native totals in `(start, end]`, the range its owner drove.
+fn record_child_rollout(
+    store: &Store,
+    execution: &str,
+    thread: &str,
+    path: &Path,
+    start: u64,
+    end: Option<u64>,
+) -> Result<()> {
+    let (mut turn, mut model) = (String::new(), None);
+    for record in read_rollout(path, &mut 0) {
+        match record {
+            RolloutRecord::Context {
+                turn: context,
+                model: context_model,
+            } => {
+                turn = context.unwrap_or_default();
+                model = context_model;
+            }
+            RolloutRecord::Tokens {
+                total: totals,
+                last,
+            } => {
+                let Some(total) = totals.total() else {
+                    continue;
+                };
+                if total > start && end.is_none_or(|end| total <= end) {
+                    store.record_attributed_sample(
+                        execution,
+                        &format!("{thread}:{turn}:request:{total}"),
+                        "codex",
+                        &crate::store::Attribution::native(
+                            "codex",
+                            model.as_deref(),
+                            None,
+                            crate::store::Missing::ChildModelUnknown,
+                        ),
+                        &last,
+                        true,
+                    )?;
+                }
+            }
+            RolloutRecord::Task { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// At startup, before recovery closes them: finish reading the rollouts of executions a dead
+/// process left open — each interrupted turn's own requests and its sub-agents' later requests.
+pub(crate) fn recover_orphaned_usage(store: &Store) -> Result<()> {
+    let scopes = store.native_scopes("codex-")?;
+    for (execution, prefix, state, orphaned) in &scopes {
+        if !orphaned {
+            continue;
+        }
+        let Some(path) = state.get("path").and_then(Value::as_str).map(Path::new) else {
+            continue;
+        };
+        if let (Some(thread), Some(turn)) = (
+            state.get("thread").and_then(Value::as_str),
+            state.get("turn").and_then(Value::as_str),
+        ) {
+            record_turn_rollout(store, execution, thread, turn, path)?;
+        } else if let (Some(thread), Some(start)) = (
+            prefix.strip_prefix("codex-child:"),
+            state.get("start").and_then(Value::as_u64),
+        ) {
+            // The next owner's start ends this owner's share.
+            let end = scopes
+                .iter()
+                .filter(|(_, other, _, _)| other == prefix)
+                .filter_map(|(_, _, other, _)| other.get("start").and_then(Value::as_u64))
+                .filter(|other| *other > start)
+                .min();
+            record_child_rollout(store, execution, thread, path, start, end)?;
+        }
+    }
+    Ok(())
+}
+
+/// Cancel capture, called with the turn's still-open execution after the child is killed: the
+/// turn's requests the aborted stream missed, then its sub-agents' rollouts; holds end here.
+pub(crate) async fn record_interrupted_usage(
+    client: &CodexClient,
+    execution: Option<&str>,
+    thread: &str,
+    turn: &str,
+) {
+    if let Some(execution) = execution {
+        let path = client
+            .native
+            .lock()
+            .await
+            .rollouts
+            .get(thread)
+            .map(|(path, _, _)| path.clone());
+        if let Some(path) = path {
+            if let Err(error) = Store::open()
+                .and_then(|store| record_turn_rollout(&store, execution, thread, turn, &path))
+            {
+                eprintln!("orx up: could not capture interrupted codex usage: {error}");
+            }
+        }
+    }
+    flush_late_usage(client, true).await;
+}
+
+/// The cancel path has no turn context left, so recovered tool items' invokers are stored directly.
+pub(crate) async fn record_interrupted_invokers(
+    client: &CodexClient,
+    session_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    items: &[Value],
+) {
+    let mut models = client.native.lock().await;
+    for record in recovered_item_records(&mut models, thread_id, turn_id, items).await {
+        let NativeRecord::Invoker(part_id, model) = record else {
+            continue;
+        };
+        let identity = crate::store::InvocationIdentity {
+            harness: "codex".into(),
+            model,
+            provider: None,
+        };
+        if let Err(error) = Store::open()
+            .and_then(|store| store.record_native_invocation(&part_id, &identity, Some(session_id)))
+        {
+            eprintln!("orx up: could not capture native tool identity: {error}");
+        }
+    }
 }
 
 pub(crate) fn reconcile_interrupted_items(
@@ -1887,16 +2744,20 @@ fn subagent_spawn_part(id: &str, item: &Value, completed: bool) -> WirePart {
 /// the plan card when applicable, and flush. Kept in one place so the three
 /// exit paths (plain completion, drain completion, drain quiet-settle) can't
 /// drift.
+#[allow(clippy::too_many_arguments)]
 async fn finish_completed_turn(
     ctx: &mut TurnCtx,
-    client: &CodexClient,
+    client: &Arc<CodexClient>,
+    models: &mut NativeTurnModels,
     thread_id: &str,
     turn_id: Option<&str>,
     plan_card_wanted: bool,
     open_requests: &mut HashMap<String, (Value, ServerReqKind)>,
+    live_children: Vec<String>,
 ) {
     sweep_open_requests(ctx, client, open_requests).await;
-    reconcile_turn_items(ctx, client, thread_id, turn_id).await;
+    reconcile_turn_items(ctx, client, models, thread_id, turn_id).await;
+    settle_turn_usage(ctx, client, models, live_children).await;
     // A sub-agent whose `turn/completed` never arrived before the turn ended
     // would otherwise spin forever.
     settle_running_subagents(&mut ctx.assistant.parts);
@@ -1922,6 +2783,15 @@ fn turn_phase_quiet(parent_done: bool) -> Duration {
     } else {
         TURN_WATCHDOG
     }
+}
+
+/// Sub-agent threads still running when the parent turn ends.
+fn live_threads(sub_threads: &HashMap<String, SubThread>) -> Vec<String> {
+    sub_threads
+        .iter()
+        .filter(|(_, sub)| sub.live)
+        .map(|(thread, _)| thread.clone())
+        .collect()
 }
 
 /// A sub-agent thread discovered this parent turn, keyed by its threadId.
@@ -2579,6 +3449,11 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     // still live — we're draining their tails before ending the turn (bounded
     // by DRAIN_QUIET_SETTLE, see the deadline below).
     let mut parent_done = false;
+    let native = client.clone();
+    let mut models = native.native.lock().await;
+    if let Some(turn) = turn_id.as_deref() {
+        models.begin_turn(ctx, &thread_id, turn).await;
+    }
 
     loop {
         // Watchdog (see TURN_WATCHDOG for the false-positive trade-off).
@@ -2630,10 +3505,12 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 finish_completed_turn(
                     ctx,
                     &client,
+                    &mut models,
                     &thread_id,
                     turn_id.as_deref(),
                     plan_turn,
                     &mut open_requests,
+                    live_threads(&sub_threads),
                 )
                 .await;
                 return Ok(());
@@ -2646,12 +3523,14 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 );
                 ctx.mark_terminal_failure("codex_watchdog", message.clone());
                 ctx.push_error(message);
+                settle_turn_usage(ctx, &client, &mut models, live_threads(&sub_threads)).await;
                 settle_running_subagents(&mut ctx.assistant.parts);
                 let _ = ctx.flush();
                 return Ok(());
             }
         };
         let Some(event) = event else {
+            settle_turn_usage(ctx, &client, &mut models, Vec::new()).await;
             settle_running_subagents(&mut ctx.assistant.parts);
             let _ = ctx.flush();
             return Err(anyhow!("codex app-server event stream ended mid-turn"));
@@ -2661,7 +3540,9 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 match classify_event_thread(turn_id.as_deref(), &sub_threads, &params) {
                     EventScope::Stale => continue,
                     EventScope::SubAgent(tid) => {
-                        capture_token_notification(ctx, &method, &params);
+                        for record in models.capture(&method, &params, true).await {
+                            record.apply(ctx);
+                        }
                         route_sub_event(ctx, &mut sub_threads, &thread_id, &tid, &method, &params);
                         ctx.maybe_flush();
                         // Draining after the parent's turn/completed: the last
@@ -2670,10 +3551,12 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                             finish_completed_turn(
                                 ctx,
                                 &client,
+                                &mut models,
                                 &thread_id,
                                 turn_id.as_deref(),
                                 plan_turn,
                                 &mut open_requests,
+                                Vec::new(),
                             )
                             .await;
                             return Ok(());
@@ -2682,7 +3565,9 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                     }
                     EventScope::Parent => {}
                 }
-                capture_token_notification(ctx, &method, &params);
+                for record in models.capture(&method, &params, false).await {
+                    record.apply(ctx);
+                }
                 // Codex settled a request itself (its approval deadline hit,
                 // or our reply raced this notification): the card must not
                 // stay live. Part ids are a pure function of the request id;
@@ -2720,16 +3605,20 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                         finish_completed_turn(
                             ctx,
                             &client,
+                            &mut models,
                             &thread_id,
                             turn_id.as_deref(),
                             plan_turn && !interrupted,
                             &mut open_requests,
+                            live_threads(&sub_threads),
                         )
                         .await;
                         return Ok(());
                     }
                     Some(TurnEnd::Failed(message)) => {
                         sweep_open_requests(ctx, &client, &mut open_requests).await;
+                        settle_turn_usage(ctx, &client, &mut models, live_threads(&sub_threads))
+                            .await;
                         settle_running_subagents(&mut ctx.assistant.parts);
                         // A terminal `error` notification may have already
                         // pushed this exact message — don't render it twice.
@@ -2811,6 +3700,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 }
             }
             TurnEvent::Closed => {
+                settle_turn_usage(ctx, &client, &mut models, Vec::new()).await;
                 // Child gone: nothing to settle with codex; just close cards and
                 // stamp any orphaned running sub-agent rows so they don't spin
                 // forever in the persisted transcript.
@@ -3514,6 +4404,11 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
         Some(id) => codex_native_session(id).await?,
         None => None,
     };
+    // Where this run's rollout lines begin: a resumed thread's rollout already holds earlier turns.
+    let launch_rollout = native_session.as_ref().map(|session| {
+        let len = std::fs::metadata(&session.path).map_or(0, |meta| meta.len());
+        (ctx.native_session_id.clone(), session.path.clone(), len)
+    });
     let native_store = native_session
         .as_ref()
         .map(|session| session.store)
@@ -3674,6 +4569,8 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     // Streaming deltas accumulate into one part until the complete event.
     let mut open_text: Option<String> = None;
     let mut open_reasoning: Option<String> = None;
+    let scope = format!("{}:{}:", ctx.assistant.id, ctx.attempt_count_for_usage());
+    let mut tools = Vec::new();
 
     while let Some(line) = lines.next_line().await? {
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
@@ -3730,6 +4627,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| next_id("cmd"));
+                tools.push(id.clone());
                 let command = msg.get("command").map(command_string).unwrap_or_default();
                 ctx.upsert_part(WirePart {
                     id,
@@ -3778,7 +4676,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             // Item-style shape: everything interesting is under "item".
             "item.completed" | "item.updated" => {
                 if let Some(item) = msg.get("item") {
-                    handle_item(ctx, item, &mut next_id);
+                    tools.extend(handle_item(ctx, item, &scope, &mut next_id));
                 }
             }
             "token_count" => {
@@ -3797,6 +4695,22 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     }
 
     let status = child.wait().await?;
+    // A failed run still spent whatever its rollout recorded.
+    if let Some(thread) = ctx.native_session_id.clone() {
+        let rollout = match launch_rollout {
+            Some((id, path, len)) if id.as_deref() == Some(thread.as_str()) => Some((path, len)),
+            _ => codex_native_session(&thread)
+                .await
+                .ok()
+                .flatten()
+                .map(|session| (session.path, 0)),
+        };
+        if let Some((path, offset)) = rollout {
+            for record in exec_rollout_records(&thread, &path, offset, &tools) {
+                record.apply(ctx);
+            }
+        }
+    }
     if !status.success() {
         return Err(anyhow!(
             "codex exited with {status}; see {}",
@@ -3832,19 +4746,30 @@ fn legacy_exec_text(text: &str, plan_mode: bool) -> String {
     )
 }
 
-fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -> String) {
-    let id = item
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| next_id("item"));
+/// Returns the part id of a tool item. Exec item ids (`item_N`) restart every run, so `scope`
+/// keeps them from colliding with an earlier turn's invoker record.
+fn handle_item(
+    ctx: &mut TurnCtx,
+    item: &Value,
+    scope: &str,
+    next_id: &mut impl FnMut(&str) -> String,
+) -> Option<String> {
+    let id = format!(
+        "{scope}{}",
+        item.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| next_id("item"))
+    );
     match item.get("type").and_then(Value::as_str) {
         Some("agent_message") => {
             ctx.upsert_part(agent_text_part(id, item));
+            None
         }
         Some("reasoning") => {
             let text = item.get("text").and_then(Value::as_str).unwrap_or("");
             ctx.upsert_part(WirePart::reasoning(id, text));
+            None
         }
         Some("command_execution") => {
             let failed = item.get("status").and_then(Value::as_str) == Some("failed")
@@ -3853,7 +4778,7 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
                     .and_then(Value::as_i64)
                     .is_some_and(|c| c != 0);
             ctx.upsert_part(WirePart {
-                id,
+                id: id.clone(),
                 kind: "tool".into(),
                 text: None,
                 tool: Some("bash".into()),
@@ -3874,8 +4799,9 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
                 phase: None,
                 children: Vec::new(),
             });
+            Some(id)
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -5852,5 +6778,692 @@ requires_openai_auth = false
             )),
             None
         );
+    }
+
+    /// Tokens, identity and tool invokers resolve from each thread's own rollout `turn_context`
+    /// (codex 0.156 shapes), per turn, with reroutes and children kept distinct.
+    #[tokio::test]
+    async fn native_turn_models_attribute_threads_turns_and_tools() {
+        use crate::store::{Attribution, Missing};
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("orx-codex-rollout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let context = |turn: &str, model: &str| {
+            json!({"timestamp":"2026-09-30T18:32:34.742Z","type":"turn_context","payload":{
+                "turn_id":turn,"root_turn_id":turn,"cwd":"/ws","approval_policy":"on-request",
+                "model":model,"effort":"medium","summary":"none"}})
+            .to_string()
+        };
+        let parent = dir.join("rollout-parent.jsonl");
+        let child = dir.join("rollout-child.jsonl");
+        std::fs::write(&parent, format!("{}\n", context("turn-1", "gpt-6-astra"))).unwrap();
+        std::fs::write(&child, format!("{}\n", context("child-turn", "gpt-6-mini"))).unwrap();
+        let mut models = NativeTurnModels::default();
+        for (thread, path) in [
+            ("parent", &parent),
+            ("child", &child),
+            ("orphan", &dir.join("none")),
+        ] {
+            models
+                .rollouts
+                .insert(thread.into(), (path.clone(), 0, None));
+        }
+        let usage: Vec<Value> =
+            serde_json::from_str(include_str!("fixtures/codex-token-usage.json")).unwrap();
+        let tokens = |thread: &str, turn: &str, usage: &Value| json!({"threadId":thread,"turnId":turn,"tokenUsage":usage});
+        let command = |thread: &str, turn: &str| {
+            json!({"threadId":thread,"turnId":turn,"startedAtMs":1,"item":{"type":"commandExecution",
+                "id":"call_1","command":"orx exp run","cwd":"/ws","status":"inProgress","commandActions":[]}})
+        };
+        let exact = |model: &str| Attribution::Exact {
+            model: model.into(),
+            provider: None,
+        };
+        let cumulative = |thread: &str, turn: &str, attribution: Attribution, usage: &Value| {
+            NativeRecord::Cumulative {
+                thread: thread.into(),
+                turn: turn.into(),
+                attribution,
+                total: codex_native_usage(&usage["total"]),
+                last: codex_native_usage(&usage["last"]),
+            }
+        };
+
+        // Deltas never trigger a lookup or a record.
+        let delta = json!({"threadId":"parent","turnId":"turn-1","itemId":"msg_1","delta":"hi"});
+        assert!(models
+            .capture("item/agentMessage/delta", &delta, false)
+            .await
+            .is_empty());
+        // The token notification has no model; the turn's rollout context supplies it once.
+        assert_eq!(
+            models
+                .capture(
+                    "thread/tokenUsage/updated",
+                    &tokens("parent", "turn-1", &usage[0]),
+                    false
+                )
+                .await,
+            vec![
+                NativeRecord::Identity(
+                    "parent:turn-1:identity:gpt-6-astra".into(),
+                    exact("gpt-6-astra")
+                ),
+                cumulative("parent", "turn-1", exact("gpt-6-astra"), &usage[0]),
+            ]
+        );
+        assert_eq!(
+            models
+                .capture(
+                    "thread/tokenUsage/updated",
+                    &tokens("parent", "turn-1", &usage[1]),
+                    false
+                )
+                .await,
+            vec![cumulative(
+                "parent",
+                "turn-1",
+                exact("gpt-6-astra"),
+                &usage[1]
+            )]
+        );
+        // The launching command's invoker is captured once, at item/started.
+        assert_eq!(
+            models
+                .capture("item/started", &command("parent", "turn-1"), false)
+                .await,
+            vec![NativeRecord::Invoker("call_1".into(), "gpt-6-astra".into())]
+        );
+        assert!(models
+            .capture("item/completed", &command("parent", "turn-1"), false)
+            .await
+            .is_empty());
+        // A child's identical item id is its own part with its own model, never the parent's.
+        assert_eq!(
+            models
+                .capture("item/started", &command("child", "child-turn"), true)
+                .await,
+            vec![
+                NativeRecord::Identity(
+                    "child:child-turn:identity:gpt-6-mini".into(),
+                    exact("gpt-6-mini")
+                ),
+                NativeRecord::Invoker("child:call_1".into(), "gpt-6-mini".into()),
+            ]
+        );
+        // An unidentified child reports its own requests as unknown and records no invoker.
+        let orphan = Attribution::Unresolved {
+            reason: Missing::ChildModelUnknown,
+        };
+        let total = codex_native_usage(&usage[0]["total"]).total().unwrap();
+        assert_eq!(
+            models
+                .capture(
+                    "thread/tokenUsage/updated",
+                    &tokens("orphan", "o-turn", &usage[0]),
+                    true
+                )
+                .await,
+            vec![NativeRecord::Request(
+                format!("orphan:o-turn:request:{total}"),
+                orphan,
+                codex_native_usage(&usage[0]["last"])
+            )]
+        );
+        assert!(models
+            .capture("item/started", &command("orphan", "o-turn"), true)
+            .await
+            .is_empty());
+
+        // A per-turn switch: a half-written context line is not read until complete.
+        let line = context("turn-2", "gpt-6-sol");
+        let (head, tail) = line.split_at(40);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent)
+            .unwrap()
+            .write_all(head.as_bytes())
+            .unwrap();
+        let unknown = Attribution::Unresolved {
+            reason: Missing::IdentityNotReported,
+        };
+        assert_eq!(
+            models
+                .capture(
+                    "thread/tokenUsage/updated",
+                    &tokens("parent", "turn-2", &usage[0]),
+                    false
+                )
+                .await,
+            vec![cumulative("parent", "turn-2", unknown, &usage[0])]
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent)
+            .unwrap()
+            .write_all(format!("{tail}\n").as_bytes())
+            .unwrap();
+        // A failed or empty turn end, or the echoed input, is not evidence that the model ran.
+        let completed =
+            json!({"threadId":"parent","turn":{"id":"turn-2","items":[],"status":"failed"}});
+        assert!(models
+            .capture("turn/completed", &completed, false)
+            .await
+            .is_empty());
+        let echo = json!({"threadId":"parent","turnId":"turn-2","startedAtMs":1,
+            "item":{"type":"userMessage","id":"u1","content":[]}});
+        assert!(models
+            .capture("item/started", &echo, false)
+            .await
+            .is_empty());
+        let answer = json!({"threadId":"parent","turnId":"turn-2","startedAtMs":1,
+            "item":{"type":"agentMessage","id":"msg_2","text":"done","phase":"final_answer"}});
+        assert_eq!(
+            models.capture("item/completed", &answer, false).await,
+            vec![NativeRecord::Identity(
+                "parent:turn-2:identity:gpt-6-sol".into(),
+                exact("gpt-6-sol")
+            )]
+        );
+        // A native reroute replaces the turn's model for everything after it, but is not itself
+        // evidence the new model ran; the model that already ran keeps its own marker.
+        let reroute = json!({"threadId":"parent","turnId":"turn-2","fromModel":"gpt-6-sol",
+            "toModel":"gpt-6-astra","reason":"highRiskCyberActivity"});
+        assert!(models
+            .capture("model/rerouted", &reroute, false)
+            .await
+            .is_empty());
+        assert_eq!(
+            models
+                .capture(
+                    "thread/tokenUsage/updated",
+                    &tokens("parent", "turn-2", &usage[1]),
+                    false
+                )
+                .await,
+            vec![
+                NativeRecord::Identity(
+                    "parent:turn-2:identity:gpt-6-astra".into(),
+                    exact("gpt-6-astra")
+                ),
+                cumulative("parent", "turn-2", exact("gpt-6-astra"), &usage[1])
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Real codex 0.156 rollout lines (see the slot baseline rollout), trimmed to the fields read.
+    fn rollout_context(turn: &str, model: &str) -> String {
+        json!({"timestamp":"2026-09-30T18:32:34.742Z","type":"turn_context","payload":{
+            "turn_id":turn,"root_turn_id":turn,"cwd":"/ws","approval_policy":"on-request",
+            "model":model,"effort":"medium","summary":"none"}})
+        .to_string()
+    }
+
+    fn rollout_tokens(total: (u64, u64), last: (u64, u64)) -> String {
+        let usage = |(input, output): (u64, u64)| {
+            json!({"input_tokens":input,
+            "cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":output,
+            "reasoning_output_tokens":0,"total_tokens":input + output})
+        };
+        json!({"timestamp":"2026-09-30T18:32:36.882Z","type":"event_msg","payload":{
+            "type":"token_count","info":{"total_token_usage":usage(total),
+            "last_token_usage":usage(last),"model_context_window":258400},
+            "rate_limits":{"limit_id":"codex","limit_name":null}}})
+        .to_string()
+    }
+
+    fn append_lines(path: &Path, lines: &[String]) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    fn usage(input: u64, output: u64) -> crate::store::TokenUsage {
+        crate::store::TokenUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            reasoning_tokens: Some(0),
+        }
+    }
+
+    fn exact(model: &str) -> crate::store::Attribution {
+        crate::store::Attribution::Exact {
+            model: model.into(),
+            provider: None,
+        }
+    }
+
+    /// A child keeps running after the parent turn settles: its later requests come from its own
+    /// rollout exactly once, and a fresh connection resuming it never recounts its history.
+    #[tokio::test]
+    async fn child_usage_after_the_parent_settles_is_recovered_once() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-child-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join("rollout-child.jsonl");
+        append_lines(
+            &rollout,
+            &[
+                rollout_context("c-turn", "gpt-6-mini"),
+                rollout_tokens((90, 10), (90, 10)),
+            ],
+        );
+        let tokens = |total: (u64, u64), last: (u64, u64)| {
+            json!({"threadId":"child","turnId":"c-turn","tokenUsage":{
+                "total":{"inputTokens":total.0,"outputTokens":total.1,"cachedInputTokens":0,
+                    "cacheWriteInputTokens":0,"reasoningOutputTokens":0},
+                "last":{"inputTokens":last.0,"outputTokens":last.1,"cachedInputTokens":0,
+                    "cacheWriteInputTokens":0,"reasoningOutputTokens":0}}})
+        };
+        let request = |total: u64, last: (u64, u64)| {
+            NativeRecord::Request(
+                format!("child:c-turn:request:{total}"),
+                exact("gpt-6-mini"),
+                usage(last.0, last.1),
+            )
+        };
+        let mut models = NativeTurnModels::default();
+        models
+            .rollouts
+            .insert("child".into(), (rollout.clone(), 0, None));
+        assert_eq!(
+            models
+                .capture(
+                    "thread/tokenUsage/updated",
+                    &tokens((90, 10), (90, 10)),
+                    true
+                )
+                .await,
+            vec![
+                NativeRecord::Identity(
+                    "child:c-turn:identity:gpt-6-mini".into(),
+                    exact("gpt-6-mini")
+                ),
+                request(100, (90, 10)),
+            ]
+        );
+        // After the drain settled: two requests nobody heard, one line duplicated natively.
+        append_lines(
+            &rollout,
+            &[
+                rollout_tokens((130, 20), (40, 10)),
+                rollout_tokens((130, 20), (40, 10)),
+                rollout_context("c-turn-2", "gpt-6-sol"),
+                rollout_tokens((200, 30), (70, 10)),
+            ],
+        );
+        assert_eq!(
+            models.catch_up_children().await,
+            vec![
+                request(150, (40, 10)),
+                NativeRecord::Request(
+                    "child:c-turn-2:request:230".into(),
+                    exact("gpt-6-sol"),
+                    usage(70, 10)
+                ),
+            ]
+        );
+        assert!(models.catch_up_children().await.is_empty());
+        // The same request heard live later is already accounted.
+        let late = models
+            .capture(
+                "thread/tokenUsage/updated",
+                &tokens((130, 20), (40, 10)),
+                true,
+            )
+            .await;
+        assert!(!late
+            .iter()
+            .any(|record| matches!(record, NativeRecord::Request(..))));
+
+        // A fresh connection resumes the child: history stays with the executions that saw it.
+        append_lines(&rollout, &[rollout_tokens((250, 40), (50, 10))]);
+        let mut fresh = NativeTurnModels::default();
+        fresh
+            .rollouts
+            .insert("child".into(), (rollout.clone(), 0, None));
+        let resumed = json!({"threadId":"child","turnId":"c-turn-2","tokenUsage":{
+            "total":{"inputTokens":250,"outputTokens":40},"last":{"inputTokens":50,"outputTokens":10}}});
+        assert_eq!(
+            fresh
+                .capture("thread/tokenUsage/updated", &resumed, true)
+                .await,
+            vec![
+                NativeRecord::Identity(
+                    "child:c-turn-2:identity:gpt-6-sol".into(),
+                    exact("gpt-6-sol")
+                ),
+                NativeRecord::Request(
+                    "child:c-turn-2:request:290".into(),
+                    exact("gpt-6-sol"),
+                    crate::store::TokenUsage {
+                        input_tokens: Some(50),
+                        output_tokens: Some(10),
+                        ..Default::default()
+                    }
+                ),
+            ]
+        );
+        assert!(fresh.catch_up_children().await.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Tool items only `thread/read` returned (the live stream lost them) still name their invoker.
+    #[tokio::test]
+    async fn recovered_turn_items_name_their_invoker() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-recover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join("rollout-parent.jsonl");
+        append_lines(&rollout, &[rollout_context("turn-1", "gpt-6-astra")]);
+        let mut models = NativeTurnModels::default();
+        models
+            .rollouts
+            .insert("parent".into(), (rollout.clone(), 0, None));
+        let command = |id: &str| {
+            json!({"type":"commandExecution","id":id,"command":"orx exp run","cwd":"/ws",
+                "status":"completed","commandActions":[],"aggregatedOutput":"run abc123"})
+        };
+        let streamed = json!({"threadId":"parent","turnId":"turn-1","item":command("call_1")});
+        models.capture("item/started", &streamed, false).await;
+        let items = [
+            command("call_1"),
+            command("call_2"),
+            json!({"type":"agentMessage","id":"item-3","text":"done"}),
+        ];
+        assert_eq!(
+            recovered_item_records(&mut models, "parent", "turn-1", &items).await,
+            vec![NativeRecord::Invoker("call_2".into(), "gpt-6-astra".into())]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `codex exec --json` names neither model nor request: this run's rollout lines supply both,
+    /// and exec's per-run `item_N` ids are scoped so turns never share an invoker record.
+    #[tokio::test]
+    async fn exec_fallback_reads_its_own_rollout_segment() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-exec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join("rollout-thread.jsonl");
+        append_lines(
+            &rollout,
+            &[
+                rollout_context("old", "gpt-6-sol"),
+                rollout_tokens((50, 5), (50, 5)),
+            ],
+        );
+        let launch = std::fs::metadata(&rollout).unwrap().len();
+        let usage_record =
+            json!({"timestamp":"2026-09-30T18:32:36.882Z","type":"token_usage_record",
+            "payload":{"thread_id":"thread","turn_id":"new","response_id":"resp_1",
+            "usage":{"input_tokens":80,"output_tokens":5}}})
+            .to_string();
+        append_lines(
+            &rollout,
+            &[
+                rollout_context("new", "gpt-6-astra"),
+                usage_record,
+                rollout_tokens((130, 10), (80, 5)),
+            ],
+        );
+
+        let mut ctx = TurnCtx::test_stub();
+        let mut counter = 0;
+        let mut next_id = |prefix: &str| {
+            counter += 1;
+            format!("{prefix}-{counter}")
+        };
+        let item = json!({"id":"item_0","type":"command_execution","command":"orx exp run",
+            "aggregated_output":"run abc123","exit_code":0,"status":"completed"});
+        let tool = handle_item(&mut ctx, &item, "msg-1:1:", &mut next_id).unwrap();
+        assert_eq!(tool, "msg-1:1:item_0");
+        assert!(ctx.assistant.parts.iter().any(|part| part.id == tool));
+
+        assert_eq!(
+            exec_rollout_records("thread", &rollout, launch, std::slice::from_ref(&tool)),
+            vec![
+                NativeRecord::Cumulative {
+                    thread: "thread".into(),
+                    turn: "new".into(),
+                    attribution: exact("gpt-6-astra"),
+                    total: usage(130, 10),
+                    last: usage(80, 5),
+                },
+                NativeRecord::Invoker(tool.clone(), "gpt-6-astra".into()),
+            ]
+        );
+        // Two models in one run: requests keep their own, tools name neither.
+        let records = exec_rollout_records("thread", &rollout, 0, std::slice::from_ref(&tool));
+        assert!(!records
+            .iter()
+            .any(|record| matches!(record, NativeRecord::Invoker(..))));
+        // No `turn_context` (an older rollout): tokens stay, identity is explicitly unknown.
+        let bare = dir.join("rollout-bare.jsonl");
+        append_lines(&bare, &[rollout_tokens((10, 1), (10, 1))]);
+        assert_eq!(
+            exec_rollout_records("bare", &bare, 0, &[]),
+            vec![NativeRecord::Cumulative {
+                thread: "bare".into(),
+                turn: String::new(),
+                attribution: crate::store::Attribution::Unresolved {
+                    reason: crate::store::Missing::IdentityNotReported,
+                },
+                total: usage(10, 1),
+                last: usage(10, 1),
+            }]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn rollout_task(turn: &str, running: bool) -> String {
+        let kind = if running {
+            "task_started"
+        } else {
+            "task_complete"
+        };
+        json!({"timestamp":"2026-09-30T18:40:36.325Z","type":"event_msg",
+            "payload":{"type":kind,"turn_id":turn}})
+        .to_string()
+    }
+
+    /// A sub-agent that outlives its spawning turn keeps charging that turn's held execution —
+    /// never the unrelated next turn — until a later turn re-drives it; native completion
+    /// (rollout `task_complete`) is what releases the hold.
+    #[tokio::test]
+    async fn late_child_requests_stay_with_the_turn_that_drove_them() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-late-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join("rollout-child.jsonl");
+        append_lines(
+            &rollout,
+            &[
+                rollout_task("c-turn", true),
+                rollout_context("c-turn", "gpt-6-mini"),
+                rollout_tokens((90, 10), (90, 10)),
+            ],
+        );
+        let mut models = NativeTurnModels::default();
+        models
+            .rollouts
+            .insert("child".into(), (rollout.clone(), 0, None));
+        models.current = Some("turn-1-execution".into());
+        let live = json!({"threadId":"child","turnId":"c-turn","tokenUsage":{
+            "total":{"inputTokens":90,"outputTokens":10},"last":{"inputTokens":90,"outputTokens":10}}});
+        let records = models
+            .capture("thread/tokenUsage/updated", &live, true)
+            .await;
+        assert!(records.contains(&NativeRecord::Request(
+            "child:c-turn:request:100".into(),
+            exact("gpt-6-mini"),
+            crate::store::TokenUsage {
+                input_tokens: Some(90),
+                output_tokens: Some(10),
+                ..Default::default()
+            },
+        )));
+        models.hold_live(&TurnCtx::test_stub(), &["child".into()]);
+        assert!(models.held.contains("turn-1-execution"));
+
+        // The next, unrelated turn: the child's new request is not charged to it.
+        models.current = Some("turn-2-execution".into());
+        append_lines(&rollout, &[rollout_tokens((130, 20), (40, 10))]);
+        assert!(models.catch_up_children().await.is_empty());
+        assert_eq!(
+            std::mem::take(&mut models.foreign),
+            [(
+                "turn-1-execution".to_string(),
+                NativeRecord::Request(
+                    "child:c-turn:request:150".into(),
+                    exact("gpt-6-mini"),
+                    usage(40, 10)
+                )
+            )]
+        );
+        assert!(
+            models.releasable(false).is_empty(),
+            "still running natively"
+        );
+        append_lines(&rollout, &[rollout_task("c-turn", false)]);
+        assert!(models.drain_late().await.is_empty());
+        assert_eq!(models.releasable(false), ["turn-1-execution"]);
+
+        // Turn 2 re-drives the child: from here on its requests are turn 2's.
+        let send = json!({"threadId":"parent","turnId":"t-2","item":{"type":"collabAgentToolCall",
+            "id":"send-1","tool":"sendInput","status":"completed","receiverThreadIds":["child"]}});
+        models.capture("item/completed", &send, false).await;
+        append_lines(
+            &rollout,
+            &[
+                rollout_task("c-turn-2", true),
+                rollout_context("c-turn-2", "gpt-6-sol"),
+                rollout_tokens((200, 30), (70, 10)),
+            ],
+        );
+        assert_eq!(
+            models.catch_up_children().await,
+            [NativeRecord::Request(
+                "child:c-turn-2:request:230".into(),
+                exact("gpt-6-sol"),
+                usage(70, 10)
+            )]
+        );
+        assert!(models.foreign.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// After a crash, startup recovery reads what the dead process never did: the interrupted
+    /// turn's own requests past its recorded total, and each sub-agent's share per owner.
+    #[test]
+    fn startup_recovery_reads_orphaned_turn_and_child_rollouts_once() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-orphan-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.join("store")).unwrap();
+        let parent = dir.join("rollout-parent.jsonl");
+        let child = dir.join("rollout-child.jsonl");
+        append_lines(
+            &parent,
+            &[
+                rollout_context("turn-0", "gpt-6-astra"),
+                rollout_tokens((50, 5), (50, 5)),
+                rollout_context("turn-1", "gpt-6-astra"),
+                rollout_tokens((160, 15), (110, 10)),
+                rollout_tokens((300, 30), (140, 15)),
+            ],
+        );
+        append_lines(
+            &child,
+            &[
+                rollout_context("c-1", "gpt-6-mini"),
+                rollout_tokens((40, 10), (40, 10)),
+                rollout_tokens((90, 20), (50, 10)),
+                rollout_context("c-2", "gpt-6-mini"),
+                rollout_tokens((150, 30), (60, 10)),
+            ],
+        );
+        for execution in ["first", "second"] {
+            store
+                .begin_usage_execution(execution, execution, "codex")
+                .unwrap();
+        }
+        // Live, the dead process saw turn-1's first request only.
+        store
+            .record_cumulative_usage(
+                "second",
+                "codex",
+                "parent",
+                "turn-1",
+                &exact("gpt-6-astra"),
+                &usage(160, 15),
+                &usage(110, 10),
+            )
+            .unwrap();
+        store
+            .set_native_scope(
+                "second",
+                "codex-turn:parent:turn-1",
+                &json!({"path": parent, "thread": "parent", "turn": "turn-1"}),
+            )
+            .unwrap();
+        store
+            .set_native_scope(
+                "first",
+                "codex-child:child",
+                &json!({"path": child, "start": 0}),
+            )
+            .unwrap();
+        store
+            .set_native_scope(
+                "second",
+                "codex-child:child",
+                &json!({"path": child, "start": 110}),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            recover_orphaned_usage(&store).unwrap();
+        }
+        let db = rusqlite::Connection::open(dir.join("store").join("orx.db")).unwrap();
+        let samples = |execution: &str| -> Vec<(String, u64)> {
+            db.prepare("SELECT sample_id, usage_json FROM chat_usage_samples WHERE execution_id = ?1 ORDER BY sample_id")
+                .unwrap()
+                .query_map([execution], |row| {
+                    let json: String = row.get(1)?;
+                    Ok((
+                        row.get(0)?,
+                        serde_json::from_str::<crate::store::TokenUsage>(&json)
+                            .unwrap()
+                            .total()
+                            .unwrap(),
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            samples("first"),
+            [
+                ("child:c-1:request:110".into(), 60),
+                ("child:c-1:request:50".into(), 50)
+            ]
+        );
+        let second = samples("second");
+        assert_eq!(second.len(), 3);
+        assert!(second.contains(&("child:c-2:request:180".into(), 70)));
+        assert_eq!(
+            second
+                .iter()
+                .filter(|(id, _)| id.starts_with("parent:turn-1:"))
+                .map(|(_, total)| total)
+                .sum::<u64>(),
+            120 + 155,
+            "turn-1's two requests, the live one not recounted"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

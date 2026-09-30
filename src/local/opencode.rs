@@ -520,6 +520,8 @@ pub struct AgentHost {
     up_port: std::sync::OnceLock<u16>,
     starting: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     stopping: std::sync::atomic::AtomicBool,
+    /// Each session's running turn, so an interrupt can capture what the aborted turn cannot.
+    turns: std::sync::Mutex<HashMap<String, crate::local::harness::opencode::TrackedTurn>>,
 }
 
 struct StartupRegistration<'a> {
@@ -544,6 +546,23 @@ impl AgentHost {
             up_port: std::sync::OnceLock::new(),
             starting: std::sync::Mutex::new(HashMap::new()),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            turns: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn track(
+        &self,
+        session_id: &str,
+        turn: crate::local::harness::opencode::TrackedTurn,
+    ) {
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.insert(session_id.to_string(), turn);
+        }
+    }
+
+    pub(crate) fn untrack(&self, session_id: &str) {
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.remove(session_id);
         }
     }
 
@@ -569,7 +588,15 @@ impl AgentHost {
         }
     }
 
+    /// Stops the native turn and, before the shared interrupt finalizes usage, captures the native
+    /// evidence of the turn it aborted.
     pub(crate) async fn interrupt(&self, session_id: &str, native_id: &str) -> Result<()> {
+        let turn = self
+            .turns
+            .lock()
+            .ok()
+            .and_then(|mut turns| turns.remove(session_id))
+            .filter(|turn| turn.native_id == native_id);
         let Some(endpoint) = self.endpoint_for(session_id).await else {
             return Ok(());
         };
@@ -584,6 +611,9 @@ impl AgentHost {
             .send()
             .await?
             .error_for_status()?;
+        if let Some(turn) = turn {
+            crate::local::harness::opencode::capture_interrupted(&endpoint, &turn).await;
+        }
         Ok(())
     }
 

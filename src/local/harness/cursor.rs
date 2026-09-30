@@ -765,6 +765,10 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let status = child.wait().await?;
     let log_path = crate::store::data_dir().join(format!("agent-{log_name}.log"));
     if !state.saw_result {
+        // Init names the model before the request; an entitlement refusal means it never ran.
+        if !state.executed && read_log_tail(&log_path, 8 * 1024).contains("ActionRequiredError:") {
+            ctx.mark_delivery(DeliveryState::Rejected);
+        }
         return Err(anyhow!("{}", cursor_exit_detail(status, &log_path)));
     }
     if ctx.plan_mode {
@@ -803,7 +807,12 @@ fn cursor_native_usage(usage: &Value) -> crate::store::TokenUsage {
 
 #[derive(Default)]
 struct TurnState {
-    reported_auto: bool,
+    /// Cursor's `system/init` model label, announced before the request is sent.
+    init_model: Option<String>,
+    /// The model produced output, so `init_model` names an execution.
+    executed: bool,
+    /// Tool calls whose invoking model is recorded.
+    invokers: std::collections::HashSet<String>,
     native_session_id: Option<String>,
     text_part_id: Option<String>,
     reasoning_part_id: Option<String>,
@@ -814,16 +823,43 @@ struct TurnState {
     saw_result: bool,
 }
 
+fn usage_sample_id(ctx: &TurnCtx) -> String {
+    format!("cursor-result-{}", ctx.attempt_count_for_usage())
+}
+
+fn usage_attribution(ctx: &TurnCtx, state: &TurnState) -> crate::store::Attribution {
+    ctx.native_attribution(
+        state.init_model.as_deref(),
+        None,
+        crate::store::Missing::IdentityNotReported,
+    )
+}
+
 fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool {
     if let Some(sid) = event.get("session_id").and_then(Value::as_str) {
         state.native_session_id = Some(sid.to_string());
     }
-    match event.get("type").and_then(Value::as_str) {
+    let kind = event.get("type").and_then(Value::as_str);
+    let succeeded = kind == Some("result")
+        && event.get("subtype").and_then(Value::as_str) == Some("success")
+        && event.get("is_error").and_then(Value::as_bool) != Some(true);
+    if !state.executed
+        && (matches!(kind, Some("assistant" | "thinking" | "tool_call")) || succeeded)
+    {
+        state.executed = true;
+        ctx.record_attributed_usage(
+            &usage_sample_id(ctx),
+            usage_attribution(ctx, state),
+            crate::store::TokenUsage::default(),
+            false,
+        );
+    }
+    match kind {
         Some("system") if event.get("subtype").and_then(Value::as_str) == Some("init") => {
-            state.reported_auto = event
+            state.init_model = event
                 .get("model")
                 .and_then(Value::as_str)
-                .is_some_and(|model| model.eq_ignore_ascii_case("auto"));
+                .map(str::to_string);
             false
         }
         Some("thinking") => {
@@ -873,11 +909,12 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         }
         Some("result") => {
             if let Some(usage) = event.get("usage") {
-                ctx.record_native_usage(
-                    &format!("cursor-result-{}", ctx.attempt_count_for_usage()),
-                    state.reported_auto.then_some("Auto"),
-                    None,
+                // `usage` is the turn's native total across every model call.
+                ctx.record_attributed_usage(
+                    &usage_sample_id(ctx),
+                    usage_attribution(ctx, state),
                     cursor_native_usage(usage),
+                    true,
                 );
             }
             state.saw_result = true;
@@ -955,12 +992,30 @@ fn apply_tool_call(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) {
     state.reasoning_part_id = None;
     close_text_segment(state);
     let subtype = event.get("subtype").and_then(Value::as_str).unwrap_or("");
-    let call_id = event
-        .get("call_id")
-        .and_then(Value::as_str)
+    let native_call_id = event.get("call_id").and_then(Value::as_str);
+    let call_id = native_call_id
         .map(str::to_string)
         .unwrap_or_else(|| format!("tool-{}", state.text_seq));
-    let (name, args, result) = tool_call_parts(event.get("tool_call").unwrap_or(&Value::Null));
+    // Only native call ids: the positional fallback repeats across turns.
+    if let (Some(call_id), Some(model)) = (native_call_id, state.init_model.as_deref()) {
+        if state.invokers.insert(call_id.to_string()) {
+            ctx.record_tool_invoker(call_id, model, None);
+        }
+    }
+    let tool_call = event.get("tool_call").unwrap_or(&Value::Null);
+    // A sub-agent runs as its own conversation: print mode and its local transcript report neither
+    // its model (`args.model` is only the request) nor its usage, which the parent result excludes.
+    if tool_call.get("taskToolCall").is_some() {
+        ctx.record_attributed_usage(
+            &format!("cursor-task-{call_id}"),
+            crate::store::Attribution::Unresolved {
+                reason: crate::store::Missing::ChildModelUnknown,
+            },
+            crate::store::TokenUsage::default(),
+            false,
+        );
+    }
+    let (name, args, result) = tool_call_parts(tool_call);
     match subtype {
         "started" => {
             ctx.upsert_part(WirePart {
@@ -1350,6 +1405,79 @@ mod tests {
                 .output
                 .as_deref(),
             Some("# Project")
+        );
+    }
+
+    /// Cursor 2026.09.15 print-mode shapes: init names the model before the request, so only
+    /// model output makes it an execution; every native tool call records its invoker.
+    #[test]
+    fn init_model_attributes_executions_and_tool_invokers() {
+        use crate::store::{Attribution, Missing};
+        let init = |model: &str| {
+            serde_json::json!({"type": "system", "subtype": "init", "apiKeySource": "login",
+                "cwd": "/ws", "session_id": "s1", "model": model, "permissionMode": "default"})
+        };
+        let echo = serde_json::json!({"type": "user", "session_id": "s1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "run it"}]}});
+        let shell = |subtype: &str, call_id: &str| {
+            serde_json::json!({"type": "tool_call", "subtype": subtype, "call_id": call_id,
+                "tool_call": {"shellToolCall": {"args": {"command": "orx exp run"}}},
+                "model_call_id": "mc-1", "session_id": "s1", "timestamp_ms": 1})
+        };
+        let fold = |events: &[Value]| {
+            let mut ctx = TurnCtx::test_stub();
+            ctx.harness = "cursor".into();
+            let mut state = TurnState::default();
+            for event in events {
+                apply_event(&mut ctx, &mut state, event);
+            }
+            (ctx, state)
+        };
+
+        // A refused request prints init and the echo, then fails: no execution evidence.
+        let (_, state) = fold(&[init("Opus 4.8 High"), echo.clone()]);
+        assert!(!state.executed);
+        let failed = serde_json::json!({"type": "result", "is_error": true, "result": "Rate limit exceeded"});
+        let (_, state) = fold(&[init("Opus 4.8 High"), echo.clone(), failed]);
+        assert!(!state.executed);
+
+        // Auto stays explicit routing; each native call records the invoker once, in order.
+        let (ctx, state) = fold(&[
+            init("Auto"),
+            echo,
+            shell("started", "call_a"),
+            shell("completed", "call_a"),
+            shell("completed", "call_b"),
+            serde_json::json!({"type": "tool_call", "subtype": "started",
+                "tool_call": {"shellToolCall": {"args": {"command": "ls"}}}}),
+        ]);
+        assert!(state.executed);
+        assert_eq!(usage_attribution(&ctx, &state), Attribution::AutoRouting);
+        assert_eq!(
+            state.invokers,
+            ["call_a", "call_b"].map(String::from).into_iter().collect()
+        );
+
+        // A named model keeps its full native label; a successful empty answer still executed.
+        let done = serde_json::json!({"type": "result", "subtype": "success", "duration_ms": 1,
+            "duration_api_ms": 1, "is_error": false, "result": "", "session_id": "s1",
+            "request_id": "r1"});
+        let (ctx, state) = fold(&[init("Opus 4.8 High"), done]);
+        assert!(state.executed);
+        assert_eq!(
+            usage_attribution(&ctx, &state),
+            Attribution::Exact {
+                model: "Opus 4.8 High".into(),
+                provider: None
+            }
+        );
+        let (ctx, state) = fold(&[shell("started", "call_c")]);
+        assert!(state.invokers.is_empty());
+        assert_eq!(
+            usage_attribution(&ctx, &state),
+            Attribution::Unresolved {
+                reason: Missing::IdentityNotReported
+            }
         );
     }
 

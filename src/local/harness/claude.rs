@@ -1499,6 +1499,10 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             let inner = event.get("event").unwrap_or(&Value::Null);
             match inner.get("type").and_then(Value::as_str) {
                 Some("message_start") => {
+                    // An interrupt kills the child before `result`, so the model is captured here.
+                    if let Some(message) = inner.get("message") {
+                        record_message(ctx, message, parent);
+                    }
                     // Sub-agent streams have their own message ids; namespace the
                     // stream mid per parent so a concurrent sub-agent's deltas
                     // don't collide with the main stream's.
@@ -1638,30 +1642,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         },
         Some("assistant") => {
             if let Some(message) = event.get("message") {
-                ctx.record_native_invocations(message);
-            }
-            if let (Some(sample_id), Some(model), Some(usage)) = (
-                event.pointer("/message/id").and_then(Value::as_str),
-                event.pointer("/message/model").and_then(Value::as_str),
-                event.pointer("/message/usage"),
-            ) {
-                let field = |key| usage.get(key).and_then(Value::as_u64);
-                let input_tokens = field("input_tokens")
-                    .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
-                    .and_then(|input| input.checked_add(field("cache_creation_input_tokens")?));
-                ctx.record_native_usage(
-                    &format!("claude-{}:{sample_id}", ctx.attempt_count_for_usage()),
-                    Some(model),
-                    None,
-                    crate::store::TokenUsage {
-                        input_tokens,
-                        // Assistant output is a partial subtotal; terminal modelUsage includes reasoning.
-                        output_tokens: field("output_tokens"),
-                        cache_read_tokens: field("cache_read_input_tokens"),
-                        cache_write_tokens: field("cache_creation_input_tokens"),
-                        reasoning_tokens: None,
-                    },
-                );
+                record_message(ctx, message, subagent_parent(event));
             }
             if event
                 .get("error")
@@ -1947,6 +1928,73 @@ fn mark_stream_final(ctx: &mut TurnCtx, state: &TurnState) {
         let prefix = format!("{mid}-");
         ctx.mark_final_text(|part| part.id.starts_with(&prefix));
     }
+}
+
+/// One native message's (id, attribution, usage snapshot, issued tool part ids). A sub-agent's
+/// tool is recorded under its bare id (the invocation gate's key) and its namespaced part id.
+fn message_sample(
+    message: &Value,
+    parent: Option<&str>,
+) -> Option<(
+    String,
+    crate::store::Attribution,
+    crate::store::TokenUsage,
+    Vec<String>,
+)> {
+    let id = message.get("id").and_then(Value::as_str)?;
+    let model = message.get("model").and_then(Value::as_str);
+    let usage = message.get("usage");
+    if model.is_none() && usage.is_none() {
+        return None;
+    }
+    let missing = if parent.is_some() {
+        crate::store::Missing::ChildModelUnknown
+    } else {
+        crate::store::Missing::IdentityNotReported
+    };
+    let usage = usage.map_or_else(Default::default, |usage| {
+        let field = |key| usage.get(key).and_then(Value::as_u64);
+        crate::store::TokenUsage {
+            input_tokens: field("input_tokens")
+                .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
+                .and_then(|input| input.checked_add(field("cache_creation_input_tokens")?)),
+            // Assistant output is a partial subtotal; terminal modelUsage includes reasoning.
+            output_tokens: field("output_tokens"),
+            cache_read_tokens: field("cache_read_input_tokens"),
+            cache_write_tokens: field("cache_creation_input_tokens"),
+            reasoning_tokens: None,
+        }
+    });
+    let tools = message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| block.get("id").and_then(Value::as_str))
+        .flat_map(|id| std::iter::once(id.to_string()).chain(parent.map(|p| format!("{p}:{id}"))))
+        .collect();
+    Some((
+        id.to_string(),
+        crate::store::Attribution::native("claude-code", model, None, missing),
+        usage,
+        tools,
+    ))
+}
+
+fn record_message(ctx: &TurnCtx, message: &Value, parent: Option<&str>) {
+    let Some((id, attribution, usage, tools)) = message_sample(message, parent) else {
+        return;
+    };
+    let attempt = ctx.attempt_count_for_usage();
+    // Tool identity first: the invocation gate is already polling for it.
+    if let crate::store::Attribution::Exact { model, provider } = &attribution {
+        for tool in &tools {
+            ctx.record_tool_invoker(tool, model, provider.as_deref());
+        }
+    }
+    // Result modelUsage replaces the listed models' messages and keeps any other one's identity.
+    ctx.record_attributed_usage(&format!("claude-{attempt}:{id}"), attribution, usage, false);
 }
 
 fn claude_result_usage_samples(
@@ -2786,6 +2834,66 @@ mod tests {
                 .output_tokens,
             Some(484)
         );
+    }
+
+    #[test]
+    fn native_messages_keep_identity_independent_of_usage_and_children() {
+        use crate::store::{Attribution, Missing};
+        let exact = |model: &str| Attribution::Exact {
+            model: model.into(),
+            provider: None,
+        };
+        // Stream `message_start` before any block: identity and input are captured pre-interrupt.
+        let (id, attribution, usage, tools) = message_sample(
+            &serde_json::json!({"id":"msg_011Cfa7Sv51tpWpeffp9gfru","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":31825,"cache_read_input_tokens":11903,"output_tokens":8}}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(id, "msg_011Cfa7Sv51tpWpeffp9gfru");
+        assert_eq!(attribution, exact("claude-opus-5-5"));
+        assert_eq!(usage.input_tokens, Some(43730));
+        assert!(tools.is_empty());
+        // A model without usage is still an identity (identity-only write).
+        let (_, attribution, usage, _) = message_sample(
+            &serde_json::json!({"id":"msg_a","model":"claude-opus-5-5","content":[]}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(attribution, exact("claude-opus-5-5"));
+        assert_eq!(usage, Default::default());
+        // A sub-agent keeps its own model; its tool is keyed bare (gate) and namespaced (part).
+        let (_, attribution, _, tools) = message_sample(
+            &serde_json::json!({"id":"msg_011CfZDfRwPUCRQJdvdor3Ju","model":"claude-haiku-4-5-20251001","content":[{"type":"tool_use","id":"toolu_child","name":"Bash","input":{"command":"orx exp run e"}}]}),
+            Some("toolu_task"),
+        )
+        .unwrap();
+        assert_eq!(attribution, exact("claude-haiku-4-5-20251001"));
+        assert_eq!(tools, ["toolu_child", "toolu_task:toolu_child"]);
+        // An unidentified child never inherits the parent's model.
+        let (_, attribution, _, _) = message_sample(
+            &serde_json::json!({"id":"msg_b","usage":{"output_tokens":4}}),
+            Some("toolu_task"),
+        )
+        .unwrap();
+        assert_eq!(
+            attribution,
+            Attribution::Unresolved {
+                reason: Missing::ChildModelUnknown
+            }
+        );
+        // Claude's local error message is an explicit exception, never a tool invoker.
+        let (_, attribution, _, _) = message_sample(
+            &serde_json::json!({"id":"e9adb23a-3a90-4edc-93e6-1f0d5e23afd0","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            attribution,
+            Attribution::Unresolved {
+                reason: Missing::SyntheticModel
+            }
+        );
+        assert!(message_sample(&serde_json::json!({"id":"msg_c","content":[]}), None).is_none());
     }
 
     /// Fold a hand-written stream-json transcript through `apply_event` against a

@@ -1,0 +1,324 @@
+{
+ "main": {
+  "data": {
+   "info": {
+    "id": "ses_f0c2f7575ffe15gETnxld4d1P5",
+    "projectID": "global",
+    "agent": "build",
+    "model": {
+     "id": "big-pickle",
+     "providerID": "opencode",
+     "variant": "default"
+    },
+    "cost": 0,
+    "tokens": {
+     "input": 7008,
+     "output": 105,
+     "reasoning": 110,
+     "cache": {
+      "read": 6864,
+      "write": 0
+     }
+    },
+    "outcome": "succeeded",
+    "time": {
+     "created": 1790796925642,
+     "updated": 1790796928470,
+     "idle": 1790796933006
+    },
+    "title": "Run parent and child probe commands",
+    "location": {
+     "directory": "/tmp/project"
+    }
+   },
+   "messages": [
+    {
+     "id": "msg_9f948015ec3b465387d9ccc322c403dd",
+     "time": {
+      "created": 1790796925700
+     },
+     "text": "Step 1: run the shell command `echo orx-probe` with the shell tool. Step 2: use the subagent tool with agent general and prompt \"Run the shell command echo child-probe with the shell tool and report its output\". Step 3: reply with the single word done.",
+     "type": "user"
+    },
+    {
+     "id": "msg_0f3d08b130017eFyyxhSAmLVQe",
+     "time": {
+      "created": 1790796927595,
+      "streamed": 1790796928020,
+      "completed": 1790796931756
+     },
+     "type": "assistant",
+     "agent": "build",
+     "model": {
+      "id": "big-pickle",
+      "providerID": "opencode",
+      "variant": "default"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "I'll run both steps in parallel since they're independent."
+      },
+      {
+       "type": "tool",
+       "id": "call_function_nidnrzatgtwr_1",
+       "name": "shell",
+       "executed": false,
+       "state": {
+        "status": "completed",
+        "input": {
+         "command": "echo orx-probe"
+        },
+        "content": [
+         {
+          "type": "text",
+          "text": "orx-probe\n"
+         },
+         {
+          "type": "text",
+          "text": "Command exited with code 0."
+         }
+        ],
+        "metadata": {
+         "status": "completed",
+         "truncated": false,
+         "exit": 0
+        }
+       },
+       "time": {
+        "created": 1790796927883,
+        "ran": 1790796928008,
+        "completed": 1790796928144
+       }
+      },
+      {
+       "type": "tool",
+       "id": "call_function_nidnrzatgtwr_2",
+       "name": "subagent",
+       "executed": false,
+       "state": {
+        "status": "completed",
+        "input": {
+         "agent": "general",
+         "description": "Run child shell probe",
+         "prompt": "Run the shell command echo child-probe with the shell tool a"
+        },
+        "content": [
+         {
+          "type": "text",
+          "text": "<subagent sessionID=\"ses_f0c2f6bd9ffemGSmEIMuvSImgq\" state=\"completed\">\nRan `echo child-probe` via the shell tool.\n\n- Output: `child-probe`\n- Exit code: 0\n</subagent>"
+         }
+        ],
+        "metadata": {
+         "sessionID": "ses_f0c2f6bd9ffemGSmEIMuvSImgq",
+         "status": "completed",
+         "truncated": false
+        }
+       },
+       "time": {
+        "created": 1790796927888,
+        "ran": 1790796928016,
+        "completed": 1790796931698
+       }
+      }
+     ],
+     "finish": "tool-calls",
+     "rawFinish": "tool_calls",
+     "cost": 0,
+     "tokens": {
+      "input": 6338,
+      "output": 97,
+      "reasoning": 0,
+      "cache": {
+       "read": 145,
+       "write": 0
+      }
+     }
+    },
+    {
+     "id": "msg_0f3d0a2ba001sxgWDHNk1sFrk4",
+     "time": {
+      "created": 1790796932952,
+      "streamed": 1790796932961,
+      "completed": 1790796933004
+     },
+     "type": "assistant",
+     "agent": "build",
+     "model": {
+      "id": "big-pickle",
+      "providerID": "opencode",
+      "variant": "default"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "done"
+      }
+     ],
+     "finish": "stop",
+     "rawFinish": "stop",
+     "cost": 0,
+     "tokens": {
+      "input": 94,
+      "output": 2,
+      "reasoning": 0,
+      "cache": {
+       "read": 6578,
+       "write": 0
+      }
+     }
+    }
+   ]
+  }
+ },
+ "child": {
+  "data": {
+   "info": {
+    "id": "ses_f0c2f6bd9ffemGSmEIMuvSImgq",
+    "parentID": "ses_f0c2f7575ffe15gETnxld4d1P5",
+    "projectID": "global",
+    "agent": "general",
+    "model": {
+     "id": "big-pickle",
+     "providerID": "opencode",
+     "variant": "default"
+    },
+    "cost": 0,
+    "tokens": {
+     "input": 10970,
+     "output": 56,
+     "reasoning": 17,
+     "cache": {
+      "read": 273,
+      "write": 0
+     }
+    },
+    "outcome": "succeeded",
+    "time": {
+     "created": 1790796928201,
+     "updated": 1790796928205,
+     "idle": 1790796931695
+    },
+    "title": "Run child shell probe",
+    "location": {
+     "directory": "/tmp/project"
+    }
+   },
+   "messages": [
+    {
+     "id": "msg_0f3d094cc002vUV1eJSvv171rJ",
+     "time": {
+      "created": 1790796928233
+     },
+     "text": "You are a subagent spawned by another session.\nRun the shell command echo child-probe with the shell tool and report its output",
+     "type": "user"
+    },
+    {
+     "id": "msg_0f3d094ef001q6aLjtCXxt1tJO",
+     "time": {
+      "created": 1790796929905,
+      "streamed": 1790796930170,
+      "completed": 1790796930241
+     },
+     "type": "assistant",
+     "agent": "general",
+     "model": {
+      "id": "big-pickle",
+      "providerID": "opencode",
+      "variant": "default"
+     },
+     "content": [
+      {
+       "type": "reasoning",
+       "text": "The user wants me to run a shell command. Let me do it.",
+       "state": {
+        "reasoningField": "reasoning_content"
+       },
+       "time": {
+        "created": 1790796929906,
+        "completed": 1790796930165
+       }
+      },
+      {
+       "type": "tool",
+       "id": "call_function_47o9w22rhcia_1",
+       "name": "shell",
+       "executed": false,
+       "state": {
+        "status": "completed",
+        "input": {
+         "command": "echo child-probe"
+        },
+        "content": [
+         {
+          "type": "text",
+          "text": "child-probe\n"
+         },
+         {
+          "type": "text",
+          "text": "Command exited with code 0."
+         }
+        ],
+        "metadata": {
+         "status": "completed",
+         "truncated": false,
+         "exit": 0
+        }
+       },
+       "time": {
+        "created": 1790796930163,
+        "ran": 1790796930168,
+        "completed": 1790796930183
+       }
+      }
+     ],
+     "finish": "tool-calls",
+     "rawFinish": "tool_calls",
+     "cost": 0,
+     "tokens": {
+      "input": 5466,
+      "output": 28,
+      "reasoning": 17,
+      "cache": {
+       "read": 145,
+       "write": 0
+      }
+     }
+    },
+    {
+     "id": "msg_0f3d09ccf001sU8UDnw1G33CT2",
+     "time": {
+      "created": 1790796931468,
+      "streamed": 1790796931636,
+      "completed": 1790796931690
+     },
+     "type": "assistant",
+     "agent": "general",
+     "model": {
+      "id": "big-pickle",
+      "providerID": "opencode",
+      "variant": "default"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Ran `echo child-probe` via the shell tool.\n\n- Output: `child"
+      }
+     ],
+     "finish": "stop",
+     "rawFinish": "stop",
+     "cost": 0,
+     "tokens": {
+      "input": 5504,
+      "output": 28,
+      "reasoning": 0,
+      "cache": {
+       "read": 128,
+       "write": 0
+      }
+     }
+    }
+   ]
+  }
+ }
+}

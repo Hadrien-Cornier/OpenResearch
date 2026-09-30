@@ -202,6 +202,8 @@ pub struct CodexClient {
     /// child (crash/restart replacement) — the DB signal covers that case.
     last_collab_mode: std::sync::Mutex<Option<&'static str>>,
     native_store: NativeStore,
+    /// Native model and sub-agent accounting state; children outlive the turn that spawned them.
+    pub(crate) native: Mutex<crate::local::harness::codex::NativeTurnModels>,
 }
 
 impl CodexClient {
@@ -623,6 +625,7 @@ async fn spawn_client(
         thread_model: std::sync::Mutex::new(None),
         last_collab_mode: std::sync::Mutex::new(None),
         native_store,
+        native: Mutex::default(),
     });
     tokio::spawn(read_loop(client.clone(), stdout));
     Ok(client)
@@ -720,7 +723,7 @@ impl CodexHost {
                 }
             }
             if let Some(stale) = guard.remove(session_id) {
-                let _ = stale.child.lock().await.kill().await;
+                retire(&stale).await;
             }
         }
         let host = self.clone();
@@ -743,7 +746,7 @@ impl CodexHost {
                     }
                 }
                 if let Some(stale) = guard.remove(&session) {
-                    let _ = stale.child.lock().await.kill().await;
+                    retire(&stale).await;
                 }
                 guard.insert(session.clone(), client.clone());
             }
@@ -768,20 +771,38 @@ impl CodexHost {
         if matches!(client.child.lock().await.try_wait(), Ok(None)) {
             Some(client.clone())
         } else {
-            guard.remove(session_id);
+            let dead = guard.remove(session_id);
+            drop(guard);
+            if let Some(dead) = dead {
+                retire(&dead).await;
+            }
             None
         }
     }
 
     /// Interrupt and harvest the in-flight turn while its child is reachable,
     /// then retire the child so a successor cannot race native cancellation.
-    pub async fn interrupt_session(&self, session_id: &str) -> Option<Vec<Value>> {
+    /// `execution` is the aborted turn's still-open usage execution, for the cancel window.
+    pub async fn interrupt_session(
+        &self,
+        session_id: &str,
+        execution: Option<&str>,
+    ) -> Option<Vec<Value>> {
         let client = self.client_for(session_id).await?;
         let thread_id = client.resumed_thread();
         let turn_id = client.active_turn.lock().unwrap().clone();
         client.interrupt_active_turn().await;
-        let items = match (thread_id, turn_id) {
-            (Some(thread_id), Some(turn_id)) => client.read_turn_items(&thread_id, &turn_id).await,
+        let items = match (&thread_id, &turn_id) {
+            (Some(thread_id), Some(turn_id)) => {
+                let items = client.read_turn_items(thread_id, turn_id).await;
+                if let Some(items) = &items {
+                    crate::local::harness::codex::record_interrupted_invokers(
+                        &client, session_id, thread_id, turn_id, items,
+                    )
+                    .await;
+                }
+                items
+            }
             _ => None,
         };
         let retired = {
@@ -798,22 +819,42 @@ impl CodexHost {
         if let Some(retired) = retired {
             let _ = retired.child.lock().await.kill().await;
         }
+        // Killed, so its rollouts are final: the cancel window and every sub-agent it owned.
+        match (&thread_id, &turn_id) {
+            (Some(thread_id), Some(turn_id)) => {
+                crate::local::harness::codex::record_interrupted_usage(
+                    &client, execution, thread_id, turn_id,
+                )
+                .await
+            }
+            _ => {
+                crate::local::harness::codex::flush_late_usage(&client, true).await;
+            }
+        }
         items
     }
 
     /// Kill and reap one session's child (on session delete).
     pub async fn kill_session(&self, session_id: &str) {
-        if let Some(client) = self.inner.lock().await.remove(session_id) {
-            let _ = client.child.lock().await.kill().await;
+        let client = self.inner.lock().await.remove(session_id);
+        if let Some(client) = client {
+            retire(&client).await;
         }
     }
 
     /// Kill and reap every child (also happens via kill_on_drop on exit).
     pub async fn shutdown(&self) {
-        for (_, client) in self.inner.lock().await.drain() {
-            let _ = client.child.lock().await.kill().await;
+        let clients: Vec<_> = self.inner.lock().await.drain().collect();
+        for (_, client) in clients {
+            retire(&client).await;
         }
     }
+}
+
+/// Kill a connection, then account its sub-agents' final rollouts and close their held executions.
+async fn retire(client: &CodexClient) {
+    let _ = client.child.lock().await.kill().await;
+    crate::local::harness::codex::flush_late_usage(client, true).await;
 }
 
 #[cfg(test)]

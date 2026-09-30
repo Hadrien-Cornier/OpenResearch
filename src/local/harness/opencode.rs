@@ -1599,7 +1599,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         None => native_store::prepare_opencode(store)?,
     };
     if binary.protocol == crate::local::opencode::Protocol::V2 {
-        return v2::run_turn(ctx, store, binary, database).await;
+        let result = v2::run_turn(ctx, store, binary, database).await;
+        ctx.host.opencode.untrack(&ctx.session_id);
+        return result;
     }
     let (native_id, base, events) =
         opencode_pre_accept_setup(ctx, store, &binary, &database).await?;
@@ -1625,6 +1627,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         body["variant"] = json!(variant);
     }
     let turn_started_at = crate::store::now_ms();
+    track_turn(ctx, &native_id, turn_started_at);
     let send = ctx
         .http()
         .post(format!("{base}/session/{native_id}/message"))
@@ -1644,81 +1647,783 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     // Native plan exit is an ordinary `question.asked`; connect it to the
     // preceding `plan_exit` tool through the question's `tool.callID`.
     let mut plan_exit_calls: HashSet<String> = HashSet::new();
+    let mut tree = TreeState::default();
     let mut buf = String::new();
 
-    loop {
-        tokio::select! {
-            chunk = stream.next() => {
-                let Some(chunk) = chunk else {
-                    return Err(anyhow!("opencode event stream ended mid-turn"));
-                };
-                buf.push_str(&String::from_utf8_lossy(&chunk?));
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].trim().to_string();
-                    buf.drain(..=pos);
-                    let Some(data) = line.strip_prefix("data: ") else { continue };
-                    let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
-                    if let Some(part) = event
-                        .get("properties")
-                        .and_then(|props| props.get("part"))
-                        .filter(|part| {
-                            part.get("sessionID").and_then(Value::as_str) == Some(native_id.as_str())
-                                && part.get("type").and_then(Value::as_str) == Some("tool")
-                                && part.get("tool").and_then(Value::as_str) == Some("plan_exit")
-                        })
-                    {
-                        if let Some(call_id) = part.get("callID").and_then(Value::as_str) {
-                            plan_exit_calls.insert(call_id.to_string());
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                chunk = stream.next() => {
+                    let Some(chunk) = chunk else {
+                        return Err(anyhow!("opencode event stream ended mid-turn"));
+                    };
+                    buf.push_str(&String::from_utf8_lossy(&chunk?));
+                    while let Some(pos) = buf.find('\n') {
+                        let line = buf[..pos].trim().to_string();
+                        buf.drain(..=pos);
+                        let Some(data) = line.strip_prefix("data: ") else { continue };
+                        let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
+                        if let Some(part) = event
+                            .get("properties")
+                            .and_then(|props| props.get("part"))
+                            .filter(|part| {
+                                part.get("sessionID").and_then(Value::as_str) == Some(native_id.as_str())
+                                    && part.get("type").and_then(Value::as_str) == Some("tool")
+                                    && part.get("tool").and_then(Value::as_str) == Some("plan_exit")
+                            })
+                        {
+                            if let Some(call_id) = part.get("callID").and_then(Value::as_str) {
+                                plan_exit_calls.insert(call_id.to_string());
+                            }
+                        }
+                        // Interactive prompts (permission/question) pause the turn and
+                        // are handled async (emit a card, or auto-reply per mode); all
+                        // other events are message/part updates handled synchronously.
+                        if !handle_prompt_event(
+                            ctx,
+                            &native_id,
+                            &base,
+                            &event,
+                            &plan_exit_calls,
+                        )
+                        .await?
+                        {
+                            handle_event(ctx, &native_id, &event, &mut assistant_msgs, &mut sub_sessions, &mut tree);
                         }
                     }
-                    // Interactive prompts (permission/question) pause the turn and
-                    // are handled async (emit a card, or auto-reply per mode); all
-                    // other events are message/part updates handled synchronously.
-                    if !handle_prompt_event(
-                        ctx,
-                        &native_id,
-                        &base,
-                        &event,
-                        &plan_exit_calls,
-                    )
-                    .await?
-                    {
-                        handle_event(ctx, &native_id, &event, &mut assistant_msgs, &mut sub_sessions);
+                }
+                resp = &mut send => {
+                    // Turn done — the response body is the final assistant message;
+                    // merge its parts as the authoritative versions.
+                    let resp = resp?.error_for_status()?;
+                    ctx.mark_delivery(DeliveryState::Accepted);
+                    let message = resp.json::<Value>().await?;
+                    if let Some(error) = opencode_response_error(&message) {
+                        ctx.mark_native_retry_exhausted();
+                        ctx.mark_terminal_failure("opencode_terminal", error);
+                        return Err(anyhow!("{error}"));
                     }
-                }
-            }
-            resp = &mut send => {
-                // Turn done — the response body is the final assistant message;
-                // merge its parts as the authoritative versions.
-                let resp = resp?.error_for_status()?;
-                ctx.mark_delivery(DeliveryState::Accepted);
-                let message = resp.json::<Value>().await?;
-                if let Some(error) = opencode_response_error(&message) {
-                    ctx.mark_native_retry_exhausted();
-                    ctx.mark_terminal_failure("opencode_terminal", error);
-                    return Err(anyhow!("{error}"));
-                }
-                ctx.clear_retry_status();
-                if !opencode_response_is_current(&message, turn_started_at) {
-                    let message = "OpenCode returned an earlier assistant message instead of replying to this turn. Update OpenCode or start a new chat.";
-                    ctx.mark_terminal_failure("opencode_stale_response", message);
-                    return Err(anyhow!(message));
-                }
-                if let Some(parts) = message.get("parts").and_then(Value::as_array) {
-                    for part in parts {
-                        if let Some(wire) = to_wire_part(part) {
-                            // Preserve children: the final `task` part carries
-                            // none, but its row already streamed the sub-agent
-                            // transcript into `children`.
-                            ctx.upsert_part_preserving_children(wire);
+                    ctx.clear_retry_status();
+                    if !opencode_response_is_current(&message, turn_started_at) {
+                        let message = "OpenCode returned an earlier assistant message instead of replying to this turn. Update OpenCode or start a new chat.";
+                        ctx.mark_terminal_failure("opencode_stale_response", message);
+                        return Err(anyhow!(message));
+                    }
+                    if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+                        for part in parts {
+                            if let Some(wire) = to_wire_part(part) {
+                                // Preserve children: the final `task` part carries
+                                // none, but its row already streamed the sub-agent
+                                // transcript into `children`.
+                                ctx.upsert_part_preserving_children(wire);
+                            }
                         }
+                        ctx.mark_final_text_tail();
                     }
-                    ctx.mark_final_text_tail();
+                    return Ok(());
                 }
-                return Ok(());
             }
         }
     }
+    .await;
+    let captured = capture_v1(
+        &*ctx,
+        ctx.http(),
+        &base,
+        vec![(native_id.clone(), None)],
+        turn_started_at,
+    )
+    .await;
+    ctx.host.opencode.untrack(&ctx.session_id);
+    if let Some(sink) = (!captured.background.is_empty())
+        .then(|| hold_execution(ctx, &native_id, turn_started_at, json!(captured.background)))
+        .flatten()
+    {
+        let http = ctx.http().clone();
+        let native = native_id.clone();
+        tokio::spawn(async move {
+            watch_v1_background(
+                &sink,
+                &http,
+                &base,
+                &native,
+                &captured.background,
+                turn_started_at,
+            )
+            .await;
+            sink.release();
+        });
+    }
+    result
+}
+
+/// Records this turn's steps and tool invokers from native history, descending into every
+/// subagent session a `task` part names (grandchildren included). Runs after the live stream,
+/// which can miss the final events, after an interrupt dropped the turn, and for background
+/// subagents that outlive it. `roots` pairs each session with the `WirePart.id` of the task part
+/// that spawned it (`None` for the chat's own session).
+async fn capture_v1(
+    sink: &impl UsageSink,
+    http: &reqwest::Client,
+    base: &str,
+    roots: Vec<(String, Option<String>)>,
+    started_at: i64,
+) -> V1Capture {
+    let mut pending = roots;
+    let mut captured = V1Capture::default();
+    let mut tree = TreeState::default();
+    while let Some((session, spawn)) = pending.pop() {
+        // A model-chosen `task_id` can resume any session, even an ancestor.
+        if !captured.visited.insert(session.clone()) {
+            continue;
+        }
+        let request = http.get(format!("{base}/session/{session}/message")).send();
+        let messages = match tokio::time::timeout(Duration::from_secs(10), async {
+            request.await?.error_for_status()?.json::<Value>().await
+        })
+        .await
+        {
+            Ok(Ok(messages)) => messages,
+            Ok(Err(error)) => {
+                eprintln!("orx up: could not reconcile OpenCode usage for {session}: {error}");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("orx up: timed out reconciling OpenCode usage for {session}");
+                continue;
+            }
+        };
+        let deliveries = v1_deliveries(&messages);
+        for message in v1_turn_messages(&messages, started_at) {
+            // A run a background result woke natively belongs to the execution owning that subagent.
+            let woken_by = v1_woken_by(message, &deliveries);
+            if woken_by.is_some_and(|child| !captured.background.iter().any(|(bg, _)| bg == child))
+            {
+                continue;
+            }
+            let identity = v1_identity(&message["info"]).map(|(_, identity)| identity);
+            for part in message["parts"].as_array().into_iter().flatten() {
+                if woken_by.is_some() {
+                    if let Some(wire) = to_wire_part(part).filter(|wire| wire.kind == "tool") {
+                        sink.tool_evidence(&wire);
+                    }
+                }
+                let Some(id) = part.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let wire = match &spawn {
+                    Some(spawn) => format!("{spawn}:{id}"),
+                    None => id.to_string(),
+                };
+                if let Some(child) = task_session(part) {
+                    if part.pointer("/state/metadata/background") == Some(&json!(true)) {
+                        captured
+                            .background
+                            .push((child.to_string(), Some(wire.clone())));
+                    }
+                    pending.push((child.to_string(), Some(wire.clone())));
+                }
+                record_v1_part(
+                    sink,
+                    part,
+                    identity.as_ref(),
+                    Some(wire),
+                    spawn.is_some(),
+                    &mut tree,
+                );
+            }
+        }
+    }
+    captured
+}
+
+#[derive(Default)]
+struct V1Capture {
+    visited: HashSet<String>,
+    /// Background subagents this turn spawned, which can outlive it.
+    background: Vec<(String, Option<String>)>,
+}
+
+/// Keeps capturing background subagents after their turn ended, and the parent runs their results
+/// natively wake with no app turn, until nothing is busy and each result was delivered (native
+/// `GET /session/status` lists only non-idle sessions).
+async fn watch_v1_background(
+    sink: &impl UsageSink,
+    http: &reqwest::Client,
+    base: &str,
+    native_id: &str,
+    roots: &[(String, Option<String>)],
+    started_at: i64,
+) {
+    let mut roots = roots.to_vec();
+    let mut owned: HashSet<String> = roots.iter().map(|(child, _)| child.clone()).collect();
+    let mut delivered = HashSet::new();
+    let mut waited = 0;
+    loop {
+        // Read before capturing, so a session idle here has persisted everything captured below.
+        let busy = match http.get(format!("{base}/session/status")).send().await {
+            Ok(response) => response.json::<Value>().await.ok(),
+            Err(_) => None,
+        };
+        let captured = capture_v1(sink, http, base, roots.clone(), started_at).await;
+        let (seen, spawned) =
+            capture_v1_continuations(sink, http, base, native_id, &owned, started_at).await;
+        delivered.extend(seen);
+        for (child, part, background) in spawned {
+            if background {
+                owned.insert(child.clone());
+            }
+            if !roots.iter().any(|(root, _)| *root == child) {
+                roots.push((child, Some(part)));
+            }
+        }
+        let active = busy.is_some_and(|busy| {
+            captured
+                .visited
+                .iter()
+                .map(String::as_str)
+                .chain([native_id])
+                .any(|session| busy.get(session).is_some())
+        });
+        let undelivered = owned.iter().any(|child| !delivered.contains(child));
+        if !active && (!undelivered || waited >= DELIVERY_GRACE_POLLS) {
+            break;
+        }
+        if !active {
+            waited += 1;
+        }
+        tokio::time::sleep(BACKGROUND_POLL).await;
+    }
+}
+
+/// How long an idle tree waits for a finished subagent's result to reach and wake its parent.
+const DELIVERY_GRACE_POLLS: usize = 15;
+
+/// The parent runs `owned` subagents' results woke: their steps, invokers and tool evidence (no
+/// transcript holds them), the results delivered so far, and subagents those runs spawned.
+async fn capture_v1_continuations(
+    sink: &impl UsageSink,
+    http: &reqwest::Client,
+    base: &str,
+    native_id: &str,
+    owned: &HashSet<String>,
+    started_at: i64,
+) -> (HashSet<String>, Vec<(String, String, bool)>) {
+    let Ok(Ok(messages)) = tokio::time::timeout(Duration::from_secs(10), async {
+        http.get(format!("{base}/session/{native_id}/message"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await
+    })
+    .await
+    else {
+        return Default::default();
+    };
+    let deliveries = v1_deliveries(&messages);
+    let delivered = deliveries
+        .values()
+        .filter(|child| owned.contains(*child))
+        .cloned()
+        .collect();
+    let mut spawned = Vec::new();
+    let mut tree = TreeState::default();
+    for message in v1_turn_messages(&messages, started_at) {
+        if !v1_woken_by(message, &deliveries).is_some_and(|child| owned.contains(child)) {
+            continue;
+        }
+        let identity = v1_identity(&message["info"]).map(|(_, identity)| identity);
+        for part in message["parts"].as_array().into_iter().flatten() {
+            let Some(id) = part.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(child) = task_session(part) {
+                let background = part.pointer("/state/metadata/background") == Some(&json!(true));
+                spawned.push((child.to_string(), id.to_string(), background));
+            }
+            if let Some(wire) = to_wire_part(part).filter(|wire| wire.kind == "tool") {
+                sink.tool_evidence(&wire);
+            }
+            record_v1_part(
+                sink,
+                part,
+                identity.as_ref(),
+                Some(id.to_string()),
+                false,
+                &mut tree,
+            );
+        }
+    }
+    (delivered, spawned)
+}
+
+/// Native background-result deliveries in a V1 listing: user message id → the subagent session its
+/// synthetic `<task id="…">` part reports.
+fn v1_deliveries(messages: &Value) -> HashMap<String, String> {
+    messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .filter_map(|message| {
+            let child = message["parts"]
+                .as_array()?
+                .iter()
+                .find_map(|part| v1_delivered_child(part))?;
+            Some((
+                message.pointer("/info/id")?.as_str()?.to_string(),
+                child.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn v1_delivered_child(part: &Value) -> Option<&str> {
+    if part.get("synthetic").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let rest = part.get("text")?.as_str()?.strip_prefix("<task id=\"")?;
+    rest.split_once('"').map(|(child, _)| child)
+}
+
+/// The subagent whose delivered result woke this assistant message, if one did.
+fn v1_woken_by<'a>(message: &Value, deliveries: &'a HashMap<String, String>) -> Option<&'a str> {
+    deliveries
+        .get(message.pointer("/info/parentID")?.as_str()?)
+        .map(String::as_str)
+}
+
+const BACKGROUND_POLL: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(2)
+};
+
+/// Assistant messages this turn created, in a native `GET /session/{id}/message` listing.
+fn v1_turn_messages(messages: &Value, started_at: i64) -> impl Iterator<Item = &Value> {
+    messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(move |message| {
+            message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .pointer("/info/time/created")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|created| created >= started_at)
+        })
+}
+
+/// The native model OpenCode ran an assistant message on (`modelID`/`providerID`).
+fn v1_identity(info: &Value) -> Option<(String, crate::store::InvocationIdentity)> {
+    Some((
+        info.get("id")?.as_str()?.to_string(),
+        crate::store::InvocationIdentity {
+            harness: "opencode".into(),
+            model: info.get("modelID")?.as_str()?.to_string(),
+            provider: Some(info.get("providerID")?.as_str()?.to_string()),
+        },
+    ))
+}
+
+/// The `WirePart.id` a native tool part is stored under, if it is in the transcript.
+fn v1_tool_part_id(
+    part: &Value,
+    native_id: &str,
+    sub_sessions: &HashMap<String, String>,
+) -> Option<String> {
+    let id = part.get("id")?.as_str()?;
+    let session = part.get("sessionID")?.as_str()?;
+    if session == native_id {
+        Some(id.to_string())
+    } else {
+        sub_sessions
+            .get(session)
+            .map(|spawn| format!("{spawn}:{id}"))
+    }
+}
+
+/// The usage sample a V1 part proves. A `step-start` means the provider began streaming a request;
+/// its `step-finish` carries that request's tokens under the same sample id, so a request that never
+/// finishes (cancel, error, a native retry) stays a known request without counters.
+fn v1_step_sample(
+    part: &Value,
+    identity: Option<&crate::store::InvocationIdentity>,
+    child: bool,
+    steps: &mut HashMap<String, String>,
+) -> Option<(
+    String,
+    crate::store::Attribution,
+    crate::store::TokenUsage,
+    bool,
+)> {
+    let attribution = crate::store::Attribution::native(
+        "opencode",
+        identity.map(|identity| identity.model.as_str()),
+        identity.and_then(|identity| identity.provider.as_deref()),
+        opencode_missing(child),
+    );
+    let id = part.get("id")?.as_str()?;
+    let message = part.get("messageID")?.as_str()?;
+    match part.get("type").and_then(Value::as_str)? {
+        "step-start" => {
+            steps.insert(message.to_string(), id.to_string());
+            Some((
+                id.to_string(),
+                attribution,
+                crate::store::TokenUsage::default(),
+                false,
+            ))
+        }
+        "step-finish" => {
+            let (usage, complete) = opencode_sample(Some(part.get("tokens")?));
+            // Part ids ascend, so a message's latest step-start is this step's.
+            let step = steps.get(message).map_or(id, String::as_str);
+            Some((step.to_string(), attribution, usage, complete))
+        }
+        _ => None,
+    }
+}
+
+fn record_v1_part(
+    sink: &impl UsageSink,
+    part: &Value,
+    identity: Option<&crate::store::InvocationIdentity>,
+    tool_part: Option<String>,
+    child: bool,
+    tree: &mut TreeState,
+) {
+    if let Some((sample, attribution, usage, complete)) =
+        v1_step_sample(part, identity, child, &mut tree.steps)
+    {
+        sink.sample(&sample, attribution, usage, complete);
+    }
+    if let (Some(tool_part), Some(identity)) = (tool_part, identity) {
+        if part.get("type").and_then(Value::as_str) == Some("tool")
+            && tree.invokers.insert(tool_part.clone())
+        {
+            sink.invoker(&tool_part, &identity.model, identity.provider.as_deref());
+        }
+    }
+}
+
+/// The subagent session a V1 `task` part ran (also a resumed `task_id`, which gets no
+/// `session.created`).
+fn task_session(part: &Value) -> Option<&str> {
+    (part.get("tool").and_then(Value::as_str) == Some("task"))
+        .then(|| part.pointer("/state/metadata/sessionId")?.as_str())
+        .flatten()
+}
+
+/// V1 evidence already recorded, and each message's latest `step-start` part id.
+#[derive(Default)]
+struct TreeState {
+    invokers: HashSet<String>,
+    steps: HashMap<String, String>,
+    /// Live background-result deliveries (user message → subagent) and the runs they woke.
+    deliveries: HashMap<String, String>,
+    woken: HashMap<String, String>,
+}
+
+/// Destination for native usage evidence: the live turn, or its execution after an interrupt
+/// dropped the turn.
+pub(crate) trait UsageSink: Sync {
+    fn sample(
+        &self,
+        id: &str,
+        attribution: crate::store::Attribution,
+        usage: crate::store::TokenUsage,
+        complete: bool,
+    );
+    fn invoker(&self, part_id: &str, model: &str, provider: Option<&str>);
+    /// A tool part no transcript holds (a natively woken run): kept so a run it launched binds.
+    fn tool_evidence(&self, _part: &WirePart) {}
+}
+
+impl UsageSink for TurnCtx {
+    fn sample(
+        &self,
+        id: &str,
+        attribution: crate::store::Attribution,
+        usage: crate::store::TokenUsage,
+        complete: bool,
+    ) {
+        self.record_attributed_usage(id, attribution, usage, complete);
+    }
+
+    fn invoker(&self, part_id: &str, model: &str, provider: Option<&str>) {
+        self.record_tool_invoker(part_id, model, provider);
+    }
+}
+
+/// A turn's usage execution, written by [`capture_interrupted`] after the turn's future is gone.
+pub(crate) struct ExecutionSink {
+    execution_id: String,
+    session_id: String,
+}
+
+impl UsageSink for ExecutionSink {
+    fn sample(
+        &self,
+        id: &str,
+        attribution: crate::store::Attribution,
+        usage: crate::store::TokenUsage,
+        complete: bool,
+    ) {
+        if let Err(error) = crate::store::Store::open().and_then(|store| {
+            store.record_attributed_sample(
+                &self.execution_id,
+                id,
+                "opencode",
+                &attribution,
+                &usage,
+                complete,
+            )
+        }) {
+            eprintln!("orx up: could not persist interrupted OpenCode usage: {error}");
+        }
+    }
+
+    fn invoker(&self, part_id: &str, model: &str, provider: Option<&str>) {
+        let identity = crate::store::InvocationIdentity {
+            harness: "opencode".into(),
+            model: model.to_string(),
+            provider: provider.map(str::to_string),
+        };
+        if let Err(error) = crate::store::Store::open().and_then(|store| {
+            store.record_native_invocation(part_id, &identity, Some(&self.session_id))
+        }) {
+            eprintln!("orx up: could not capture interrupted OpenCode tool identity: {error}");
+        }
+    }
+
+    fn tool_evidence(&self, part: &WirePart) {
+        if let Err(error) = crate::store::Store::open().and_then(|store| {
+            store.set_native_scope(
+                &self.execution_id,
+                &format!("tool-part:{}", part.id),
+                &serde_json::to_value(part)?,
+            )
+        }) {
+            eprintln!("orx up: could not keep OpenCode tool evidence: {error}");
+        }
+    }
+}
+
+impl ExecutionSink {
+    /// Closes a held execution now if its turn already ended.
+    fn release(&self) {
+        if let Err(error) = crate::store::Store::open()
+            .and_then(|store| store.release_usage_execution(&self.execution_id))
+        {
+            eprintln!("orx up: could not release OpenCode usage: {error}");
+        }
+    }
+}
+
+fn execution_sink(ctx: &TurnCtx) -> Option<ExecutionSink> {
+    let execution_id = crate::store::Store::open()
+        .and_then(|store| store.open_usage_execution(&ctx.turn_id))
+        .ok()??;
+    Some(ExecutionSink {
+        execution_id,
+        session_id: ctx.session_id.clone(),
+    })
+}
+
+/// Holds this turn's execution open past the turn for background subagents; release it once they
+/// settle and the shared finalize closes it with the turn's outcome. The native scope lets a
+/// restart finish reading their history instead of closing on this process's last snapshot.
+fn hold_execution(
+    ctx: &TurnCtx,
+    native_id: &str,
+    started_at: i64,
+    roots: Value,
+) -> Option<ExecutionSink> {
+    let sink = execution_sink(ctx)?;
+    let store = crate::store::Store::open().ok()?;
+    if !store.hold_usage_execution(&sink.execution_id).ok()? {
+        return None;
+    }
+    let scope = json!({"session": ctx.session_id, "native": native_id, "startedAt": started_at, "roots": roots});
+    if let Err(error) = store.set_native_scope(&sink.execution_id, BACKGROUND_SCOPE, &scope) {
+        eprintln!("orx up: could not persist OpenCode background scope: {error}");
+    }
+    Some(sink)
+}
+
+const BACKGROUND_SCOPE: &str = "opencode-background";
+
+/// Held executions a dead process left, adopted at startup so recovery cannot close them before
+/// [`recover_adopted_background`] reads their native history.
+static ADOPTED: Mutex<Vec<(String, Value)>> = Mutex::new(Vec::new());
+
+pub(crate) fn adopt_orphaned_background(store: &crate::store::Store) -> Result<()> {
+    for (execution, _, scope, orphaned) in store.native_scopes(BACKGROUND_SCOPE)? {
+        if orphaned && store.hold_usage_execution(&execution)? {
+            ADOPTED
+                .lock()
+                .map_err(|_| anyhow!("OpenCode recovery lock failed"))?
+                .push((execution, scope));
+        }
+    }
+    Ok(())
+}
+
+/// Brings each adopted session's server back up, captures its background subagents and the parent
+/// runs their results woke from native history, then closes the execution.
+pub(crate) fn recover_adopted_background(agent: std::sync::Arc<crate::local::opencode::AgentHost>) {
+    let adopted = ADOPTED
+        .lock()
+        .map(|mut adopted| std::mem::take(&mut *adopted));
+    for (execution_id, scope) in adopted.unwrap_or_default() {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let sink = ExecutionSink {
+                execution_id,
+                session_id: scope["session"].as_str().unwrap_or_default().to_string(),
+            };
+            if let Err(error) = recover_background(&agent, &sink, &scope).await {
+                eprintln!("orx up: could not recover OpenCode background usage: {error}");
+            }
+            sink.release();
+        });
+    }
+}
+
+async fn recover_background(
+    agent: &crate::local::opencode::AgentHost,
+    sink: &ExecutionSink,
+    scope: &Value,
+) -> Result<()> {
+    let (Some(native_id), Some(started_at)) =
+        (scope["native"].as_str(), scope["startedAt"].as_i64())
+    else {
+        return Err(anyhow!("invalid OpenCode background scope"));
+    };
+    let store = crate::store::Store::open()?;
+    let session = store
+        .get_chat_session(&sink.session_id)?
+        .ok_or_else(|| anyhow!("chat session no longer exists"))?;
+    let project = store
+        .get_local_project(&session.project_id)?
+        .ok_or_else(|| anyhow!("project no longer exists"))?;
+    let native = native_id.to_string();
+    let native_session =
+        tokio::task::spawn_blocking(move || native_store::opencode_session(&native))
+            .await
+            .map_err(|error| anyhow!("OpenCode session lookup failed: {error}"))??
+            .ok_or_else(|| anyhow!("OpenCode session {native_id} no longer exists"))?;
+    let binary = crate::local::opencode::resolve_binary().await?;
+    let protocol = binary.protocol;
+    agent
+        .ensure(
+            &project,
+            &sink.session_id,
+            None,
+            crate::local::opencode::ResolvedRuntime {
+                binary,
+                database: native_session.path,
+                store: native_session.store,
+            },
+            tokio::sync::watch::channel(String::new()).0,
+        )
+        .await?;
+    let endpoint = agent
+        .endpoint_for(&sink.session_id)
+        .await
+        .ok_or_else(|| anyhow!("OpenCode did not start"))?;
+    let roots = scope["roots"].as_array().cloned().unwrap_or_default();
+    let pair = |root: &Value| -> Option<(String, Value)> {
+        Some((root.get(0)?.as_str()?.to_string(), root.get(1)?.clone()))
+    };
+    if protocol == crate::local::opencode::Protocol::V2 {
+        let roots: Vec<(String, String)> = roots
+            .iter()
+            .filter_map(pair)
+            .filter_map(|(child, parent)| Some((child, parent.as_str()?.to_string())))
+            .collect();
+        v2::watch_background(sink, &endpoint, native_id, &roots, started_at).await;
+    } else {
+        let roots: Vec<(String, Option<String>)> = roots
+            .iter()
+            .filter_map(pair)
+            .map(|(child, spawn)| (child, spawn.as_str().map(str::to_string)))
+            .collect();
+        watch_v1_background(
+            sink,
+            &endpoint.client,
+            &endpoint.base_url,
+            native_id,
+            &roots,
+            started_at,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// What an interrupt needs to capture the turn it aborts, held by the session's `AgentHost`.
+pub(crate) struct TrackedTurn {
+    pub(crate) native_id: String,
+    started_at: i64,
+    sink: ExecutionSink,
+}
+
+fn track_turn(ctx: &TurnCtx, native_id: &str, started_at: i64) {
+    if let Some(sink) = execution_sink(ctx) {
+        ctx.host.opencode.track(
+            &ctx.session_id,
+            TrackedTurn {
+                native_id: native_id.to_string(),
+                started_at,
+                sink,
+            },
+        );
+    }
+}
+
+/// Captures an interrupted turn's native evidence before the shared interrupt finalizes its usage.
+/// V1 abort persists synchronously and cascades to every subagent; V2 settles asynchronously.
+pub(crate) async fn capture_interrupted(
+    endpoint: &crate::local::opencode::AgentEndpoint,
+    turn: &TrackedTurn,
+) {
+    match endpoint.protocol {
+        crate::local::opencode::Protocol::V1 => {
+            capture_v1(
+                &turn.sink,
+                &endpoint.client,
+                &endpoint.base_url,
+                vec![(turn.native_id.clone(), None)],
+                turn.started_at,
+            )
+            .await;
+        }
+        crate::local::opencode::Protocol::V2 => {
+            v2::capture_interrupted(endpoint, &turn.sink, &turn.native_id, turn.started_at).await
+        }
+    }
+}
+
+/// An unidentified sub-agent never inherits its parent's model.
+fn opencode_missing(child: bool) -> crate::store::Missing {
+    if child {
+        crate::store::Missing::ChildModelUnknown
+    } else {
+        crate::store::Missing::IdentityNotReported
+    }
+}
+
+/// Native `tokens` as a sample that is complete when it measures the request's input and output.
+fn opencode_sample(tokens: Option<&Value>) -> (crate::store::TokenUsage, bool) {
+    let usage = tokens
+        .filter(|tokens| !tokens.is_null())
+        .map(opencode_native_usage)
+        .unwrap_or_default();
+    let complete = usage.input_tokens.is_some() && usage.output_tokens.is_some();
+    (usage, complete)
 }
 
 fn opencode_response_error(message: &Value) -> Option<&str> {
@@ -1794,6 +2499,7 @@ fn handle_event(
     event: &Value,
     assistant_msgs: &mut HashSet<String>,
     sub_sessions: &mut HashMap<String, String>,
+    tree: &mut TreeState,
 ) {
     let props = event.get("properties").unwrap_or(&Value::Null);
     match event.get("type").and_then(Value::as_str) {
@@ -1877,22 +2583,21 @@ fn handle_event(
                     assistant_msgs.insert(id.to_string());
                 }
             }
+            if session == Some(native_id) {
+                if let (Some(id), Some(child)) = (
+                    info.get("id").and_then(Value::as_str),
+                    info.get("parentID")
+                        .and_then(Value::as_str)
+                        .and_then(|parent| tree.deliveries.get(parent)),
+                ) {
+                    tree.woken.insert(id.to_string(), child.clone());
+                }
+            }
             let accountable = session == Some(native_id)
                 || session.is_some_and(|session| ctx.native_usage_scopes.contains(session));
             if accountable && info.get("role").and_then(Value::as_str) == Some("assistant") {
-                if let (Some(id), Some(model), Some(provider)) = (
-                    info.get("id").and_then(Value::as_str),
-                    info.get("modelID").and_then(Value::as_str),
-                    info.get("providerID").and_then(Value::as_str),
-                ) {
-                    ctx.native_message_models.insert(
-                        id.to_string(),
-                        crate::store::InvocationIdentity {
-                            harness: "opencode".into(),
-                            model: model.to_string(),
-                            provider: Some(provider.to_string()),
-                        },
-                    );
+                if let Some((id, identity)) = v1_identity(info) {
+                    ctx.native_message_models.insert(id, identity);
                 }
             }
             // Only the MAIN session's tokens drive the context meter; a
@@ -1917,22 +2622,37 @@ fn handle_event(
                 .get("messageID")
                 .and_then(Value::as_str)
                 .is_some_and(|mid| assistant_msgs.contains(mid));
-            if (session == Some(native_id)
-                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session)))
-                && part.get("type").and_then(Value::as_str) == Some("step-finish")
+            if session == Some(native_id)
+                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session))
             {
-                if let (Some(id), Some(tokens)) =
-                    (part.get("id").and_then(Value::as_str), part.get("tokens"))
-                {
-                    let identity = part
-                        .get("messageID")
-                        .and_then(Value::as_str)
-                        .and_then(|id| ctx.native_message_models.get(id));
-                    ctx.record_native_usage(
-                        id,
-                        identity.map(|i| i.model.as_str()),
-                        identity.and_then(|i| i.provider.as_deref()),
-                        opencode_native_usage(tokens),
+                let tool_part = v1_tool_part_id(part, native_id, sub_sessions);
+                if let Some(child) = task_session(part) {
+                    ctx.native_usage_scopes.insert(child.to_string());
+                    // A grandchild nests under its parent's task row.
+                    if let Some(spawn) = &tool_part {
+                        sub_sessions
+                            .entry(child.to_string())
+                            .or_insert_with(|| spawn.clone());
+                    }
+                }
+                let message = part.get("messageID").and_then(Value::as_str);
+                if let (Some(message), Some(child)) = (message, v1_delivered_child(part)) {
+                    tree.deliveries
+                        .insert(message.to_string(), child.to_string());
+                }
+                // Another execution's subagent result woke this run; that execution accounts it.
+                let foreign = message
+                    .and_then(|message| tree.woken.get(message))
+                    .is_some_and(|child| !ctx.native_usage_scopes.contains(child));
+                let identity = message.and_then(|id| ctx.native_message_models.get(id));
+                if !foreign {
+                    record_v1_part(
+                        &*ctx,
+                        part,
+                        identity,
+                        tool_part,
+                        session != Some(native_id),
+                        tree,
                     );
                 }
             }
@@ -2228,6 +2948,7 @@ opencode/unknown
             &json!({"type":"message.part.updated","properties":{"part":{"id":"finish","messageID":"message","sessionID":"session","type":"step-finish","reason":"stop"}}}),
             &mut messages,
             &mut HashMap::new(),
+            &mut TreeState::default(),
         );
         assert_eq!(
             ctx.assistant.parts[0].phase,
@@ -2562,7 +3283,14 @@ opencode/unknown
                 "tokens": { "input": 1200, "output": 340, "reasoning": 50, "cache": { "read": 8000, "write": 200 } }
             }}
         });
-        handle_event(&mut ctx, "ses_x", &event, &mut msgs, &mut HashMap::new());
+        handle_event(
+            &mut ctx,
+            "ses_x",
+            &event,
+            &mut msgs,
+            &mut HashMap::new(),
+            &mut TreeState::default(),
+        );
         let usage = ctx.context_usage.expect("usage reported");
         assert_eq!(usage.used_tokens, 1200 + 340 + 50 + 8000 + 200);
         assert_eq!(usage.context_window, None);
@@ -2583,6 +3311,7 @@ opencode/unknown
             &no_tokens,
             &mut msgs,
             &mut HashMap::new(),
+            &mut TreeState::default(),
         );
         assert!(ctx.context_usage.is_none());
         // All-zero placeholder tokens must also be ignored.
@@ -2597,6 +3326,7 @@ opencode/unknown
             &zero_tokens,
             &mut msgs,
             &mut HashMap::new(),
+            &mut TreeState::default(),
         );
         assert!(ctx.context_usage.is_none());
     }
@@ -2614,7 +3344,14 @@ opencode/unknown
             json!({"type":"message.updated","properties":{"info":{"id":"answer","sessionID":"ses_x","role":"assistant"}}}),
             json!({"type":"message.part.updated","properties":{"part":{"id":"answer_text","messageID":"answer","sessionID":"ses_x","type":"text","text":"Run finished"}}}),
         ] {
-            handle_event(&mut ctx, "ses_x", &event, &mut messages, &mut sessions);
+            handle_event(
+                &mut ctx,
+                "ses_x",
+                &event,
+                &mut messages,
+                &mut sessions,
+                &mut TreeState::default(),
+            );
         }
         assert_eq!(ctx.delivery_state(), DeliveryState::Accepted);
         assert_eq!(ctx.assistant.parts.len(), 1);
@@ -2694,6 +3431,7 @@ opencode/unknown
             &json!({"type":"session.status","properties":{"sessionID":"ses_x","status":{"type":"idle"}}}),
             &mut messages,
             &mut sessions,
+            &mut TreeState::default(),
         );
         assert_eq!(ctx.delivery_state(), DeliveryState::Unknown);
         handle_event(
@@ -2702,6 +3440,7 @@ opencode/unknown
             &json!({"type":"session.status","properties":{"sessionID":"ses_x","status":{"type":"retry","attempt":1}}}),
             &mut messages,
             &mut sessions,
+            &mut TreeState::default(),
         );
         assert_eq!(ctx.delivery_state(), DeliveryState::Accepted);
     }
@@ -2721,6 +3460,7 @@ opencode/unknown
             &json!({"type":"message.updated","properties":{"info":{"id":"msg_1","sessionID":"ses_main","role":"assistant"}}}),
             &mut msgs,
             &mut subs,
+            &mut TreeState::default(),
         );
         handle_event(
             &mut ctx,
@@ -2730,6 +3470,7 @@ opencode/unknown
                 "state":{"status":"running","input":{"description":"analyze"}}}}}),
             &mut msgs,
             &mut subs,
+            &mut TreeState::default(),
         );
         // opencode announces the spawned child session (parentID = our session).
         handle_event(
@@ -2738,6 +3479,7 @@ opencode/unknown
             &json!({"type":"session.created","properties":{"info":{"id":"ses_child","parentID":"ses_main"}}}),
             &mut msgs,
             &mut subs,
+            &mut TreeState::default(),
         );
         assert_eq!(subs.get("ses_child").map(String::as_str), Some("prt_task"));
         handle_event(
@@ -2746,6 +3488,7 @@ opencode/unknown
             &json!({"type":"session.created","properties":{"info":{"id":"ses_grandchild","parentID":"ses_child"}}}),
             &mut msgs,
             &mut subs,
+            &mut TreeState::default(),
         );
         handle_event(
             &mut ctx,
@@ -2753,6 +3496,7 @@ opencode/unknown
             &json!({"type":"message.updated","properties":{"info":{"id":"msg_grandchild","sessionID":"ses_grandchild","role":"assistant","modelID":"child-model","providerID":"fixture"}}}),
             &mut msgs,
             &mut subs,
+            &mut TreeState::default(),
         );
         assert!(ctx.native_usage_scopes.contains("ses_grandchild"));
         assert_eq!(
@@ -2766,6 +3510,7 @@ opencode/unknown
             &json!({"type":"message.updated","properties":{"info":{"id":"msg_c","sessionID":"ses_child","role":"assistant"}}}),
             &mut msgs,
             &mut subs,
+            &mut TreeState::default(),
         );
         handle_event(
             &mut ctx,
@@ -2775,6 +3520,7 @@ opencode/unknown
                 "state":{"status":"completed","input":{"command":"ls"},"output":"a.rs"}}}}),
             &mut msgs,
             &mut subs,
+            &mut TreeState::default(),
         );
         // Only the task row is top-level; the sub bash nested under it (namespaced).
         assert_eq!(ctx.assistant.parts.len(), 1, "{:?}", ctx.assistant.parts);
@@ -2804,6 +3550,498 @@ opencode/unknown
         let task = &ctx.assistant.parts[0];
         assert_eq!(task.state.as_ref().unwrap().status, "completed");
         assert_eq!(task.children.len(), 1, "children survive the final merge");
+    }
+
+    /// Native evidence as the store keeps it: an identity-only write never erases counters.
+    #[derive(Default)]
+    pub(super) struct Recorded {
+        pub(super) samples:
+            Mutex<HashMap<String, (crate::store::Attribution, crate::store::TokenUsage, bool)>>,
+        pub(super) invokers: Mutex<HashMap<String, String>>,
+        pub(super) evidence: Mutex<Vec<WirePart>>,
+    }
+
+    impl UsageSink for Recorded {
+        fn sample(
+            &self,
+            id: &str,
+            attribution: crate::store::Attribution,
+            usage: crate::store::TokenUsage,
+            complete: bool,
+        ) {
+            let mut samples = self.samples.lock().unwrap();
+            let entry = samples.entry(id.to_string()).or_insert((
+                attribution.clone(),
+                usage.clone(),
+                complete,
+            ));
+            entry.0 = attribution;
+            if usage != crate::store::TokenUsage::default() {
+                (entry.1, entry.2) = (usage, complete);
+            }
+        }
+
+        fn invoker(&self, part_id: &str, model: &str, _: Option<&str>) {
+            self.invokers
+                .lock()
+                .unwrap()
+                .insert(part_id.to_string(), model.to_string());
+        }
+
+        fn tool_evidence(&self, part: &WirePart) {
+            self.evidence.lock().unwrap().push(part.clone());
+        }
+    }
+
+    /// A hold a dead process left (background subagents still to read) is adopted at startup, so
+    /// generic recovery cannot close it on that process's last snapshot before its native history
+    /// is captured; its scope carries what recovery needs.
+    #[test]
+    fn orphaned_background_holds_are_adopted_not_closed_at_startup() {
+        let dir = std::env::temp_dir().join(format!("orx-oc-adopt-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::Store::open_at(dir.clone()).unwrap();
+        let db = rusqlite::Connection::open(dir.join("orx.db")).unwrap();
+        db.execute_batch("INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('turn', 'session', 'message', 'c', 'h', '', '{}', 'completed', 'accepted', 1, 1);").unwrap();
+        store
+            .begin_usage_execution("exec", "turn", "opencode")
+            .unwrap();
+        store.hold_usage_execution("exec").unwrap();
+        store.finalize_turn_usage("turn", "done").unwrap();
+        let scope = json!({"session":"session","native":"ses_main","startedAt":100,"roots":[["ses_bg","prt_task"]]});
+        store
+            .set_native_scope("exec", BACKGROUND_SCOPE, &scope)
+            .unwrap();
+        db.execute(
+            "UPDATE chat_usage_executions SET held_by = 'dead-process'",
+            [],
+        )
+        .unwrap();
+        adopt_orphaned_background(&store).unwrap();
+        store.recover_terminal_usage().unwrap();
+        let outcome: Option<String> = db
+            .query_row("SELECT outcome FROM chat_usage_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(outcome, None, "kept open for native recovery");
+        let adopted = std::mem::take(&mut *ADOPTED.lock().unwrap());
+        assert_eq!(adopted, [("exec".to_string(), scope)]);
+        // Recovery releases it after capture: it then closes with the turn's own outcome.
+        store.release_usage_execution("exec").unwrap();
+        let outcome: Option<String> = db
+            .query_row("SELECT outcome FROM chat_usage_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(outcome.as_deref(), Some("done"));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Live V1 1.18.33 shape (oc-research v1probe): a background task's result is delivered as a
+    /// synthetic `<task id=…>` user message that natively wakes the parent with no app turn. That
+    /// run, its tool and its printed run id belong to the turn that spawned the task; a later app
+    /// turn listing the same history never accounts it.
+    #[tokio::test]
+    async fn v1_woken_parent_run_belongs_to_the_turn_that_spawned_its_task() {
+        use axum::{extract::Path, routing::get, Json, Router};
+        let step = |message: &str, part: &str, tokens: Option<Value>| {
+            let mut finish = json!({"id":format!("{part}_f"),"messageID":message,"sessionID":"ses_main","type":"step-finish"});
+            if let Some(tokens) = tokens {
+                finish["tokens"] = tokens;
+            }
+            vec![
+                json!({"id":format!("{part}_s"),"messageID":message,"sessionID":"ses_main","type":"step-start"}),
+                finish,
+            ]
+        };
+        let tokens = json!({"input":5,"output":2,"reasoning":0,"cache":{"read":0,"write":0}});
+        let assistant = |id: &str, parent: &str, created: i64, parts: Vec<Value>| {
+            json!({"info":{"id":id,"sessionID":"ses_main","role":"assistant","parentID":parent,
+                "modelID":"big-pickle","providerID":"opencode","time":{"created":created}},"parts":parts})
+        };
+        let mut spawn = step("msg_turn", "prt_turn", Some(tokens.clone()));
+        spawn.push(json!({"id":"prt_task","messageID":"msg_turn","sessionID":"ses_main","type":"tool","tool":"task",
+            "state":{"status":"completed","metadata":{"sessionId":"ses_bg","background":true}}}));
+        let mut woken = step("msg_woken", "prt_woken", Some(tokens.clone()));
+        woken.push(json!({"id":"prt_bash","messageID":"msg_woken","sessionID":"ses_main","type":"tool","tool":"bash",
+            "state":{"status":"completed","input":{"command":"orx exp run exp"},"output":"  run  7c1a\n"}}));
+        let main = json!([
+            {"info":{"id":"msg_user","sessionID":"ses_main","role":"user","time":{"created":100}},"parts":[]},
+            assistant("msg_turn", "msg_user", 101, spawn),
+            {"info":{"id":"msg_delivery","sessionID":"ses_main","role":"user","time":{"created":200}},
+                "parts":[{"id":"prt_d","type":"text","synthetic":true,
+                    "text":"<task id=\"ses_bg\" state=\"completed\">\n<summary>done</summary>"}]},
+            assistant("msg_woken", "msg_delivery", 201, woken),
+            {"info":{"id":"msg_later","sessionID":"ses_main","role":"user","time":{"created":300}},"parts":[]},
+            assistant("msg_next", "msg_later", 301, step("msg_next", "prt_next", Some(tokens))),
+        ]);
+        let background = json!([{"info":{"id":"msg_bg","sessionID":"ses_bg","role":"assistant","modelID":"bg-model",
+            "providerID":"p","time":{"created":150}},"parts":[
+            {"id":"prt_bg","messageID":"msg_bg","sessionID":"ses_bg","type":"step-start"}]}]);
+        let app = Router::new()
+            .route("/session/status", get(|| async { Json(json!({})) }))
+            .route(
+                "/session/{id}/message",
+                get(move |Path(id): Path<String>| {
+                    let listing = if id == "ses_bg" {
+                        background.clone()
+                    } else {
+                        main.clone()
+                    };
+                    async move { Json(listing) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+
+        // No later app turn: the held turn's watcher alone accounts the woken run.
+        let held = Recorded::default();
+        watch_v1_background(
+            &held,
+            &http,
+            &base,
+            "ses_main",
+            &[("ses_bg".to_string(), Some("prt_task".to_string()))],
+            100,
+        )
+        .await;
+        let samples = held.samples.into_inner().unwrap();
+        assert!(
+            samples["prt_woken_s"].2,
+            "woken run counted with its tokens"
+        );
+        assert!(samples.contains_key("prt_bg"));
+        assert!(
+            !samples.contains_key("prt_next_s"),
+            "a later turn's own step"
+        );
+        assert!(
+            !samples.contains_key("prt_turn_s"),
+            "the turn itself already counted it"
+        );
+        assert_eq!(
+            held.invokers.into_inner().unwrap()["prt_bash"],
+            "big-pickle"
+        );
+        let evidence = held.evidence.into_inner().unwrap();
+        assert_eq!(evidence[0].id, "prt_bash");
+        assert!(evidence[0]
+            .state
+            .as_ref()
+            .unwrap()
+            .output
+            .as_deref()
+            .unwrap()
+            .contains("7c1a"));
+
+        // The later app turn (started before the wake) never accounts the woken run.
+        let later = Recorded::default();
+        capture_v1(
+            &later,
+            &http,
+            &base,
+            vec![("ses_main".to_string(), None)],
+            150,
+        )
+        .await;
+        server.abort();
+        let samples = later.samples.into_inner().unwrap();
+        assert!(samples.contains_key("prt_next_s"));
+        assert!(!samples.contains_key("prt_woken_s"));
+    }
+
+    /// Replays a captured OpenCode 1.18.33 turn: bash, then a `task` subagent that runs bash.
+    #[test]
+    fn native_v1_turn_attributes_every_step_and_tool_to_its_own_message_model() {
+        use crate::store::{Attribution, Missing};
+        const MAIN: &str = "ses_f0c30aab3ffev2glu5jL6rRnqj";
+        const CHILD: &str = "ses_f0c30789cffe5d20g8AoPPYRBr";
+        const TASK: &str = "prt_0f3cf875e001Klz5seORXpbK4K";
+        let events: Vec<Value> = include_str!("fixtures/opencode-v1-turn-events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut ctx = TurnCtx::test_stub();
+        let (mut messages, mut subs, mut tree) =
+            (HashSet::new(), HashMap::new(), TreeState::default());
+        for event in &events {
+            handle_event(&mut ctx, MAIN, event, &mut messages, &mut subs, &mut tree);
+        }
+        assert_eq!(subs.get(CHILD).map(String::as_str), Some(TASK));
+        assert!(ctx.native_usage_scopes.contains(CHILD));
+        assert_eq!(
+            tree.invokers,
+            HashSet::from([
+                "prt_0f3cf7e3f001MTz4d5J06KbOBZ".to_string(),
+                TASK.to_string(),
+                format!("{TASK}:prt_0f3cf9941001wZ3V6C7leaXefR"),
+            ])
+        );
+        let recorded = Recorded::default();
+        let mut replay = TreeState::default();
+        for part in events
+            .iter()
+            .filter_map(|event| event.pointer("/properties/part"))
+        {
+            let identity = part["messageID"]
+                .as_str()
+                .and_then(|id| ctx.native_message_models.get(id));
+            record_v1_part(
+                &recorded,
+                part,
+                identity,
+                None,
+                part["sessionID"] != MAIN,
+                &mut replay,
+            );
+        }
+        // Five steps (three parent, two child): identity and tokens share one sample each.
+        let samples = recorded.samples.into_inner().unwrap();
+        assert_eq!(samples.len(), 5);
+        let exact = Attribution::Exact {
+            model: "big-pickle".into(),
+            provider: Some("opencode".into()),
+        };
+        assert!(samples
+            .values()
+            .all(|(attribution, _, complete)| attribution == &exact && *complete));
+        let first = &samples["prt_0f3cf7dc9001hTNuf5YeAipgt2"].1;
+        assert_eq!(first.input_tokens, Some(6283 + 1941));
+        assert_eq!(first.output_tokens, Some(31));
+
+        // A child's step whose model is not known yet never borrows its parent's model.
+        let child_finish = events
+            .iter()
+            .filter_map(|event| event.pointer("/properties/part"))
+            .find(|part| part["sessionID"] == CHILD && part["type"] == "step-finish")
+            .unwrap();
+        let (_, attribution, ..) =
+            v1_step_sample(child_finish, None, true, &mut HashMap::new()).unwrap();
+        assert_eq!(
+            attribution,
+            Attribution::Unresolved {
+                reason: Missing::ChildModelUnknown
+            }
+        );
+    }
+
+    /// Replays the same turn's native history with a grandchild, a native retry's unfinished
+    /// attempt, a resumed child's earlier message, and a `task_id` that resumes an ancestor.
+    #[tokio::test]
+    async fn v1_capture_descends_into_every_subagent_once() {
+        use axum::{extract::Path, routing::get, Json, Router};
+        const MAIN: &str = "ses_f0c30aab3ffev2glu5jL6rRnqj";
+        const CHILD: &str = "ses_f0c30789cffe5d20g8AoPPYRBr";
+        const TASK: &str = "prt_0f3cf875e001Klz5seORXpbK4K";
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/opencode-v1-messages.json")).unwrap();
+        let started_at = fixture["main"][0]["info"]["time"]["created"]
+            .as_i64()
+            .unwrap();
+        let mut main = fixture["main"].clone();
+        // The first attempt of a natively retried request streamed but never finished.
+        main[1]["parts"].as_array_mut().unwrap().insert(
+            0,
+            json!({"id":"prt_0f3cf7dc9000retried00000","messageID":"msg_0f3cf6e4f001VaKSOLsRFi3dsY","sessionID":MAIN,"type":"step-start"}),
+        );
+        let mut child = fixture["child"].clone();
+        let mut earlier = child[1].clone();
+        earlier["info"]["id"] = json!("msg_earlier_turn");
+        earlier["info"]["time"]["created"] = json!(started_at - 1);
+        child.as_array_mut().unwrap().insert(0, earlier);
+        let grand_task = json!({"id":"prt_grand_task","messageID":"msg_0f3cf8773001sB85ZJIXdf6L7F","sessionID":CHILD,"type":"tool","tool":"task","callID":"call_grand","state":{"status":"completed","input":{},"output":"","metadata":{"sessionId":"ses_grandchild","background":true}}});
+        child[2]["parts"].as_array_mut().unwrap().push(grand_task);
+        let grandchild = json!([{
+            "info":{"id":"msg_grand","sessionID":"ses_grandchild","role":"assistant","modelID":"grand-model","providerID":"grand","time":{"created":started_at + 1}},
+            "parts":[
+                {"id":"prt_grand_start","messageID":"msg_grand","sessionID":"ses_grandchild","type":"step-start"},
+                {"id":"prt_grand_bash","messageID":"msg_grand","sessionID":"ses_grandchild","type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"true"},"output":""}},
+                {"id":"prt_grand_resume","messageID":"msg_grand","sessionID":"ses_grandchild","type":"tool","tool":"task","state":{"status":"completed","input":{},"output":"","metadata":{"sessionId":MAIN}}}
+            ]
+        }]);
+        let sessions = HashMap::from([
+            (MAIN.to_string(), main),
+            (CHILD.to_string(), child),
+            ("ses_grandchild".to_string(), grandchild),
+        ]);
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        let app = Router::new().route(
+            "/session/{id}/message",
+            get(move |Path(id): Path<String>| {
+                log.lock().unwrap().push(id.clone());
+                let listing = sessions[&id].clone();
+                async move { Json(listing) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let recorded = Recorded::default();
+        let captured = capture_v1(
+            &recorded,
+            &reqwest::Client::new(),
+            &base,
+            vec![(MAIN.to_string(), None)],
+            started_at,
+        )
+        .await;
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 3, "each session read once");
+        assert_eq!(
+            captured.background,
+            [(
+                "ses_grandchild".to_string(),
+                Some(format!("{TASK}:prt_grand_task"))
+            )]
+        );
+
+        let samples = recorded.samples.into_inner().unwrap();
+        // Five finished steps, the grandchild's unfinished one, and the retried attempt.
+        assert_eq!(samples.len(), 7);
+        let (retried_model, retried_usage, retried_complete) =
+            &samples["prt_0f3cf7dc9000retried00000"];
+        assert!(
+            matches!(retried_model, crate::store::Attribution::Exact { model, .. } if model == "big-pickle")
+        );
+        assert_eq!(retried_usage, &crate::store::TokenUsage::default());
+        assert!(!retried_complete);
+        assert!(samples["prt_0f3cf7dc9001hTNuf5YeAipgt2"].2);
+        let (grand_model, grand_usage, _) = &samples["prt_grand_start"];
+        assert!(
+            matches!(grand_model, crate::store::Attribution::Exact { model, .. } if model == "grand-model")
+        );
+        assert_eq!(grand_usage, &crate::store::TokenUsage::default());
+        assert!(!samples.keys().any(|id| id.contains("earlier")));
+
+        let invokers = recorded.invokers.into_inner().unwrap();
+        assert_eq!(invokers[TASK], "big-pickle");
+        assert_eq!(
+            invokers[&format!("{TASK}:prt_0f3cf9941001wZ3V6C7leaXefR")],
+            "big-pickle"
+        );
+        assert_eq!(
+            invokers[&format!("{TASK}:prt_grand_task:prt_grand_bash")],
+            "grand-model"
+        );
+    }
+
+    /// A real OpenCode 1.18.33 abort mid-subagent: `POST /abort` had already persisted both aborted
+    /// steps, which streamed but never finished, so each is a known request without counters.
+    #[tokio::test]
+    async fn aborted_v1_turn_keeps_every_started_step_without_inventing_counters() {
+        use axum::{extract::Path, routing::get, Json, Router};
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/opencode-v1-abort-messages.json")).unwrap();
+        let main = fixture["main"].as_str().unwrap().to_string();
+        let started_at = fixture["sessions"][&main][0]["info"]["time"]["created"]
+            .as_i64()
+            .unwrap();
+        let sessions = fixture["sessions"].clone();
+        let app = Router::new().route(
+            "/session/{id}/message",
+            get(move |Path(id): Path<String>| {
+                let listing = sessions[&id].clone();
+                async move { Json(listing) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let recorded = Recorded::default();
+        capture_v1(
+            &recorded,
+            &reqwest::Client::new(),
+            &base,
+            vec![(main, None)],
+            started_at,
+        )
+        .await;
+        server.abort();
+        let samples = recorded.samples.into_inner().unwrap();
+        let exact = crate::store::Attribution::Exact {
+            model: "big-pickle".into(),
+            provider: Some("opencode".into()),
+        };
+        for step in [
+            "prt_0f3fd25150011uI3i2udhGGxOn",
+            "prt_0f3fd2e27001T46c4latb67zMo",
+        ] {
+            assert_eq!(
+                samples[step],
+                (exact.clone(), crate::store::TokenUsage::default(), false)
+            );
+        }
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            recorded.invokers.into_inner().unwrap()["prt_0f3fd2519001es0eud2F7drRcq"],
+            "big-pickle"
+        );
+    }
+
+    /// A background subagent keeps being captured after its turn until no session is busy.
+    #[tokio::test]
+    async fn v1_background_watch_captures_until_nothing_is_busy() {
+        use axum::{routing::get, Json, Router};
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/session/status",
+                get(move || {
+                    let poll = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        Json(if poll < 2 {
+                            json!({"ses_bg":{"type":"busy"}})
+                        } else {
+                            json!({})
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/session/{id}/message",
+                get(|| async {
+                    Json(json!([{
+                        "info":{"id":"msg_bg","sessionID":"ses_bg","role":"assistant","modelID":"bg-model","providerID":"p","time":{"created":10}},
+                        "parts":[
+                            {"id":"prt_start","messageID":"msg_bg","sessionID":"ses_bg","type":"step-start"},
+                            {"id":"prt_finish","messageID":"msg_bg","sessionID":"ses_bg","type":"step-finish","tokens":{"input":3,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}
+                        ]
+                    }]))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let recorded = Recorded::default();
+        watch_v1_background(
+            &recorded,
+            &reqwest::Client::new(),
+            &base,
+            "ses_main",
+            &[("ses_bg".to_string(), Some("prt_task".to_string()))],
+            10,
+        )
+        .await;
+        server.abort();
+        let samples = recorded.samples.into_inner().unwrap();
+        assert!(samples["prt_start"].2);
+    }
+
+    #[test]
+    fn reconciliation_reads_only_this_turns_assistant_messages() {
+        let listing = json!([
+            {"info":{"id":"msg_earlier","role":"assistant","time":{"created":99}},"parts":[]},
+            {"info":{"id":"msg_user","role":"user","time":{"created":100}},"parts":[]},
+            {"info":{"id":"msg_step","role":"assistant","time":{"created":100}},"parts":[]},
+        ]);
+        let ids: Vec<_> = v1_turn_messages(&listing, 100)
+            .map(|message| message["info"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["msg_step"]);
     }
 
     /// A `#!/bin/sh` stand-in for the opencode CLI, as in `detect.rs`.

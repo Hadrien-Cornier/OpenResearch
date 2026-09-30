@@ -565,8 +565,38 @@ pub struct ExpRunArgs {
     pub chat_session_id: Option<String>,
     #[arg(long, hide = true)]
     pub invocation_context: Option<String>,
+    /// The launching agent shell's command, forwarded so `orx up` can find the invoking tool part.
+    #[arg(skip)]
+    pub launch_command: Option<String>,
+    /// Native agent CLI that launched this outside an OpenResearch chat (see [`agent_origin`]).
+    #[arg(skip)]
+    pub agent_origin: Option<String>,
+    /// A request forwarded to `orx up`: launch evidence comes only from the request, never
+    /// from the server process's own environment.
+    #[arg(skip)]
+    pub forwarded: bool,
     #[arg(skip)]
     pub telemetry_suppressed: bool,
+}
+
+/// Markers the native agent CLIs export into their shell tools, verified in each shipped binary.
+/// Nested agents leave several markers, so the innermost is `unknown`. Antigravity exports none.
+pub(crate) fn agent_origin(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let found: Vec<_> = [
+        ("CLAUDECODE", "claude-code"),
+        ("CODEX_THREAD_ID", "codex"),
+        ("OPENCODE", "opencode"),
+        ("CURSOR_AGENT", "cursor"),
+    ]
+    .into_iter()
+    .filter(|(key, _)| env(key).is_some_and(|value| !value.is_empty()))
+    .map(|(_, harness)| harness)
+    .collect();
+    match found.as_slice() {
+        [] => None,
+        [harness] => Some(harness.to_string()),
+        _ => Some("unknown".into()),
+    }
 }
 
 impl ExpRunArgs {
@@ -576,7 +606,7 @@ impl ExpRunArgs {
         let context = self
             .invocation_context
             .clone()
-            .or_else(|| std::env::var("ORX_INVOCATION_CONTEXT").ok());
+            .or_else(|| self.launch_env("ORX_INVOCATION_CONTEXT"));
         let identity: Option<crate::store::InvocationIdentity> = context
             .map(|json| serde_json::from_str(&json))
             .transpose()?;
@@ -586,10 +616,29 @@ impl ExpRunArgs {
         Ok(identity)
     }
 
+    fn launch_env(&self, key: &str) -> Option<String> {
+        (!self.forwarded)
+            .then(|| std::env::var(key).ok())
+            .flatten()
+            .filter(|value| !value.is_empty())
+    }
+
     pub fn launching_chat_session(&self) -> Option<String> {
         self.chat_session_id
             .clone()
-            .or_else(crate::local::chat::launching_chat_session)
+            .or_else(|| self.launch_env(crate::local::chat::CHAT_SESSION_ENV))
+    }
+
+    pub(crate) fn launching_tool_command(&self) -> Option<String> {
+        self.launch_command
+            .clone()
+            .or_else(|| self.launch_env("ORX_CHAT_TOOL_COMMAND"))
+    }
+
+    pub(crate) fn launching_agent_origin(&self) -> Option<String> {
+        self.agent_origin
+            .clone()
+            .or_else(|| agent_origin(|key| self.launch_env(key)))
     }
 }
 

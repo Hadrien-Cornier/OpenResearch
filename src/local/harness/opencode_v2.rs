@@ -1,6 +1,7 @@
 //! V2 admits prompts before execution finishes; reconcile its durable projection.
 use super::*;
 use crate::local::opencode::AgentEndpoint;
+use futures::future::{BoxFuture, FutureExt};
 
 async fn get(endpoint: &AgentEndpoint, path: &str) -> Result<Value> {
     Ok(endpoint
@@ -92,6 +93,9 @@ pub(super) async fn run_turn(
         .filter_map(|m| m["id"].as_str().map(str::to_owned))
         .collect();
     let prompt_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let started_at = crate::store::now_ms();
+    let mut captured = Captured::default();
+    track_turn(ctx, &native_id, started_at);
     ctx.persist_delivery(DeliveryState::Unknown)?;
     // A transport failure can follow durable admission. Never replay this POST.
     let admission = post(
@@ -105,57 +109,105 @@ pub(super) async fn run_turn(
     }
     let mut surfaced = HashSet::new();
     let mut was_idle = false;
-    loop {
-        // ponytail: full projected history polling; switch to paged durable log if long chats make this costly.
-        let projection = get(&endpoint, &endpoint.v2_export_path(&native_id)).await?;
-        let current = messages(&projection)?;
-        let delivered = current.iter().any(|m| m["id"].as_str() == Some(&prompt_id));
-        merge_projection(ctx, &endpoint, &native_id, current, &previous).await?;
-        if delivered && ctx.delivery_state() != DeliveryState::Accepted {
-            ctx.persist_delivery(DeliveryState::Accepted)?;
-        }
-        prompts(ctx, &endpoint, &path, &mut surfaced).await?;
-        let inbox = get(&endpoint, &format!("{path}/inbox")).await?;
-        let queued = inbox["data"]
-            .as_array()
-            .ok_or_else(|| anyhow!("OpenCode V2 inbox response is invalid"))?
-            .iter()
-            .any(|item| item["id"].as_str() == Some(&prompt_id));
-        let active = get(&endpoint, "/api/session/active").await?;
-        let running = active["data"]
-            .as_object()
-            .ok_or_else(|| anyhow!("OpenCode V2 active response is invalid"))?
-            .contains_key(&native_id);
-        if observed_idle(&mut was_idle, queued, running) {
-            let final_projection = get(&endpoint, &endpoint.v2_export_path(&native_id)).await?;
-            let final_messages = messages(&final_projection)?;
-            let delivered = delivered
-                || final_messages
-                    .iter()
-                    .any(|m| m["id"].as_str() == Some(&prompt_id));
-            let answered =
-                merge_projection(ctx, &endpoint, &native_id, final_messages, &previous).await?;
-            if delivered
-                && answered
-                && final_projection
-                    .pointer("/data/info/outcome")
-                    .and_then(Value::as_str)
-                    == Some("succeeded")
-            {
+    let result: Result<()> = async {
+        loop {
+            // ponytail: full projected history polling; switch to paged durable log if long chats make this costly.
+            let projection = get(&endpoint, &endpoint.v2_export_path(&native_id)).await?;
+            let current = messages(&projection)?;
+            let delivered = current.iter().any(|m| m["id"].as_str() == Some(&prompt_id));
+            merge_projection(
+                ctx,
+                &endpoint,
+                &native_id,
+                current,
+                &previous,
+                started_at,
+                &mut captured,
+            )
+            .await?;
+            if delivered && ctx.delivery_state() != DeliveryState::Accepted {
                 ctx.persist_delivery(DeliveryState::Accepted)?;
-                ctx.mark_final_text_tail();
-                return Ok(());
             }
-            if let Err(error) = admission {
-                return Err(error);
+            prompts(ctx, &endpoint, &path, &mut surfaced).await?;
+            let inbox = get(&endpoint, &format!("{path}/inbox")).await?;
+            let queued = inbox["data"]
+                .as_array()
+                .ok_or_else(|| anyhow!("OpenCode V2 inbox response is invalid"))?
+                .iter()
+                .any(|item| item["id"].as_str() == Some(&prompt_id));
+            let active = get(&endpoint, "/api/session/active").await?;
+            let active = active["data"]
+                .as_object()
+                .ok_or_else(|| anyhow!("OpenCode V2 active response is invalid"))?;
+            for session in captured.sessions(&native_id) {
+                if active.contains_key(&session) {
+                    observe_retry(
+                        &*ctx,
+                        &endpoint,
+                        &session,
+                        session != native_id,
+                        &mut captured,
+                    )
+                    .await;
+                }
             }
-            return Err(anyhow!(
-                "OpenCode V2 became idle without completing this prompt"
-            ));
+            let running = active.contains_key(&native_id);
+            if observed_idle(&mut was_idle, queued, running) {
+                let final_projection = get(&endpoint, &endpoint.v2_export_path(&native_id)).await?;
+                let final_messages = messages(&final_projection)?;
+                let delivered = delivered
+                    || final_messages
+                        .iter()
+                        .any(|m| m["id"].as_str() == Some(&prompt_id));
+                let answered = merge_projection(
+                    ctx,
+                    &endpoint,
+                    &native_id,
+                    final_messages,
+                    &previous,
+                    started_at,
+                    &mut captured,
+                )
+                .await?;
+                if delivered
+                    && answered
+                    && final_projection
+                        .pointer("/data/info/outcome")
+                        .and_then(Value::as_str)
+                        == Some("succeeded")
+                {
+                    ctx.persist_delivery(DeliveryState::Accepted)?;
+                    ctx.mark_final_text_tail();
+                    return Ok(());
+                }
+                if let Err(error) = admission {
+                    return Err(error);
+                }
+                return Err(anyhow!(
+                    "OpenCode V2 became idle without completing this prompt"
+                ));
+            }
+            ctx.flush()?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        ctx.flush()?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
     }
+    .await;
+    let roots: Vec<(String, String)> = captured
+        .background
+        .iter()
+        .filter_map(|child| Some((child.clone(), captured.descendants.get(child)?.clone())))
+        .collect();
+    if let Some(sink) = (!roots.is_empty())
+        .then(|| hold_execution(ctx, &native_id, started_at, json!(roots)))
+        .flatten()
+    {
+        let native = native_id.clone();
+        tokio::spawn(async move {
+            watch_background(&sink, &endpoint, &native, &roots, started_at).await;
+            sink.release();
+        });
+    }
+    result
 }
 
 fn observed_idle(was_idle: &mut bool, queued: bool, running: bool) -> bool {
@@ -171,11 +223,26 @@ async fn merge_projection(
     native_id: &str,
     messages: &[Value],
     previous: &HashSet<String>,
+    started_at: i64,
+    captured: &mut Captured,
 ) -> Result<bool> {
     let mut answered = false;
-    for message in messages.iter().filter(|m| {
-        m["id"].as_str().is_some_and(|id| !previous.contains(id)) && m["type"] == "assistant"
-    }) {
+    let woken = woken_runs(messages);
+    for message in messages
+        .iter()
+        .filter(|m| m["id"].as_str().is_some_and(|id| !previous.contains(id)))
+    {
+        // A run another execution's subagent result woke is that execution's to account.
+        if foreign_run(message, &woken, captured) {
+            for (part, _) in projected_parts(message) {
+                ctx.upsert_part_preserving_children(part);
+            }
+            continue;
+        }
+        capture(ctx, message, false, captured);
+        if message["type"] != "assistant" {
+            continue;
+        }
         if message.get("retry").is_none_or(Value::is_null)
             && message
                 .pointer("/time/completed")
@@ -210,30 +277,374 @@ async fn merge_projection(
         }
         let mut parts = projected_parts(message);
         for (part, content) in &mut parts {
-            if content["type"] != "tool" || content["name"] != "subagent" {
-                continue;
+            if let Some(child) = subagent_session(content, native_id, captured) {
+                part.children =
+                    subagent_children(&*ctx, endpoint, native_id, child, started_at, captured)
+                        .await?;
             }
-            let Some(child_id) = content
-                .pointer("/state/metadata/sessionID")
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let child = get(endpoint, &endpoint.v2_export_path(child_id)).await?;
-            if child.pointer("/data/info/parentID").and_then(Value::as_str) != Some(native_id) {
-                return Err(anyhow!("OpenCode returned an unrelated subagent session"));
-            }
-            part.children = self::messages(&child)?
-                .iter()
-                .filter(|m| m["type"] == "assistant")
-                .flat_map(wire_parts)
-                .collect();
         }
         for (part, _) in parts {
             ctx.upsert_part_preserving_children(part);
         }
     }
     Ok(answered)
+}
+
+/// Native evidence already recorded, so repeated polls of an unchanged projection write nothing.
+#[derive(Default)]
+struct Captured {
+    samples: HashMap<String, String>,
+    invokers: HashSet<String>,
+    /// This turn's subagent sessions at any depth, each with its parent session.
+    descendants: HashMap<String, String>,
+    /// Background subagents spawned this turn, which can outlive it.
+    background: HashSet<String>,
+}
+
+impl Captured {
+    fn sessions(&self, native_id: &str) -> Vec<String> {
+        std::iter::once(native_id.to_string())
+            .chain(self.descendants.keys().cloned())
+            .collect()
+    }
+
+    fn record(
+        &mut self,
+        sink: &dyn UsageSink,
+        id: &str,
+        attribution: crate::store::Attribution,
+        (usage, complete): (crate::store::TokenUsage, bool),
+    ) {
+        let fingerprint = json!([attribution, usage, complete]).to_string();
+        if self.samples.insert(id.to_owned(), fingerprint.clone()) != Some(fingerprint) {
+            sink.sample(id, attribution, usage, complete);
+        }
+    }
+}
+
+/// The session a settled `subagent` tool part of `parent` ran, noting a background one.
+fn subagent_session<'a>(
+    content: &'a Value,
+    parent: &str,
+    captured: &mut Captured,
+) -> Option<&'a str> {
+    if content["type"] != "tool" || content["name"] != "subagent" {
+        return None;
+    }
+    let child = content.pointer("/state/metadata/sessionID")?.as_str()?;
+    captured
+        .descendants
+        .insert(child.to_owned(), parent.to_owned());
+    if content.pointer("/state/metadata/status") == Some(&json!("running")) {
+        captured.background.insert(child.to_owned());
+    }
+    Some(child)
+}
+
+/// A subagent's transcript with its own subagents nested, capturing this turn's steps at every
+/// depth. A continued subagent session also holds earlier turns' messages.
+fn subagent_children<'a>(
+    sink: &'a dyn UsageSink,
+    endpoint: &'a AgentEndpoint,
+    parent_id: &'a str,
+    child_id: &'a str,
+    started_at: i64,
+    captured: &'a mut Captured,
+) -> BoxFuture<'a, Result<Vec<WirePart>>> {
+    async move {
+        let child = get(endpoint, &endpoint.v2_export_path(child_id)).await?;
+        if child.pointer("/data/info/parentID").and_then(Value::as_str) != Some(parent_id) {
+            return Err(anyhow!("OpenCode returned an unrelated subagent session"));
+        }
+        let mut children = Vec::new();
+        for message in messages(&child)? {
+            let current = message
+                .pointer("/time/created")
+                .and_then(Value::as_i64)
+                .is_some_and(|created| created >= started_at);
+            if current {
+                capture(sink, message, true, captured);
+            }
+            if message["type"] != "assistant" {
+                continue;
+            }
+            for (mut part, content) in projected_parts(message) {
+                if let Some(grandchild) =
+                    subagent_session(content, child_id, captured).filter(|_| current)
+                {
+                    part.children = subagent_children(
+                        sink, endpoint, child_id, grandchild, started_at, captured,
+                    )
+                    .await?;
+                }
+                children.push(part);
+            }
+        }
+        Ok(children)
+    }
+    .boxed()
+}
+
+/// V2 runs one provider step per assistant message, and its `model` is the step's resolved
+/// native model. Compactions carry their own model and tokens.
+fn capture(sink: &dyn UsageSink, message: &Value, child: bool, captured: &mut Captured) {
+    let (Some(id), Some("assistant" | "compaction")) =
+        (message["id"].as_str(), message["type"].as_str())
+    else {
+        return;
+    };
+    let attribution = crate::store::Attribution::native(
+        "opencode",
+        message.pointer("/model/id").and_then(Value::as_str),
+        message.pointer("/model/providerID").and_then(Value::as_str),
+        opencode_missing(child),
+    );
+    if let Some(sample) = executed_usage(message) {
+        captured.record(sink, id, attribution.clone(), sample);
+    }
+    if let crate::store::Attribution::Exact { model, provider } = &attribution {
+        for (part, content) in projected_parts(message) {
+            if content["type"] == "tool" && captured.invokers.insert(part.id.clone()) {
+                sink.invoker(&part.id, model, provider.as_deref());
+            }
+        }
+    }
+}
+
+/// A step that failed before the provider responded never executed; one with tokens, a streamed
+/// response or output did.
+fn executed_usage(message: &Value) -> Option<(crate::store::TokenUsage, bool)> {
+    let tokens = message.get("tokens").filter(|tokens| !tokens.is_null());
+    (tokens.is_some()
+        || message
+            .pointer("/time/streamed")
+            .is_some_and(|t| !t.is_null())
+        || message["content"]
+            .as_array()
+            .is_some_and(|content| !content.is_empty()))
+    .then(|| opencode_sample(tokens))
+}
+
+/// A native retry reuses the assistant message and never persists a failed attempt's counters;
+/// only the unsettled message shows that attempt's model, so record it as a known request.
+async fn observe_retry(
+    sink: &dyn UsageSink,
+    endpoint: &AgentEndpoint,
+    session: &str,
+    child: bool,
+    captured: &mut Captured,
+) {
+    let path = format!("/api/session/{session}/message?type=assistant&order=desc&limit=1");
+    let Ok(latest) = get(endpoint, &path).await else {
+        return;
+    };
+    let Some(message) = latest.pointer("/data/0") else {
+        return;
+    };
+    if let (Some(id), Some(attempt)) = (
+        message["id"].as_str(),
+        message.pointer("/retry/attempt").and_then(Value::as_i64),
+    ) {
+        let attribution = crate::store::Attribution::native(
+            "opencode",
+            message.pointer("/model/id").and_then(Value::as_str),
+            message.pointer("/model/providerID").and_then(Value::as_str),
+            opencode_missing(child),
+        );
+        captured.record(
+            sink,
+            &format!("{id}:attempt:{attempt}"),
+            attribution,
+            (crate::store::TokenUsage::default(), false),
+        );
+    }
+}
+
+/// V2 interrupts asynchronously and spares background subagents; stop those too, then capture the
+/// settled tree before the shared interrupt finalizes usage.
+pub(super) async fn capture_interrupted(
+    endpoint: &AgentEndpoint,
+    sink: &dyn UsageSink,
+    native_id: &str,
+    started_at: i64,
+) {
+    let mut captured = Captured::default();
+    wait_idle(endpoint, &[native_id.to_string()]).await;
+    let _ = capture_tree(sink, endpoint, native_id, started_at, &mut captured, false).await;
+    let background: Vec<String> = captured.background.iter().cloned().collect();
+    if !background.is_empty() {
+        for session in &background {
+            let _ = post(
+                endpoint,
+                &format!("/api/session/{session}/interrupt"),
+                &json!({}),
+            )
+            .await;
+        }
+        wait_idle(endpoint, &background).await;
+        // Each cancelled subagent reports back and wakes its parent; stop that run as well.
+        let _ = post(
+            endpoint,
+            &format!("/api/session/{native_id}/interrupt"),
+            &json!({}),
+        )
+        .await;
+        wait_idle(endpoint, &captured.sessions(native_id)).await;
+        let _ = capture_tree(sink, endpoint, native_id, started_at, &mut captured, false).await;
+    }
+    for session in captured.sessions(native_id) {
+        observe_retry(
+            sink,
+            endpoint,
+            &session,
+            session != native_id,
+            &mut captured,
+        )
+        .await;
+    }
+}
+
+/// Keeps capturing background subagents after their turn ended, and the parent runs their results
+/// natively wake with no app turn, until none of the tree is active and each result was delivered.
+pub(super) async fn watch_background(
+    sink: &dyn UsageSink,
+    endpoint: &AgentEndpoint,
+    native_id: &str,
+    roots: &[(String, String)],
+    started_at: i64,
+) {
+    let mut captured = Captured {
+        background: roots.iter().map(|(child, _)| child.clone()).collect(),
+        ..Default::default()
+    };
+    let mut waited = 0;
+    loop {
+        // Read before capturing, so a session idle here has settled everything captured below.
+        let active = get(endpoint, "/api/session/active").await.ok();
+        for (child, parent) in roots {
+            let _ =
+                subagent_children(sink, endpoint, parent, child, started_at, &mut captured).await;
+        }
+        // Includes the woken parent runs (only those this execution's subagents woke).
+        let _ = capture_tree(sink, endpoint, native_id, started_at, &mut captured, true).await;
+        let delivered: HashSet<String> = get(endpoint, &endpoint.v2_export_path(native_id))
+            .await
+            .ok()
+            .and_then(|projection| Some(woken_deliveries(messages(&projection).ok()?).collect()))
+            .unwrap_or_default();
+        let busy = active.is_some_and(|active| {
+            std::iter::once(native_id)
+                .chain(captured.descendants.keys().map(String::as_str))
+                .chain(roots.iter().map(|(child, _)| child.as_str()))
+                .any(|session| active["data"].get(session).is_some())
+        });
+        let undelivered = captured
+            .background
+            .iter()
+            .any(|child| !delivered.contains(child));
+        if !busy && (!undelivered || waited >= super::DELIVERY_GRACE_POLLS) {
+            break;
+        }
+        if !busy {
+            waited += 1;
+        }
+        tokio::time::sleep(BACKGROUND_POLL).await;
+    }
+}
+
+/// Assistant runs a subagent's delivered result woke (native `synthetic` message with
+/// `metadata.childID`, then the parent's run until the next user message) → that subagent.
+fn woken_runs(messages: &[Value]) -> HashMap<String, String> {
+    let mut woken = HashMap::new();
+    let mut by = None;
+    for message in messages {
+        match message["type"].as_str() {
+            Some("user") => by = None,
+            Some("synthetic") => {
+                by = (message.pointer("/metadata/source") == Some(&json!("subagent")))
+                    .then(|| message.pointer("/metadata/childID")?.as_str())
+                    .flatten()
+                    .map(str::to_owned);
+            }
+            _ => {
+                if let (Some(child), Some(id)) = (&by, message["id"].as_str()) {
+                    woken.insert(id.to_owned(), child.clone());
+                }
+            }
+        }
+    }
+    woken
+}
+
+fn woken_deliveries(messages: &[Value]) -> impl Iterator<Item = String> + '_ {
+    messages
+        .iter()
+        .filter(|message| message["type"] == "synthetic")
+        .filter(|message| message.pointer("/metadata/source") == Some(&json!("subagent")))
+        .filter_map(|message| Some(message.pointer("/metadata/childID")?.as_str()?.to_owned()))
+}
+
+fn foreign_run(message: &Value, woken: &HashMap<String, String>, captured: &Captured) -> bool {
+    message["id"]
+        .as_str()
+        .and_then(|id| woken.get(id))
+        .is_some_and(|child| !captured.background.contains(child))
+}
+
+/// `woken_only`: after the turn, only runs its own subagents' results woke (later turns' own
+/// messages belong to them).
+async fn capture_tree(
+    sink: &dyn UsageSink,
+    endpoint: &AgentEndpoint,
+    native_id: &str,
+    started_at: i64,
+    captured: &mut Captured,
+    woken_only: bool,
+) -> Result<()> {
+    let projection = get(endpoint, &endpoint.v2_export_path(native_id)).await?;
+    let all = messages(&projection)?;
+    let woken = woken_runs(all);
+    for message in all.iter().filter(|m| {
+        m.pointer("/time/created")
+            .and_then(Value::as_i64)
+            .is_some_and(|created| created >= started_at)
+    }) {
+        let is_woken = woken.contains_key(message["id"].as_str().unwrap_or_default());
+        if foreign_run(message, &woken, captured) || (woken_only && !is_woken) {
+            continue;
+        }
+        if is_woken {
+            for (part, _) in projected_parts(message) {
+                if part.kind == "tool" {
+                    sink.tool_evidence(&part);
+                }
+            }
+        }
+        capture(sink, message, false, captured);
+        for content in message["content"].as_array().into_iter().flatten() {
+            if let Some(child) = subagent_session(content, native_id, captured) {
+                subagent_children(sink, endpoint, native_id, child, started_at, captured).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Waits (bounded) until none of `sessions` is natively active.
+async fn wait_idle(endpoint: &AgentEndpoint, sessions: &[String]) {
+    for _ in 0..20 {
+        match get(endpoint, "/api/session/active").await {
+            Ok(active)
+                if !sessions
+                    .iter()
+                    .any(|session| active["data"].get(session).is_some()) =>
+            {
+                return
+            }
+            Err(_) => return,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 fn messages(projection: &Value) -> Result<&Vec<Value>> {
@@ -792,6 +1203,422 @@ pub(super) async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Merges a captured beta-19271 turn (shell, then a subagent running shell) twice, against
+    /// its real child export plus an earlier turn's step from a continued subagent session.
+    #[tokio::test]
+    async fn native_v2_turn_captures_each_step_once_and_only_this_turns_child_steps() {
+        use axum::{routing::get, Json, Router};
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/opencode-v2-export.json")).unwrap();
+        let main = messages(&fixture["main"]).unwrap().clone();
+        let started_at = main[0]["time"]["created"].as_i64().unwrap();
+        let mut child = fixture["child"].clone();
+        let mut earlier = child["data"]["messages"][1].clone();
+        earlier["id"] = json!("msg_earlier_turn");
+        earlier["time"]["created"] = json!(started_at - 1);
+        child["data"]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, earlier);
+        let app = Router::new().route(
+            "/api/session/{id}/export",
+            get(move || {
+                let child = child.clone();
+                async move { Json(child) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = AgentEndpoint {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            client: reqwest::Client::new(),
+            protocol: crate::local::opencode::Protocol::V2,
+            legacy_v2_api: true,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut ctx = TurnCtx::test_stub();
+        let mut captured = Captured::default();
+        for _ in 0..2 {
+            let answered = merge_projection(
+                &mut ctx,
+                &endpoint,
+                "ses_f0c2f7575ffe15gETnxld4d1P5",
+                &main,
+                &HashSet::new(),
+                started_at,
+                &mut captured,
+            )
+            .await
+            .unwrap();
+            assert!(answered);
+        }
+        server.abort();
+        let mut samples: Vec<_> = captured.samples.keys().map(String::as_str).collect();
+        samples.sort();
+        assert_eq!(
+            samples,
+            [
+                "msg_0f3d08b130017eFyyxhSAmLVQe",
+                "msg_0f3d094ef001q6aLjtCXxt1tJO",
+                "msg_0f3d09ccf001sU8UDnw1G33CT2",
+                "msg_0f3d0a2ba001sxgWDHNk1sFrk4",
+            ]
+        );
+        assert_eq!(
+            captured.invokers,
+            HashSet::from([
+                "msg_0f3d08b130017eFyyxhSAmLVQe:1".to_string(),
+                "msg_0f3d08b130017eFyyxhSAmLVQe:2".to_string(),
+                "msg_0f3d094ef001q6aLjtCXxt1tJO:1".to_string(),
+            ])
+        );
+        let subagent = ctx
+            .assistant
+            .parts
+            .iter()
+            .find(|part| part.id == "msg_0f3d08b130017eFyyxhSAmLVQe:2")
+            .unwrap();
+        assert!(subagent
+            .children
+            .iter()
+            .any(|part| part.id == "msg_0f3d094ef001q6aLjtCXxt1tJO:1"));
+        let (usage, complete) = executed_usage(&main[1]).unwrap();
+        assert!(complete);
+        assert_eq!(usage.input_tokens, Some(6338 + 145));
+        assert_eq!(usage.output_tokens, Some(97));
+    }
+
+    #[test]
+    fn only_a_streamed_or_measured_step_executed() {
+        let failed = json!({"id":"msg_x","type":"assistant","agent":"build","model":{"id":"big-pickle","providerID":"opencode"},"content":[],"time":{"created":1,"completed":2},"finish":"error","error":{"type":"provider.auth","message":"Unauthorized"}});
+        assert!(executed_usage(&failed).is_none());
+        let mut interrupted = failed.clone();
+        interrupted["time"]["streamed"] = json!(1);
+        let (usage, complete) = executed_usage(&interrupted).unwrap();
+        assert_eq!(usage, crate::store::TokenUsage::default());
+        assert!(!complete);
+        let mut partial = failed.clone();
+        partial["content"] = json!([{"type":"text","text":"Half"}]);
+        assert!(executed_usage(&partial).is_some());
+    }
+
+    /// A fake V2 server over fixed session exports. `active` answers `/api/session/active` in turn
+    /// (the last repeats); interrupts are logged.
+    async fn fake_v2(
+        exports: HashMap<String, Value>,
+        latest: Value,
+        active: Vec<Value>,
+    ) -> (
+        AgentEndpoint,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{extract::Path, routing::get, routing::post, Json, Router};
+        let interrupts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = interrupts.clone();
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/session/{id}/export",
+                get(move |Path(id): Path<String>| {
+                    let export = exports[&id].clone();
+                    async move { Json(export) }
+                }),
+            )
+            .route(
+                "/api/session/{id}/message",
+                get(move || {
+                    let latest = latest.clone();
+                    async move { Json(latest) }
+                }),
+            )
+            .route(
+                "/api/session/active",
+                get(move || {
+                    let poll = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let active = active[poll.min(active.len() - 1)].clone();
+                    async move { Json(active) }
+                }),
+            )
+            .route(
+                "/api/session/{id}/interrupt",
+                post(move |Path(id): Path<String>| {
+                    log.lock().unwrap().push(id);
+                    async { Json(json!({"interrupted":true})) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = AgentEndpoint {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            client: reqwest::Client::new(),
+            protocol: crate::local::opencode::Protocol::V2,
+            legacy_v2_api: true,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (endpoint, interrupts, server)
+    }
+
+    fn step(id: &str, session: &str, model: &str, created: i64, content: Value) -> Value {
+        json!({"id":id,"sessionID":session,"type":"assistant","model":{"id":model,"providerID":"p"},"content":content,"tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":created,"streamed":created,"completed":created}})
+    }
+
+    fn subagent(session: &str, status: &str) -> Value {
+        json!({"type":"tool","name":"subagent","callID":format!("call_{session}"),"state":{"status":"completed","input":{},"content":[],"metadata":{"sessionID":session,"status":status}}})
+    }
+
+    fn export(session: &str, parent: Option<&str>, messages: Vec<Value>) -> Value {
+        json!({"data":{"info":{"id":session,"parentID":parent},"messages":messages}})
+    }
+
+    /// An interrupt stops this turn's background subagent (V2 spares it natively) and the parent it
+    /// wakes, then captures every depth, the retrying step's model, and nothing from earlier turns.
+    #[tokio::test]
+    async fn interrupted_v2_turn_captures_its_whole_tree() {
+        let shell = json!([{"type":"tool","name":"shell","callID":"call_sh","state":{"status":"completed","input":{"command":"true"},"content":[]}}]);
+        let exports = HashMap::from([
+            (
+                "ses_main".to_string(),
+                export(
+                    "ses_main",
+                    None,
+                    vec![
+                        step("msg_old", "ses_main", "main-model", 5, json!([])),
+                        step(
+                            "msg_main",
+                            "ses_main",
+                            "main-model",
+                            10,
+                            json!([
+                                subagent("ses_child", "completed"),
+                                subagent("ses_bg", "running")
+                            ]),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "ses_child".to_string(),
+                export(
+                    "ses_child",
+                    Some("ses_main"),
+                    vec![
+                        step("msg_child_old", "ses_child", "child-model", 5, json!([])),
+                        step(
+                            "msg_child",
+                            "ses_child",
+                            "child-model",
+                            11,
+                            json!([subagent("ses_grand", "completed")]),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "ses_grand".to_string(),
+                export(
+                    "ses_grand",
+                    Some("ses_child"),
+                    vec![step("msg_grand", "ses_grand", "grand-model", 12, shell)],
+                ),
+            ),
+            (
+                "ses_bg".to_string(),
+                export(
+                    "ses_bg",
+                    Some("ses_main"),
+                    vec![step("msg_bg", "ses_bg", "bg-model", 13, json!([]))],
+                ),
+            ),
+        ]);
+        let retrying = json!({"data":[{"id":"msg_retrying","type":"assistant","model":{"id":"main-model","providerID":"p"},"content":[],"retry":{"attempt":1,"at":14,"error":{"type":"provider.overloaded","message":"busy"}},"time":{"created":14}}],"cursor":{}});
+        let (endpoint, interrupts, server) =
+            fake_v2(exports, retrying, vec![json!({"data":{}})]).await;
+        let recorded = super::super::tests::Recorded::default();
+        capture_interrupted(&endpoint, &recorded, "ses_main", 10).await;
+        server.abort();
+
+        assert_eq!(*interrupts.lock().unwrap(), ["ses_bg", "ses_main"]);
+        let samples = recorded.samples.into_inner().unwrap();
+        let mut ids: Vec<_> = samples.keys().map(String::as_str).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "msg_bg",
+                "msg_child",
+                "msg_grand",
+                "msg_main",
+                "msg_retrying:attempt:1"
+            ]
+        );
+        let model = |id: &str| match &samples[id].0 {
+            crate::store::Attribution::Exact { model, .. } => model.clone(),
+            other => panic!("{id}: {other:?}"),
+        };
+        assert_eq!(model("msg_grand"), "grand-model");
+        assert_eq!(model("msg_retrying:attempt:1"), "main-model");
+        assert_eq!(
+            samples["msg_retrying:attempt:1"].1,
+            crate::store::TokenUsage::default()
+        );
+        assert!(!samples["msg_retrying:attempt:1"].2);
+        assert!(samples["msg_grand"].2);
+        let invokers = recorded.invokers.into_inner().unwrap();
+        assert_eq!(invokers["msg_grand:0"], "grand-model");
+        assert_eq!(invokers["msg_child:0"], "child-model");
+    }
+
+    /// Real beta-19271 runs: a subagent that spawned its own subagent (`experimental.subagent_depth`
+    /// 2), and a background subagent whose result later woke the parent.
+    #[tokio::test]
+    async fn real_v2_grandchild_and_background_subagents_are_captured() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/opencode-v2-nested-export.json")).unwrap();
+        let replay = |run: &str| {
+            let run = &fixture[run];
+            let main = run["main"]["data"]["info"]["id"].as_str().unwrap();
+            let mut exports = HashMap::from([(main.to_string(), run["main"].clone())]);
+            for (id, export) in run["sessions"].as_object().unwrap() {
+                exports.insert(id.clone(), export.clone());
+            }
+            let started_at = run["main"]["data"]["messages"][0]["time"]["created"]
+                .as_i64()
+                .unwrap();
+            (main, exports, started_at)
+        };
+
+        let (main, exports, started_at) = replay("nested");
+        let (endpoint, _, server) = fake_v2(
+            exports,
+            json!({"data":[],"cursor":{}}),
+            vec![json!({"data":{}})],
+        )
+        .await;
+        let recorded = super::super::tests::Recorded::default();
+        let mut captured = Captured::default();
+        capture_tree(&recorded, &endpoint, main, started_at, &mut captured, false)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            captured.descendants["ses_f0c08d898ffeAtB9QwOBElycQc"],
+            "ses_f0c08e2cfffeVYNY9f4SvHj7xR",
+            "the grandchild's parent is the child"
+        );
+        let samples = recorded.samples.into_inner().unwrap();
+        assert_eq!(samples.len(), 6, "two steps per session, every depth");
+        assert!(samples.values().all(|(attribution, _, complete)| *complete
+            && matches!(attribution, crate::store::Attribution::Exact { model, .. } if model == "big-pickle")));
+        let invokers = recorded.invokers.into_inner().unwrap();
+        assert!(
+            invokers.contains_key("msg_0f3f727ac001GiaRSITeAuyytF:1"),
+            "grandchild shell"
+        );
+        assert!(
+            invokers.contains_key("msg_0f3f71d75001f70EWLiFqQefgU:1"),
+            "child spawn"
+        );
+
+        let (main, exports, started_at) = replay("background");
+        let (endpoint, _, server) = fake_v2(
+            exports,
+            json!({"data":[],"cursor":{}}),
+            vec![json!({"data":{}})],
+        )
+        .await;
+        let recorded = super::super::tests::Recorded::default();
+        let mut captured = Captured::default();
+        capture_tree(&recorded, &endpoint, main, started_at, &mut captured, false)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            captured.background,
+            HashSet::from(["ses_f0c0c01a4ffebVNIrsOFXsVCSI".to_string()])
+        );
+        let samples = recorded.samples.into_inner().unwrap();
+        assert!(
+            samples["msg_0f3f46634001V8sKmW4maT6c8v"].2,
+            "background step"
+        );
+        // The parent run the result natively woke (no app turn) belongs to this execution.
+        const WOKEN: &str = "msg_0f3f46be7001vGS4IGSz10v12P";
+        assert!(samples[WOKEN].2);
+
+        // A later app turn (started after the spawn, before the wake) never accounts that run.
+        let (endpoint, _, server) = fake_v2(
+            replay("background").1,
+            json!({"data":[],"cursor":{}}),
+            vec![json!({"data":{}})],
+        )
+        .await;
+        let later = super::super::tests::Recorded::default();
+        capture_tree(
+            &later,
+            &endpoint,
+            main,
+            1790799270000,
+            &mut Captured::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!later.samples.into_inner().unwrap().contains_key(WOKEN));
+
+        // With no later turn at all, the held execution's watcher accounts only the woken run
+        // (plus the subagent), never the turn's own steps again.
+        let watched = super::super::tests::Recorded::default();
+        watch_background(
+            &watched,
+            &endpoint,
+            main,
+            &[(
+                "ses_f0c0c01a4ffebVNIrsOFXsVCSI".to_string(),
+                main.to_string(),
+            )],
+            started_at,
+        )
+        .await;
+        server.abort();
+        let watched = watched.samples.into_inner().unwrap();
+        assert!(watched[WOKEN].2);
+        assert!(!watched.contains_key("msg_0f3f3ee270019YUmIFWT2pdkiB"));
+    }
+
+    /// A background subagent keeps being captured after its turn until its tree goes quiet.
+    #[tokio::test]
+    async fn background_watch_captures_until_the_subagent_tree_is_quiet() {
+        let exports = HashMap::from([(
+            "ses_bg".to_string(),
+            export(
+                "ses_bg",
+                Some("ses_main"),
+                vec![step("msg_bg", "ses_bg", "bg-model", 13, json!([]))],
+            ),
+        )]);
+        let (endpoint, _, server) = fake_v2(
+            exports,
+            json!({"data":[],"cursor":{}}),
+            vec![
+                json!({"data":{"ses_bg":{}}}),
+                json!({"data":{"ses_bg":{}}}),
+                json!({"data":{}}),
+            ],
+        )
+        .await;
+        let recorded = super::super::tests::Recorded::default();
+        watch_background(
+            &recorded,
+            &endpoint,
+            "ses_main",
+            &[("ses_bg".to_string(), "ses_main".to_string())],
+            10,
+        )
+        .await;
+        server.abort();
+        let samples = recorded.samples.into_inner().unwrap();
+        assert!(samples["msg_bg"].2);
+    }
 
     #[tokio::test]
     async fn discovery_waits_for_a_cold_v2_catalog() {

@@ -813,12 +813,7 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         .then(|| {
             crate::telemetry::pending_event_payload(
                 "experiment_finished",
-                serde_json::json!({
-                    "harness": identity.as_ref().map(|identity| &identity.harness),
-                    "model": identity.as_ref().map(|identity| &identity.model),
-                    "provider": identity.as_ref().and_then(|identity| identity.provider.as_ref()),
-                    "status": "failed",
-                }),
+                serde_json::json!({ "status": "failed" }),
             )
         })
         .flatten();
@@ -827,6 +822,8 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         &pending,
         args.force,
         identity.as_ref(),
+        args.launching_tool_command().as_deref(),
+        args.launching_agent_origin().as_deref(),
         report.as_ref(),
     )?;
     let pending_backend_json = descriptor.to_json();
@@ -872,6 +869,8 @@ fn reserve_run(
     pending: &StoredRun,
     force: bool,
     identity: Option<&crate::store::InvocationIdentity>,
+    tool_command: Option<&str>,
+    agent_origin: Option<&str>,
     report: Option<&(String, serde_json::Value)>,
 ) -> Result<()> {
     let dir = crate::store::data_dir().join("submission-locks");
@@ -900,7 +899,14 @@ fn reserve_run(
         }
     }
     let tx = store.begin()?;
-    store.reserve_run_telemetry(&pending.id, identity, report)?;
+    store.reserve_run_telemetry(
+        &pending.id,
+        identity,
+        pending.chat_session_id.as_deref(),
+        tool_command,
+        agent_origin,
+        report,
+    )?;
     store.upsert_run(pending)?;
     tx.commit()?;
     Ok(())
@@ -978,6 +984,9 @@ mod tests {
             force: false,
             chat_session_id: None,
             invocation_context: None,
+            launch_command: None,
+            agent_origin: None,
+            forwarded: false,
             telemetry_suppressed: false,
         }
     }
@@ -1045,6 +1054,19 @@ mod tests {
             "--no-container"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn forwarded_launches_never_take_origin_from_the_server_environment() {
+        std::env::set_var("CODEX_THREAD_ID", "backend-launcher-thread");
+        let mut args = tinker_args();
+        assert!(args.launching_agent_origin().is_some());
+        args.forwarded = true;
+        assert_eq!(args.launching_agent_origin(), None);
+        assert_eq!(args.launching_chat_session(), None);
+        assert_eq!(args.launching_tool_command(), None);
+        args.agent_origin = Some("codex".into());
+        assert_eq!(args.launching_agent_origin().as_deref(), Some("codex"));
     }
 
     #[test]
