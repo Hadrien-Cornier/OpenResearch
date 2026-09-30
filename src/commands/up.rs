@@ -4385,12 +4385,14 @@ fn spawn_restart_when_idle(state: AppState) {
             DRAINING.store(true, Ordering::SeqCst);
             if ACTIVE.load(Ordering::SeqCst) == 0
                 && !state.data_dir_move_in_progress.load(Ordering::SeqCst)
-                && state
-                    .remote_sessions
-                    .list()
-                    .await
-                    .iter()
-                    .all(|session| session.status == RemoteSessionStatus::Disconnected)
+                && state.remote_sessions.list().await.iter().all(|session| {
+                    matches!(
+                        session.status,
+                        RemoteSessionStatus::Disconnected
+                            | RemoteSessionStatus::NeedsInstall
+                            | RemoteSessionStatus::NeedsUpdate
+                    )
+                })
                 && state.chat.stop_admitting_if_idle().await
             {
                 state.restart.notify_one();
