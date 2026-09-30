@@ -117,6 +117,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         project_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
         publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         harness_fill_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        claude_catalog_queue: Arc::new(std::sync::Mutex::new(ClaudeCatalogQueue::default())),
         data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         data_dir_gate: Arc::new(tokio::sync::Mutex::new(())),
         remote_sessions: crate::commands::up_remote::RemoteSessionManager::new(),
@@ -168,7 +169,11 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.data_dir_move_in_progress.clone(),
         state.data_dir_gate.clone(),
     ));
-    spawn_claude_auth_monitor(state.chat.clone(), claude.clone());
+    spawn_claude_auth_monitor(
+        state.chat.clone(),
+        claude.clone(),
+        state.harness_fill_in_flight.clone(),
+    );
     spawn_background_tasks(remote_auth.is_none());
     let live_events = state.chat.clone();
     local::overleaf_live::set_event_sink(Box::new(move |name, data| {
@@ -349,6 +354,7 @@ struct AppState {
     /// Single-flight guard for the background catalog fill: without it every
     /// expired read would start its own full detection sweep.
     harness_fill_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    claude_catalog_queue: Arc<std::sync::Mutex<ClaudeCatalogQueue>>,
     /// Set while a data-dir move is running. New chat turns and run launches
     /// check it and refuse (409) so nothing starts writing the store mid-move —
     /// closing the window between the move's in-flight check and its completion.
@@ -4348,7 +4354,11 @@ fn spawn_agent_preflight(state: AppState) {
 /// alone: served payloads get the live auth snapshot overlaid on the way out,
 /// the ready-claude gate re-detects a promoted login, and a wholesale clear
 /// here used to discard in-flight catalog fills on every flap.
-fn spawn_claude_auth_monitor(chat: Arc<ChatHost>, claude: Arc<local::claude::ClaudeHost>) {
+fn spawn_claude_auth_monitor(
+    chat: Arc<ChatHost>,
+    claude: Arc<local::claude::ClaudeHost>,
+    fill_in_flight: Arc<std::sync::atomic::AtomicBool>,
+) {
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(5);
         let mut observed_generation = claude.auth_snapshot().generation;
@@ -4364,18 +4374,19 @@ fn spawn_claude_auth_monitor(chat: Arc<ChatHost>, claude: Arc<local::claude::Cla
                     );
                 }
             }
-            if before.runtime_rejected
+            if fill_in_flight.load(std::sync::atomic::Ordering::Acquire)
+                || before.runtime_rejected
                 || matches!(
                     before.state,
                     local::harness::HarnessAuthState::Ready
                         | local::harness::HarnessAuthState::Unsupported
-                )
+                ) && !before.auth_check_failed
             {
                 delay = Duration::from_secs(5);
                 continue;
             }
-            let state = local::harness::claude::current_auth_state().await;
-            claude.observe_auth_state(state, before.generation);
+            let probe = local::harness::claude::current_auth_state().await;
+            let changed = claude.observe_auth_probe(&probe);
             let after = claude.auth_snapshot();
             if after.generation != observed_generation {
                 observed_generation = after.generation;
@@ -4385,8 +4396,10 @@ fn spawn_claude_auth_monitor(chat: Arc<ChatHost>, claude: Arc<local::claude::Cla
                         json!({ "harness": "claude-code", "authState": after.state }),
                     );
                 }
+            } else if changed {
+                chat.emit_event("harness.catalog", json!({}));
             }
-            delay = if state == local::harness::HarnessAuthState::Unknown {
+            delay = if after.auth_check_failed {
                 (delay * 2).min(Duration::from_secs(60))
             } else {
                 Duration::from_secs(5)
@@ -6106,7 +6119,8 @@ struct HarnessQuery {
     retry: Option<u8>,
 }
 
-fn overlay_claude_auth(payload: &mut Value, snapshot: local::claude::AuthSnapshot) {
+fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapshot) {
+    const FAILED_RECHECK_NOTE: &str = "Could not re-check Claude Code. The last verified configuration is still in use; re-check this harness.";
     let Some(harnesses) = payload.get_mut("harnesses").and_then(Value::as_array_mut) else {
         return;
     };
@@ -6127,35 +6141,86 @@ fn overlay_claude_auth(payload: &mut Value, snapshot: local::claude::AuthSnapsho
     if claude.get("catalogPending").and_then(Value::as_bool) == Some(true) {
         return;
     }
-    // The snapshot only carries a state, so its generic note would overwrite the
-    // credential-conflict diagnosis with "run `claude auth status`" — advice for
-    // a state the conflict already explains, and the repair the user needs.
-    let needs_config_repair = claude
-        .get("needsConfigRepair")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let entry_was_ready = claude.get("authState").and_then(Value::as_str) == Some("ready");
     claude["authState"] = json!(snapshot.state);
+    claude["needsConfigRepair"] = json!(snapshot.credential_conflict);
+    claude["authCheckFailed"] = json!(snapshot.auth_check_failed);
+    claude["loginEligible"] = json!(
+        !snapshot.auth_check_failed
+            && !snapshot.runtime_rejected
+            && local::harness::claude::login_eligible_state(
+                snapshot.state,
+                snapshot.method,
+                snapshot.provider.as_deref(),
+                snapshot.credential_conflict,
+            )
+    );
+    if let Some(object) = claude.as_object_mut() {
+        match snapshot.method {
+            Some(method) => {
+                object.insert("authMethod".into(), json!(method));
+            }
+            None => {
+                object.remove("authMethod");
+            }
+        }
+        match &snapshot.provider {
+            Some(provider) => {
+                object.insert("authProvider".into(), json!(provider));
+            }
+            None => {
+                object.remove("authProvider");
+            }
+        }
+        if snapshot.state != local::harness::HarnessAuthState::Ready
+            || snapshot.method != Some("oauth")
+            || snapshot
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider != "firstParty")
+            || !entry_was_ready
+        {
+            object.remove("account");
+            object.remove("org");
+            object.remove("plan");
+        }
+    }
     if snapshot.state == local::harness::HarnessAuthState::Ready {
+        claude["authenticated"] = json!(true);
+        claude["agentReady"] = json!(true);
+        if snapshot.auth_check_failed {
+            claude["agentNote"] = json!(FAILED_RECHECK_NOTE);
+        } else if !entry_was_ready
+            || claude.get("agentNote").and_then(Value::as_str) == Some(FAILED_RECHECK_NOTE)
+        {
+            if let Some(object) = claude.as_object_mut() {
+                object.remove("agentNote");
+            }
+        }
         return;
     }
     claude["authenticated"] = json!(false);
     claude["agentReady"] = json!(false);
     claude["models"] = json!([]);
-    if let Some(object) = claude.as_object_mut() {
-        object.remove("authMethod");
-        object.remove("account");
-        object.remove("org");
-        object.remove("plan");
-    }
-    if needs_config_repair {
+    if snapshot.credential_conflict {
+        claude["agentNote"] = json!("Claude Code reports a subscription login while an Anthropic environment credential is set. Fix or unset that credential, then re-check this harness.");
         return;
     }
     claude["agentNote"] = json!(if snapshot.runtime_rejected {
-        local::harness::claude::auth_recovery_note()
+        local::harness::claude::auth_recovery_note(snapshot.method, snapshot.provider.as_deref())
     } else {
         match snapshot.state {
             local::harness::HarnessAuthState::NeedsLogin => {
-                "Sign in with `claude auth login`, then re-check this harness."
+                if local::harness::claude::login_eligible_state(
+                    snapshot.state,
+                    snapshot.method,
+                    snapshot.provider.as_deref(),
+                    false,
+                ) {
+                    "Sign in with `claude auth login`, then re-check this harness."
+                } else {
+                    "Check the configured Claude Code provider with `claude auth status`, then re-check this harness."
+                }
             }
             local::harness::HarnessAuthState::Unknown => {
                 "Open a terminal and run `claude auth status`, then re-check this harness."
@@ -6164,6 +6229,101 @@ fn overlay_claude_auth(payload: &mut Value, snapshot: local::claude::AuthSnapsho
                 "Update Claude Code to 2.1.211 or newer, then re-check this harness."
             }
             local::harness::HarnessAuthState::Ready => unreachable!(),
+        }
+    });
+}
+
+struct ClaudeCatalogRequest {
+    bin: std::path::PathBuf,
+    ultracode: bool,
+    method: Option<&'static str>,
+    provider: Option<String>,
+}
+
+#[derive(Default)]
+struct ClaudeCatalogQueue {
+    running: bool,
+    latest: Option<(std::time::Instant, ClaudeCatalogRequest)>,
+}
+
+fn claude_catalog_request(
+    harnesses: &[local::harness::HarnessInfo],
+) -> Option<ClaudeCatalogRequest> {
+    let claude = harnesses
+        .iter()
+        .find(|h| h.id == "claude-code" && h.agent_ready)?;
+    if !local::harness::claude::external_provider(
+        claude.auth_method,
+        claude.auth_provider.as_deref(),
+    ) {
+        return None;
+    }
+    Some(ClaudeCatalogRequest {
+        bin: claude.bin_path.as_ref()?.into(),
+        ultracode: claude.claude_ultracode,
+        method: claude.auth_method,
+        provider: claude.auth_provider.clone(),
+    })
+}
+
+fn enqueue_claude_catalog(
+    state: AppState,
+    cached_at: std::time::Instant,
+    request: ClaudeCatalogRequest,
+) {
+    let mut queue = state.claude_catalog_queue.lock().unwrap();
+    queue.latest = Some((cached_at, request));
+    if queue.running {
+        return;
+    }
+    queue.running = true;
+    drop(queue);
+    tokio::spawn(async move {
+        loop {
+            let next = {
+                let mut queue = state.claude_catalog_queue.lock().unwrap();
+                match queue.latest.take() {
+                    Some(next) => next,
+                    None => {
+                        queue.running = false;
+                        return;
+                    }
+                }
+            };
+            let (cached_at, request) = next;
+            let models =
+                local::harness::claude::external_model_catalog(request.bin, request.ultracode)
+                    .await;
+            let empty = models.is_empty();
+            let mut cache = state.harnesses.lock().await;
+            let Some((at, payload)) = cache.as_mut() else {
+                continue;
+            };
+            if *at != cached_at {
+                continue;
+            }
+            let auth = state.claude.auth_snapshot();
+            if auth.state != local::harness::HarnessAuthState::Ready
+                || auth.runtime_rejected
+                || auth.method != request.method
+                || auth.provider != request.provider
+            {
+                continue;
+            }
+            let Some(claude) = payload["harnesses"].as_array_mut().and_then(|all| {
+                all.iter_mut()
+                    .find(|h| h["id"] == "claude-code" && h["agentReady"] == true)
+            }) else {
+                continue;
+            };
+            claude["models"] = json!(models);
+            if empty {
+                claude["agentNote"] = json!("Could not load Claude Code models. Re-check this harness or update Claude Code; the CLI default model is still available.");
+            } else if let Some(object) = claude.as_object_mut() {
+                object.remove("agentNote");
+            }
+            drop(cache);
+            state.chat.emit_event("harness.catalog", json!({}));
         }
     });
 }
@@ -6197,23 +6357,12 @@ fn payload_has_ready_claude(payload: &Value) -> bool {
         == Some(true)
 }
 
+#[cfg(test)]
 fn claude_entry_pending(payload: &Value) -> bool {
     claude_entry(payload)
         .and_then(|claude| claude.get("catalogPending"))
         .and_then(Value::as_bool)
         == Some(true)
-}
-
-fn replace_claude_entry(payload: &mut Value, replacement: Value) {
-    let Some(harnesses) = payload.get_mut("harnesses").and_then(Value::as_array_mut) else {
-        return;
-    };
-    if let Some(claude) = harnesses
-        .iter_mut()
-        .find(|h| h.get("id").and_then(Value::as_str) == Some("claude-code"))
-    {
-        *claude = replacement;
-    }
 }
 
 async fn harness_snapshot(Path(id): Path<String>) -> ApiResult {
@@ -6249,13 +6398,16 @@ async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
         // An explicit re-check detects outside the cache lock: a full sweep
         // takes seconds and must not stall every ordinary read queued behind
         // it. Last writer wins — concurrent refreshes may duplicate a sweep.
-        let probe_generation = state.claude.auth_snapshot().generation;
+        state.claude.reserve_auth_check();
         let harnesses = local::harness::detect_harnesses().await;
-        let (mut payload, announce) =
-            finish_harnesses_payload(state, harnesses, probe_generation, false).await;
+        let catalog = claude_catalog_request(&harnesses);
+        let (mut payload, announce) = finish_harnesses_payload(state, harnesses, false).await;
         let cached_at = std::time::Instant::now();
         spawn_cursor_account_details(state, &mut payload, cached_at);
         *state.harnesses.lock().await = Some((cached_at, payload.clone()));
+        if let Some(catalog) = catalog {
+            enqueue_claude_catalog(state.clone(), cached_at, catalog);
+        }
         emit_auth_announcement(state, announce);
         return payload;
     }
@@ -6280,7 +6432,7 @@ async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
             spawn_catalog_fill(state.clone(), *at, uuid::Uuid::new_v4());
         }
         let mut out = payload.clone();
-        overlay_claude_auth(&mut out, auth);
+        overlay_claude_auth(&mut out, &auth);
         return out;
     }
     seed_harnesses_locked(state, &mut cache).await
@@ -6296,7 +6448,6 @@ async fn seed_harnesses_locked(
     state: &AppState,
     cache: &mut Option<(std::time::Instant, Value)>,
 ) -> Value {
-    let probe_generation = state.claude.auth_snapshot().generation;
     let started = std::time::Instant::now();
     let harnesses = local::harness::detect_harnesses_snapshot().await;
     let installed = harnesses.iter().filter(|h| h.installed).count();
@@ -6304,7 +6455,7 @@ async fn seed_harnesses_locked(
     // passes join on it.
     let fill_id = uuid::Uuid::new_v4();
     let snapshot_ms = started.elapsed().as_millis() as u64;
-    let (mut payload, _) = finish_harnesses_payload(state, harnesses, probe_generation, true).await;
+    let (mut payload, _) = finish_harnesses_payload(state, harnesses, true).await;
     let cached_at = std::time::Instant::now();
     spawn_cursor_account_details(state, &mut payload, cached_at);
     *cache = Some((cached_at, payload.clone()));
@@ -6330,31 +6481,23 @@ async fn seed_harnesses_locked(
 /// the ClaudeHost's tracked auth state, then overlay and report. Shared by
 /// the snapshot and full passes, and by the background catalog fill.
 ///
-/// `provisional` marks a snapshot answer. A snapshot's claude auth is still
-/// worth adopting when it is conclusive — a signed-out credential store, or
-/// the fallback probe's live verdict — so shared state does not lag what the
-/// file evidence already proved. Two outcomes are not conclusive: `Unknown`
-/// is a guess, and an oauth-method `Ready` skipped the minimum-version gate
-/// (the snapshot never ran `--version`), so both wait for the fill. The
-/// first-install telemetry capture is likewise restricted to completed
-/// answers.
+/// `provisional` marks a discovery-only snapshot. Only full passes publish
+/// live Claude auth observations and first-install telemetry.
 /// The returned `Option` is a claimed auth announcement: the caller emits it
 /// only after committing the payload, so a discarded pass never sends the
 /// dashboard on a `refresh=1` sweep for results nobody will see.
 async fn finish_harnesses_payload(
     state: &AppState,
     harnesses: Vec<local::harness::HarnessInfo>,
-    probe_generation: u64,
     provisional: bool,
 ) -> (Value, Option<local::claude::AuthSnapshot>) {
-    if let Some(claude) = harnesses.iter().find(|h| h.id == "claude-code") {
-        let adoptable = claude.auth_state != local::harness::HarnessAuthState::Unknown
-            && !(claude.auth_state == local::harness::HarnessAuthState::Ready
-                && claude.auth_method == Some("oauth"));
-        if !provisional || adoptable {
-            state
-                .claude
-                .observe_auth_state(claude.auth_state, probe_generation);
+    if !provisional {
+        if let Some(probe) = harnesses
+            .iter()
+            .find(|h| h.id == "claude-code")
+            .and_then(|h| h.auth_observation.as_ref())
+        {
+            state.claude.observe_auth_probe(probe);
         }
     }
     let mut payload = json!({ "harnesses": harnesses });
@@ -6367,38 +6510,14 @@ async fn finish_harnesses_payload(
         state.claude.defer_auth_verification(snapshot.generation);
         snapshot = state.claude.auth_snapshot();
     }
-    // The pending check keeps this off a snapshot's card: the in-flight fill
-    // answers definitively, so an inline re-probe would just repeat its work.
-    // (A snapshot claude can be Ready-but-not-ready here because `detect_one`
-    // clamps `agent_ready` on every provisional entry.)
-    if snapshot.state == local::harness::HarnessAuthState::Ready
-        && !payload_has_ready_claude(&payload)
-        && !claude_entry_pending(&payload)
-    {
-        if let Some(retry) = local::harness::detect_harness("claude-code").await {
-            state
-                .claude
-                .observe_auth_state(retry.auth_state, snapshot.generation);
-            if retry.agent_ready {
-                replace_claude_entry(&mut payload, json!(retry));
-            }
-            snapshot = state.claude.auth_snapshot();
-        }
-        if snapshot.state == local::harness::HarnessAuthState::Ready
-            && !payload_has_ready_claude(&payload)
-        {
-            state.claude.defer_auth_verification(snapshot.generation);
-            snapshot = state.claude.auth_snapshot();
-        }
-    }
     // A provisional pass must not announce: `harness.auth` makes the dashboard
     // call `refreshHarnesses(true)`, an inline full sweep — the stall this
     // whole design exists to remove — fired by the snapshot's own adoption.
     // A real pass hands its auth snapshot back unclaimed; the caller claims at
     // emit time, after the payload commits, so a pass that loses the cache
     // race never burns a generation it can't announce.
-    let announce = (!provisional).then_some(snapshot);
-    overlay_claude_auth(&mut payload, snapshot);
+    let announce = (!provisional).then_some(snapshot.clone());
+    overlay_claude_auth(&mut payload, &snapshot);
     if !provisional {
         crate::telemetry::harness::capture_initial(&payload);
     }
@@ -6494,12 +6613,12 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
     {
         return;
     }
+    state.claude.reserve_auth_check();
     let probe_timings = local::harness::ProbeTimingSink::default();
     tokio::spawn(local::harness::probe_timing_scope(
         probe_timings.clone(),
         async move {
             let _fill = FillGuard(state.harness_fill_in_flight.clone());
-            let probe_generation = state.claude.auth_snapshot().generation;
             let started = std::time::Instant::now();
             // Commit each harness as its probes land: the onboarding gate is
             // per-entry (`agentReady && !catalogPending`), so a ready agent must
@@ -6517,9 +6636,9 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
                 // probe left unobserved until fill end would be stamped back to
                 // Unknown on each answer — the stall this loop exists to remove.
                 if info.id == "claude-code" {
-                    state
-                        .claude
-                        .observe_auth_state(info.auth_state, probe_generation);
+                    if let Some(probe) = info.auth_observation.as_ref() {
+                        state.claude.observe_auth_probe(probe);
+                    }
                 }
                 let mut published = false;
                 {
@@ -6562,11 +6681,11 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
             ordered.sort_by_key(|(index, _)| *index);
             let harnesses: Vec<local::harness::HarnessInfo> =
                 ordered.into_iter().map(|(_, info)| info).collect();
+            let catalog = claude_catalog_request(&harnesses);
             // Finish before touching the cache: the Claude re-probe inside can
             // cost a child process, and holding the lock across it stalls every
             // reader the snapshot was meant to unblock.
-            let (mut payload, announce) =
-                finish_harnesses_payload(&state, harnesses, probe_generation, false).await;
+            let (mut payload, announce) = finish_harnesses_payload(&state, harnesses, false).await;
             // The reconciled payload is authoritative — overlay applied — so
             // readiness is counted from it, not the raw probes.
             let installed = payload["harnesses"]
@@ -6581,6 +6700,7 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
                         .count()
                 })
                 .unwrap_or(0);
+            let mut catalog_at = None;
             let committed = {
                 let mut cache = state.harnesses.lock().await;
                 // A refresh or retry that landed in between owns the cache. No
@@ -6600,6 +6720,7 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
                     let filled_at = std::time::Instant::now();
                     spawn_cursor_account_details(&state, &mut payload, filled_at);
                     *cache = Some((filled_at, payload));
+                    catalog_at = Some(filled_at);
                     true
                 }
             };
@@ -6625,6 +6746,9 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
             });
             if !committed {
                 return;
+            }
+            if let (Some(catalog), Some(at)) = (catalog, catalog_at) {
+                enqueue_claude_catalog(state.clone(), at, catalog);
             }
             state.chat.emit_event("harness.catalog", json!({}));
             emit_auth_announcement(&state, announce);
@@ -7688,6 +7812,41 @@ pub(crate) async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_recheck_clears_stale_claude_warning() {
+        let host = local::claude::ClaudeHost::new();
+        let ready = local::harness::claude::parse_auth_status(
+            Some(0),
+            br#"{"loggedIn":true,"authMethod":"third_party","apiProvider":"bedrock"}"#,
+            local::harness::claude::auth_barrier_sequence(),
+        );
+        host.observe_auth_probe(&ready);
+        let failed = local::harness::claude::parse_auth_status(
+            Some(2),
+            b"bad status",
+            local::harness::claude::auth_barrier_sequence(),
+        );
+        host.observe_auth_probe(&failed);
+        let mut payload =
+            json!({"harnesses": [{"id": "claude-code", "authState": "ready", "agentReady": true}]});
+        overlay_claude_auth(&mut payload, &host.auth_snapshot());
+        assert_eq!(payload["harnesses"][0]["authCheckFailed"], true);
+        assert!(payload["harnesses"][0]["agentNote"]
+            .as_str()
+            .unwrap()
+            .contains("Could not re-check"));
+
+        let recovered = local::harness::claude::parse_auth_status(
+            Some(0),
+            br#"{"loggedIn":true,"authMethod":"third_party","apiProvider":"bedrock"}"#,
+            local::harness::claude::auth_barrier_sequence(),
+        );
+        host.observe_auth_probe(&recovered);
+        overlay_claude_auth(&mut payload, &host.auth_snapshot());
+        assert_eq!(payload["harnesses"][0]["authCheckFailed"], false);
+        assert!(payload["harnesses"][0].get("agentNote").is_none());
+    }
 
     #[test]
     fn send_model_distinguishes_cli_default_from_no_override() {
