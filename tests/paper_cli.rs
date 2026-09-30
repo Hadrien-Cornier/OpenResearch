@@ -79,6 +79,7 @@ fn full_text_preserves_requested_versions_and_reports_stale_text() {
                     }
                     Err(err) => panic!("{err}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -124,7 +125,10 @@ fn full_text_preserves_requested_versions_and_reports_stale_text() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         if success {
-            assert!(stdout.contains(&format!("alphaXiv: https://www.alphaxiv.org/abs/{id}\n")));
+            assert!(
+                stdout.contains(&format!("alphaXiv: https://www.alphaxiv.org/abs/{id}\n")),
+                "{stdout}"
+            );
             assert!(stdout.contains(text));
         } else {
             assert!(stdout.is_empty(), "{stdout}");
