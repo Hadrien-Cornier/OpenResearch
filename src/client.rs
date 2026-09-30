@@ -435,10 +435,20 @@ const MAX_RETRY_WAIT_SECS: u64 = 5;
 /// else a growing backoff, plus jitter so concurrent `orx` processes don't retry in lockstep.
 fn retry_delay(retry_after: Option<u64>, attempt: u64) -> std::time::Duration {
     let secs = retry_after.unwrap_or(attempt);
-    let jitter_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_millis()) % 500);
+    let jitter_ms = u64::try_from(uuid::Uuid::new_v4().as_u128() % 500).unwrap_or(0);
     std::time::Duration::from_millis(secs * 1000 + jitter_ms)
+}
+
+/// `Retry-After` as seconds from now: either delta-seconds or an HTTP-date (RFC 9110).
+fn retry_after_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    value.parse().ok().or_else(|| {
+        let at = httpdate::parse_http_date(value).ok()?;
+        Some(
+            at.duration_since(std::time::SystemTime::now())
+                .map_or(0, |d| d.as_secs()),
+        )
+    })
 }
 
 /// Send a keyless literature GET, retrying 429s: parallel agent calls routinely
@@ -463,7 +473,7 @@ async fn public_get(
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok());
+            .and_then(retry_after_secs);
         drop(res);
         if attempt == ATTEMPTS || retry_after.is_some_and(|secs| secs > MAX_RETRY_WAIT_SECS) {
             let wait = match retry_after {
@@ -1622,7 +1632,8 @@ mod tests {
     };
     use super::{
         parse_pubmed_articles, public_get, pubmed_discovery_url, pubmed_fetch_url,
-        rerank_pubmed_articles, retry_delay, PubmedArticle, PubmedDiscoveryOptions,
+        rerank_pubmed_articles, retry_after_secs, retry_delay, PubmedArticle,
+        PubmedDiscoveryOptions,
     };
     use serde_json::json;
 
@@ -1749,6 +1760,16 @@ mod tests {
         assert!((2000..2500).contains(&ms(Some(2), 1)));
         assert!((1000..1500).contains(&ms(None, 1)));
         assert!((2000..2500).contains(&ms(None, 2)));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_or_an_http_date() {
+        assert_eq!(retry_after_secs(" 30 "), Some(30));
+        assert_eq!(retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"), Some(0));
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        let secs = retry_after_secs(&httpdate::fmt_http_date(later)).unwrap();
+        assert!((118..=120).contains(&secs));
+        assert_eq!(retry_after_secs("soon"), None);
     }
 
     #[test]
