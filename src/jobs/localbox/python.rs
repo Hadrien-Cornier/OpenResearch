@@ -143,6 +143,27 @@ mod tests {
     }
 
     #[test]
+    fn git_bash_runs_the_shims_and_python3_reaches_the_error() {
+        let dir = std::env::temp_dir().join(format!("orx-shims-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("python"), stub_shim()).unwrap();
+        std::fs::write(dir.join("python3"), FORWARD_TO_PYTHON).unwrap();
+        let mut path = std::ffi::OsString::from(&dir);
+        if let Some(rest) = crate::local::shell_env::search_path() {
+            path.push(";");
+            path.push(rest);
+        }
+        let out = Command::new(crate::local::bash::program())
+            .args(["-c", "python3 --version"])
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Microsoft Store alias"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_forward_slashed_path_entry_is_still_windows_apps() {
         assert!(in_windows_apps(Path::new(
             r"C:/Users/me/AppData/Local/Microsoft/WindowsApps\python.exe"
