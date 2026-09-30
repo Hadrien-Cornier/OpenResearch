@@ -634,6 +634,7 @@ mod imp {
                 no_agent: false,
                 model: None,
                 remote_host: false,
+                desktop_app: true,
             };
             // The window is useless without its server, so the app goes with it.
             match crate::commands::up::run(args).await {

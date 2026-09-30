@@ -175,6 +175,9 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.harness_fill_in_flight.clone(),
     );
     spawn_background_tasks(remote_auth.is_none());
+    if !persistent_host && !args.desktop_app {
+        spawn_restart_when_idle(state.clone());
+    }
     let live_events = state.chat.clone();
     local::overleaf_live::set_event_sink(Box::new(move |name, data| {
         live_events.emit_event(name, data)
@@ -756,9 +759,11 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         // above the client-side per-file limit so a full message still fits.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
-    let app = app.layer(middleware::from_fn(
-        crate::commands::up_remote::loopback_guard,
-    ));
+    let app = app
+        .layer(middleware::from_fn(track_active))
+        .layer(middleware::from_fn(
+            crate::commands::up_remote::loopback_guard,
+        ));
     match remote_auth {
         Some(auth) => app.layer(middleware::from_fn_with_state(auth, require_remote_auth)),
         None => app,
@@ -4292,6 +4297,104 @@ fn spawn_background_tasks(check_updates: bool) {
     });
 }
 
+/// Requests and terminals in flight, which an automatic restart would cut off.
+static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// An automatic restart is checking for idleness; new requests wait it out.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+struct Active;
+
+impl Active {
+    fn new() -> Self {
+        ACTIVE.fetch_add(1, Ordering::SeqCst);
+        Active
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn track_active(request: axum::extract::Request, next: Next) -> Response {
+    // The dashboard holds its event stream open for as long as it is open.
+    if request.uri().path() == "/api/events" {
+        return next.run(request).await;
+    }
+    // Count first, then check: paired with the drain's set-then-count, one side always sees the other.
+    let active = loop {
+        let active = Active::new();
+        if !DRAINING.load(Ordering::SeqCst) {
+            break active;
+        }
+        drop(active);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    next.run(request).await.map(|body| {
+        axum::body::Body::new(ActiveBody {
+            body,
+            _active: active,
+        })
+    })
+}
+
+/// A response body that stays `Active` until hyper has sent or dropped it, so a
+/// file still streaming after its handler returned isn't cut off by a restart.
+struct ActiveBody {
+    body: axum::body::Body,
+    _active: Active,
+}
+
+impl axum::body::HttpBody for ActiveBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// Relaunch into an update installed underneath this server once that interrupts nothing,
+/// so a long-lived `orx up` stops launching runs and building sandboxes with old code.
+fn spawn_restart_when_idle(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(UPDATE_SAMPLE_INTERVAL).await;
+            let status = updates::status();
+            // The cache can claim an install the exec target doesn't have; never restart in a loop.
+            if !(status.auto_update
+                && status.restart_required
+                && updates::newer_exe_on_disk().await)
+            {
+                continue;
+            }
+            DRAINING.store(true, Ordering::SeqCst);
+            if ACTIVE.load(Ordering::SeqCst) == 0
+                && !state.data_dir_move_in_progress.load(Ordering::SeqCst)
+                && state.remote_sessions.list().await.is_empty()
+                && state.chat.stop_admitting_if_idle().await
+            {
+                state.restart.notify_one();
+                return;
+            }
+            DRAINING.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
 /// Startup summary of detected coding agents. Never blocks. It goes through
 /// the same locked cache path as `/api/harnesses`, so the dashboard's first
 /// call serves the preflight result instead of launching a second sweep.
@@ -5464,7 +5567,11 @@ pub(crate) async fn ssh_connect_to_target(
     if host.is_empty() {
         return bad_request("host is required").into_response();
     }
-    ws.on_upgrade(move |socket| ssh_connect_socket(socket, host, req.backend, target))
+    let active = Active::new();
+    ws.on_upgrade(move |socket| async move {
+        let _active = active;
+        ssh_connect_socket(socket, host, req.backend, target).await
+    })
 }
 
 const DEFAULT_PTY_SIZE: PtySize = PtySize {
@@ -5767,7 +5874,9 @@ async fn project_terminal(
     if let Some(rejected) = reject_cross_origin(&headers) {
         return rejected;
     }
+    let active = Active::new();
     ws.on_upgrade(move |mut socket| async move {
+        let _active = active;
         let mut size = DEFAULT_PTY_SIZE;
         let started = tokio::task::spawn_blocking(move || {
             let root = project_terminal_root(&id, req.session_id.as_deref())?;
@@ -5922,7 +6031,9 @@ async fn command_terminal(
     if let Some(rejected) = reject_cross_origin(headers) {
         return rejected;
     }
+    let active = Active::new();
     ws.on_upgrade(move |mut socket| async move {
+        let _active = active;
         let mut size = DEFAULT_PTY_SIZE;
         let started = match program {
             Ok(program) => spawn_pty(program, args, Vec::new(), size).await,
@@ -7898,6 +8009,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sender.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_streaming_response_stays_active_until_its_body_is_sent() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let release = gate.clone();
+        let app = Router::new()
+            .route(
+                "/file",
+                get(move || async move {
+                    axum::body::Body::from_stream(futures::stream::once(async move {
+                        gate.notified().await;
+                        Ok::<_, Infallible>("done")
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn(track_active));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        assert_eq!(response.text().await.unwrap(), "done");
+        for _ in 0..100 {
+            if ACTIVE.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a sent response body stayed active");
     }
 
     #[tokio::test]

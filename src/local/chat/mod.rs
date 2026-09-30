@@ -2302,6 +2302,8 @@ pub struct ChatHost {
     turns: Mutex<HashMap<String, TurnState>>,
     /// Cross-process ownership tokens for locally active turn slots.
     durable_turns: std::sync::Mutex<HashMap<String, String>>,
+    /// Set once `orx up` commits to restarting into an update; no turn starts after.
+    restarting: std::sync::atomic::AtomicBool,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
@@ -3256,6 +3258,7 @@ impl ChatHost {
             events,
             turns: Mutex::new(HashMap::new()),
             durable_turns: std::sync::Mutex::new(HashMap::new()),
+            restarting: std::sync::atomic::AtomicBool::new(false),
             deleting_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
@@ -3633,7 +3636,23 @@ impl ChatHost {
         f()
     }
 
+    /// Stop admitting turns if none is running, queued, or awaiting an answer. Every
+    /// admission claims under the turn map's lock, so none can slip in after this check.
+    pub async fn stop_admitting_if_idle(&self) -> bool {
+        let turns = self.turns.lock().await;
+        let idle =
+            turns.is_empty() && self.queued_count() == 0 && self.pending_permission_count() == 0;
+        if idle {
+            self.restarting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        idle
+    }
+
     fn claim_durable_turn(&self, session_id: &str) -> bool {
+        if self.restarting.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
         let mut claims = self.durable_turns.lock().unwrap();
         if claims.contains_key(session_id) {
             return false;
@@ -8517,6 +8536,9 @@ pub const LOCAL_SESSION_ENV: &str = "ORX_LOCAL_SESSION";
 /// Loopback port of the trusted `orx up` process that owns local agent runs.
 pub const UP_PORT_ENV: &str = "ORX_UP_PORT";
 
+/// Version of that `orx up`, which keeps running its own code after an update lands on disk.
+pub const UP_VERSION_ENV: &str = "ORX_UP_VERSION";
+
 /// Route-scoped bearer for agent subprocesses calling their owning `orx up`.
 pub const UP_AUTH_TOKEN_ENV: &str = "ORX_UP_AUTH_TOKEN";
 
@@ -8643,9 +8665,11 @@ pub fn set_chat_session_env(
     match up_port {
         Some(port) => {
             cmd.env(UP_PORT_ENV, port.to_string());
+            cmd.env(UP_VERSION_ENV, env!("CARGO_PKG_VERSION"));
         }
         None => {
             cmd.env_remove(UP_PORT_ENV);
+            cmd.env_remove(UP_VERSION_ENV);
         }
     }
     match up_auth_token() {
@@ -9733,6 +9757,19 @@ mod bridge_tests {
             .is_err());
         assert!(!ran);
         assert_eq!(host.while_idle(&[], || Ok(7)).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn restart_stops_admitting_turns_only_when_idle() {
+        let host = test_host();
+        host.turns
+            .lock()
+            .await
+            .insert("busy".into(), TurnState::Reserved { turn_id: None });
+        assert!(!host.stop_admitting_if_idle().await);
+        host.turns.lock().await.clear();
+        assert!(host.stop_admitting_if_idle().await);
+        assert!(!host.claim_durable_turn("next"));
     }
 
     #[tokio::test]
