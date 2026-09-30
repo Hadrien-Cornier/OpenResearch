@@ -6339,7 +6339,7 @@ impl ChatHost {
         autonomy: Autonomy,
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
-        store.set_chat_session_autonomy(session_id, autonomy.id())?;
+        store.set_chat_session_autonomy(session_id, autonomy)?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -9325,7 +9325,7 @@ mod cap_tests {
             None,
             None,
             None,
-            "next".into()
+            "next".into(),
         )
         .contains("the summary"));
 

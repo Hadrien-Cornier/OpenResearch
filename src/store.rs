@@ -17,6 +17,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::error::{anyhow, Result};
+use crate::local::autonomy::Autonomy;
 use crate::local::model::{LocalExperiment, LocalProject};
 use crate::workspace_state::{GlobalWorkspaceState, WorkspaceState};
 
@@ -700,9 +701,9 @@ impl Store {
             "ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN goal TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN autonomy TEXT",
-            "ALTER TABLE ui_state ADD COLUMN preferred_autonomy TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_service_tier TEXT",
             "ALTER TABLE ui_state ADD COLUMN workspace_state_json TEXT",
+            "ALTER TABLE ui_state ADD COLUMN preferred_autonomy TEXT",
             "ALTER TABLE chat_spawns ADD COLUMN wake_parent INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE chat_spawns ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_spawns ADD COLUMN finished_at INTEGER",
@@ -965,7 +966,7 @@ impl Store {
                     preferred_autonomy: row
                         .get::<_, Option<String>>(8)?
                         .as_deref()
-                        .and_then(crate::local::autonomy::Autonomy::from_id),
+                        .and_then(Autonomy::from_id),
                 })
             },
         )?)
@@ -1017,10 +1018,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_preferred_autonomy(&self, autonomy: &str) -> Result<()> {
+    pub fn set_preferred_autonomy(&self, autonomy: Autonomy) -> Result<()> {
         self.conn.execute(
             "UPDATE ui_state SET preferred_autonomy = ?1 WHERE id = 1",
-            params![autonomy],
+            params![autonomy.id()],
         )?;
         Ok(())
     }
@@ -2173,10 +2174,10 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    pub fn set_chat_session_autonomy(&self, id: &str, autonomy: &str) -> Result<()> {
+    pub fn set_chat_session_autonomy(&self, id: &str, autonomy: Autonomy) -> Result<()> {
         self.conn.execute(
             "UPDATE chat_sessions SET autonomy = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, autonomy, now_ms()],
+            params![id, autonomy.id(), now_ms()],
         )?;
         Ok(())
     }
@@ -3144,7 +3145,7 @@ pub struct StoredUiState {
     pub tour_completed: bool,
     pub preferred_agent: Option<StoredAgentSelection>,
     pub workspace: Option<GlobalWorkspaceState>,
-    pub preferred_autonomy: Option<crate::local::autonomy::Autonomy>,
+    pub preferred_autonomy: Option<Autonomy>,
 }
 
 /// Normalized transcript entry; `parts_json` is the wire-format parts array
@@ -3565,7 +3566,7 @@ mod tests {
         store.set_onboarding_completed(true).unwrap();
         store.set_tour_completed(true).unwrap();
         store.set_preferred_agent(&selection).unwrap();
-        store.set_preferred_autonomy("copilot").unwrap();
+        store.set_preferred_autonomy(Autonomy::Copilot).unwrap();
 
         assert_eq!(
             store.ui_state().unwrap(),
@@ -3574,7 +3575,7 @@ mod tests {
                 tour_completed: true,
                 preferred_agent: Some(selection),
                 workspace: None,
-                preferred_autonomy: Some(crate::local::autonomy::Autonomy::Copilot),
+                preferred_autonomy: Some(Autonomy::Copilot),
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4425,7 +4426,7 @@ mod tests {
         let autonomy = |store: &Store| store.get_chat_session("chat_a").unwrap().unwrap().autonomy;
         assert_eq!(autonomy(&store).as_deref(), Some("copilot"));
         store
-            .set_chat_session_autonomy("chat_a", "agentic")
+            .set_chat_session_autonomy("chat_a", Autonomy::Agentic)
             .unwrap();
         assert_eq!(autonomy(&store).as_deref(), Some("agentic"));
         let _ = std::fs::remove_dir_all(&dir);

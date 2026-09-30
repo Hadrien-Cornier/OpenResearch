@@ -4698,11 +4698,12 @@ export function ChatPanel({
         onPreferredAutonomyChange(session.autonomy);
       })
       .catch(() => {
-        if (settingsMutationSeq.current !== mutation) return;
         setSessions((current) =>
-          current.map((row) => (row.id === sessionId ? { ...row, autonomy: previous } : row)),
+          current.map((row) =>
+            row.id === sessionId && row.autonomy === autonomy ? { ...row, autonomy: previous } : row,
+          ),
         );
-        setSettingsError(m.chat_update_autonomy_failed());
+        if (settingsMutationSeq.current === mutation) setSettingsError(m.chat_update_autonomy_failed());
       });
   };
   const sessionGoal = openSession?.goal?.trim() || "";

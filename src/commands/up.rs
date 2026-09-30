@@ -5295,7 +5295,7 @@ async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
             store.set_preferred_agent(&selection)?;
         }
         if let Some(autonomy) = req.preferred_autonomy {
-            store.set_preferred_autonomy(autonomy.id())?;
+            store.set_preferred_autonomy(autonomy)?;
         }
         if let Some(workspace) = req.workspace {
             store.set_global_workspace_state(&workspace)?;
