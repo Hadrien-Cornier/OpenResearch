@@ -275,6 +275,16 @@ pub(crate) fn installed_origin(owner: &str, repo: &str) -> Option<PathBuf> {
     origin.exists().then_some(origin)
 }
 
+/// Analytics label for launching `experiment`, or `None` outside the demo project.
+pub(crate) fn run_label(experiment: &LocalExperiment) -> Option<&'static str> {
+    (experiment.project_id == PROJECT_ID).then_some(match experiment.id.as_str() {
+        EXPERIMENT_ID => "cpu_end_to_end",
+        LR_PROBE_EXPERIMENT_ID => "lr_probe",
+        VOCAB_PROBE_EXPERIMENT_ID => "vocab_probe",
+        _ => "other",
+    })
+}
+
 pub(crate) fn turn_context(project_id: &str) -> Option<&'static str> {
     (project_id == PROJECT_ID).then_some(TURN_CONTEXT)
 }
