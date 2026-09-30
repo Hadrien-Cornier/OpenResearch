@@ -1183,6 +1183,7 @@ pub fn import_native_chat(
         context_usage_json: None,
         bootstrap_context: None,
         goal: None,
+        autonomy: None,
         active_leaf_id: None,
         parent_session_id: None,
         created_at: now_ms(),
@@ -1241,6 +1242,7 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         "activeLeafId": s.active_leaf_id,
         "parentSessionId": s.parent_session_id,
         "goal": s.goal,
+        "autonomy": crate::local::autonomy::Autonomy::from_stored(s.autonomy.as_deref()).id(),
     })
 }
 
@@ -1269,6 +1271,7 @@ fn with_turn_context(
     native_session_id: Option<&str>,
     bootstrap_context: Option<&str>,
     goal: Option<&str>,
+    autonomy: Option<&str>,
     demo_evidence_context: Option<&str>,
     shell_context: Option<&str>,
     text: String,
@@ -1286,6 +1289,9 @@ fn with_turn_context(
     });
     if let Some(goal) = goal.as_deref() {
         contexts.push(goal);
+    }
+    if let Some(autonomy) = autonomy {
+        contexts.push(autonomy);
     }
     if let Some(context) = demo_evidence_context {
         contexts.push(context);
@@ -2006,6 +2012,7 @@ mod shell_command_tests {
             None,
             None,
             None,
+            None,
             Some(&context),
             "why?".into(),
         );
@@ -2022,6 +2029,7 @@ mod initial_message_tests {
         contextualize_messages, is_initial_chat_message, with_selected_chat_context,
         with_turn_context, AnnotatedText, TextAnnotation,
     };
+    use crate::local::autonomy::Autonomy;
     use serde_json::{json, Value};
 
     #[test]
@@ -2039,6 +2047,7 @@ mod initial_message_tests {
             None,
             None,
             None,
+            None,
             "continue".into(),
         );
         assert!(seeded.contains("prior demo"));
@@ -2050,12 +2059,13 @@ mod initial_message_tests {
                 None,
                 None,
                 None,
+                None,
                 "continue".into()
             ),
             "continue"
         );
         assert_eq!(
-            with_turn_context(None, None, None, None, None, "continue".into()),
+            with_turn_context(None, None, None, None, None, None, "continue".into()),
             "continue"
         );
     }
@@ -2068,6 +2078,7 @@ mod initial_message_tests {
             Some("ship the sweep"),
             None,
             None,
+            None,
             "continue".into(),
         );
         assert!(seeded.contains("ship the sweep"));
@@ -2076,9 +2087,34 @@ mod initial_message_tests {
         assert!(!seeded.contains("prior demo"));
         assert!(seeded.contains("<current-user-message>\ncontinue"));
         assert_eq!(
-            with_turn_context(Some("native"), None, None, None, None, "continue".into()),
+            with_turn_context(
+                Some("native"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "continue".into()
+            ),
             "continue"
         );
+    }
+
+    #[test]
+    fn autonomy_rides_every_turn_after_the_goal() {
+        let turn = with_turn_context(
+            Some("native"),
+            None,
+            Some("ship the sweep"),
+            Autonomy::Copilot.turn_context(),
+            None,
+            None,
+            "continue".into(),
+        );
+        let goal = turn.find("<orx-goal>").unwrap();
+        let autonomy = turn.find("<orx-autonomy level=\"copilot\">").unwrap();
+        assert!(goal < autonomy);
+        assert!(turn.ends_with("<current-user-message>\ncontinue\n</current-user-message>"));
     }
 
     #[test]
@@ -2087,6 +2123,7 @@ mod initial_message_tests {
             None,
             Some("prior demo"),
             None,
+            None,
             Some("demo evidence"),
             None,
             "first".into(),
@@ -2094,6 +2131,7 @@ mod initial_message_tests {
         let follow_up = with_turn_context(
             Some("native"),
             Some("prior demo"),
+            None,
             None,
             Some("demo evidence"),
             None,
@@ -2106,7 +2144,15 @@ mod initial_message_tests {
         assert!(follow_up.contains("<current-user-message>\nfollow up"));
         assert_eq!(first.matches("<current-user-message>").count(), 1);
         assert_eq!(
-            with_turn_context(Some("native"), None, None, None, None, "ordinary".into()),
+            with_turn_context(
+                Some("native"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ordinary".into()
+            ),
             "ordinary"
         );
     }
@@ -5489,6 +5535,8 @@ impl ChatHost {
                 session.native_session_id.as_deref(),
                 session.bootstrap_context.as_deref(),
                 session.goal.as_deref(),
+                crate::local::autonomy::Autonomy::from_stored(session.autonomy.as_deref())
+                    .turn_context(),
                 super::demo::turn_context(&project.id),
                 shell_context.as_deref(),
                 expanded,
@@ -6282,6 +6330,16 @@ impl ChatHost {
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
         store.set_chat_session_goal(session_id, goal)?;
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    pub async fn set_autonomy(
+        &self,
+        session_id: &str,
+        autonomy: crate::local::autonomy::Autonomy,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        store.set_chat_session_autonomy(session_id, autonomy.id())?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -9070,6 +9128,7 @@ mod cap_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
                 created_at: 1,
@@ -9177,6 +9236,7 @@ mod cap_tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
             created_at: 1,
@@ -9233,6 +9293,7 @@ mod cap_tests {
             context_usage_json: Some("{\"usedTokens\":9000}".into()),
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
             created_at: 1,
@@ -9263,7 +9324,8 @@ mod cap_tests {
             None,
             None,
             None,
-            "next".into(),
+            None,
+            "next".into()
         )
         .contains("the summary"));
 
@@ -9992,6 +10054,7 @@ mod bridge_tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
             created_at: 1,
@@ -10147,6 +10210,7 @@ mod run_wakeup_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
                 created_at: 1,
@@ -11000,6 +11064,7 @@ mod steering_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
                 created_at: 1,

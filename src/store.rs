@@ -699,6 +699,8 @@ impl Store {
             "ALTER TABLE chat_sessions ADD COLUMN active_leaf_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN goal TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN autonomy TEXT",
+            "ALTER TABLE ui_state ADD COLUMN preferred_autonomy TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_service_tier TEXT",
             "ALTER TABLE ui_state ADD COLUMN workspace_state_json TEXT",
             "ALTER TABLE chat_spawns ADD COLUMN wake_parent INTEGER NOT NULL DEFAULT 1",
@@ -936,7 +938,8 @@ impl Store {
         Ok(self.conn.query_row(
             "SELECT onboarding_completed, tour_completed, preferred_harness,
                     preferred_model, preferred_service_tier,
-                    preferred_permission_mode, preferred_reasoning_level, workspace_state_json
+                    preferred_permission_mode, preferred_reasoning_level, workspace_state_json,
+                    preferred_autonomy
              FROM ui_state WHERE id = 1",
             [],
             |row| {
@@ -959,6 +962,7 @@ impl Store {
                     workspace: workspace_json
                         .as_deref()
                         .and_then(GlobalWorkspaceState::from_stored),
+                    preferred_autonomy: row.get(8)?,
                 })
             },
         )?)
@@ -1006,6 +1010,14 @@ impl Store {
         self.conn.execute(
             "UPDATE ui_state SET tour_completed = ?1 WHERE id = 1",
             params![completed],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_preferred_autonomy(&self, autonomy: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ui_state SET preferred_autonomy = ?1 WHERE id = 1",
+            params![autonomy],
         )?;
         Ok(())
     }
@@ -1950,8 +1962,8 @@ impl Store {
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
                                         service_tier, permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
-                                        active_leaf_id, parent_session_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                                        active_leaf_id, parent_session_id, created_at, updated_at, autonomy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 s.id,
                 s.project_id,
@@ -1971,6 +1983,7 @@ impl Store {
                 s.parent_session_id,
                 s.created_at,
                 s.updated_at,
+                s.autonomy,
             ],
         )?;
         Ok(())
@@ -2155,6 +2168,14 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(rows.flatten().collect())
+    }
+
+    pub fn set_chat_session_autonomy(&self, id: &str, autonomy: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions SET autonomy = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, autonomy, now_ms()],
+        )?;
+        Ok(())
     }
 
     pub fn set_chat_session_goal(&self, id: &str, goal: Option<&str>) -> Result<()> {
@@ -3091,6 +3112,8 @@ pub struct StoredChatSession {
     /// What the user asked the agent to keep working toward (`/goal`), carried
     /// into every turn until they clear it.
     pub goal: Option<String>,
+    /// Research autonomy level id (`crate::local::autonomy`); `None` is the default.
+    pub autonomy: Option<String>,
     /// Tip of the branch the UI is currently showing. Forked turns make the
     /// transcript a tree; this picks which path through it is live.
     pub active_leaf_id: Option<String>,
@@ -3118,6 +3141,7 @@ pub struct StoredUiState {
     pub tour_completed: bool,
     pub preferred_agent: Option<StoredAgentSelection>,
     pub workspace: Option<GlobalWorkspaceState>,
+    pub preferred_autonomy: Option<String>,
 }
 
 /// Normalized transcript entry; `parts_json` is the wire-format parts array
@@ -3245,7 +3269,7 @@ fn row_to_chat_turn(
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, service_tier, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
      created_at, updated_at, title_source, bootstrap_context, active_leaf_id, parent_session_id, \
-     goal";
+     goal, autonomy";
 
 fn row_to_chat_spawn(row: &rusqlite::Row<'_>) -> std::result::Result<ChatSpawn, rusqlite::Error> {
     Ok(ChatSpawn {
@@ -3282,6 +3306,7 @@ fn row_to_chat_session(
         active_leaf_id: row.get(17)?,
         parent_session_id: row.get(18)?,
         goal: row.get(19)?,
+        autonomy: row.get(20)?,
     })
 }
 
@@ -3523,6 +3548,7 @@ mod tests {
                 tour_completed: false,
                 preferred_agent: None,
                 workspace: None,
+                preferred_autonomy: None,
             }
         );
 
@@ -3536,6 +3562,7 @@ mod tests {
         store.set_onboarding_completed(true).unwrap();
         store.set_tour_completed(true).unwrap();
         store.set_preferred_agent(&selection).unwrap();
+        store.set_preferred_autonomy("copilot").unwrap();
 
         assert_eq!(
             store.ui_state().unwrap(),
@@ -3544,6 +3571,7 @@ mod tests {
                 tour_completed: true,
                 preferred_agent: Some(selection),
                 workspace: None,
+                preferred_autonomy: Some("copilot".into()),
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4365,6 +4393,7 @@ mod tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
             created_at: 1,
@@ -4381,6 +4410,22 @@ mod tests {
             attempts: 0,
             finished_at: None,
         }
+    }
+
+    #[test]
+    fn chat_session_autonomy_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("orx-store-autonomy-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut session = chat_session_fixture("chat_a");
+        session.autonomy = Some("copilot".into());
+        store.create_chat_session(&session).unwrap();
+        let autonomy = |store: &Store| store.get_chat_session("chat_a").unwrap().unwrap().autonomy;
+        assert_eq!(autonomy(&store).as_deref(), Some("collaborator"));
+        store
+            .set_chat_session_autonomy("chat_a", "agentic")
+            .unwrap();
+        assert_eq!(autonomy(&store).as_deref(), Some("agentic"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

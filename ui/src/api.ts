@@ -222,7 +222,11 @@ export interface UiState {
   onboardingCompleted: boolean;
   tourCompleted: boolean;
   preferredAgent: AgentSelection | null;
+  preferredAutonomy: Autonomy | null;
 }
+
+/** How much of the research the agent owns before checking in. */
+export type Autonomy = "copilot" | "agentic";
 
 export const getUiState = (signal?: AbortSignal) => get<UiState>("/api/settings/ui-state", signal);
 
@@ -238,6 +242,7 @@ export const updateUiState = (body: {
   workspace?: GlobalWorkspace;
   tourCompleted?: boolean;
   preferredAgent?: AgentSelection;
+  preferredAutonomy?: Autonomy;
 }) => post<UiState>("/api/settings/ui-state", body);
 
 export const completeOnboarding = (selection: OnboardingSelection, profile: Profile) =>
@@ -1909,6 +1914,7 @@ export interface ChatSession {
   planMode: boolean;
   /** What `/goal` asked the agent to keep working toward; null when unset. */
   goal?: string | null;
+  autonomy: Autonomy;
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
@@ -1965,7 +1971,7 @@ export interface TurnOptions {
 export const createChatSession = (
   projectId: string,
   harness: HarnessId,
-  opts: TurnOptions = {},
+  opts: TurnOptions & { autonomy?: Autonomy } = {},
 ) =>
   post<{ session: ChatSession }>("/api/chat/sessions", { projectId, harness, ...opts }).then(
     (r) => r.session,
@@ -1997,6 +2003,11 @@ export const setChatSessionPlanMode = (sessionId: string, planMode: boolean) =>
 /** `null` clears the goal. */
 export const setChatSessionGoal = (sessionId: string, goal: string | null) =>
   patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { goal }).then(
+    (r) => r.session,
+  );
+
+export const setChatSessionAutonomy = (sessionId: string, autonomy: Autonomy) =>
+  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { autonomy }).then(
     (r) => r.session,
   );
 

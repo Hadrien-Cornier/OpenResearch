@@ -95,6 +95,7 @@ import {
   fmtDuration,
   sendChatMessage,
   setChatSessionArchived,
+  setChatSessionAutonomy,
   setChatSessionPermissionMode,
   importNativeChat,
   setChatSessionGoal,
@@ -104,6 +105,7 @@ import {
   type ChatMessage,
   type ChatPart,
   type ChatPrompt,
+  type Autonomy,
   type ChatSession,
   type Harness,
   type PromptAnswer,
@@ -4192,6 +4194,8 @@ export function ChatPanel({
   onActiveSessionChange,
   preferredAgent,
   onPreferredAgentChange,
+  preferredAutonomy,
+  onPreferredAutonomyChange,
   children,
 }: {
   projectId: string;
@@ -4252,11 +4256,14 @@ export function ChatPanel({
   /** Database-backed selection used to seed new chat sessions. */
   preferredAgent: ModelSelection | null;
   onPreferredAgentChange: (selection: ModelSelection) => Promise<void>;
+  preferredAutonomy: Autonomy;
+  onPreferredAutonomyChange: (autonomy: Autonomy) => void;
   /** Middle-pane content when a settings section is active. */
   children?: React.ReactNode;
 }) {
   const setChatSessionPermissionModeMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionPermissionMode>) => setChatSessionPermissionMode(...args) });
   const setChatSessionPlanModeMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionPlanMode>) => setChatSessionPlanMode(...args) });
+  const setChatSessionAutonomyMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionAutonomy>) => setChatSessionAutonomy(...args) });
   const setChatSessionGoalMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionGoal>) => setChatSessionGoal(...args) });
   const importNativeChatMutation = useMutation({ mutationFn: (args: Parameters<typeof importNativeChat>) => importNativeChat(...args) });
   const createChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof createChatSession>) => createChatSession(...args) });
@@ -4673,6 +4680,24 @@ export function ChatPanel({
       });
   };
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
+  const setAutonomy = (autonomy: Autonomy) => {
+    onPreferredAutonomyChange(autonomy);
+    if (!openSession) return;
+    const sessionId = openSession.id;
+    const previous = openSession.autonomy;
+    const replace = (session: ChatSession) =>
+      setSessions((current) => current.map((row) => (row.id === session.id ? session : row)));
+    replace({ ...openSession, autonomy });
+    setSettingsError(null);
+    void queueSessionMutation(() => setChatSessionAutonomyMutation.mutateAsync([sessionId, autonomy]))
+      .then(replace)
+      .catch(() => {
+        setSessions((current) =>
+          current.map((row) => (row.id === sessionId ? { ...row, autonomy: previous } : row)),
+        );
+        setSettingsError(m.chat_update_autonomy_failed());
+      });
+  };
   const sessionGoal = openSession?.goal?.trim() || "";
   const planActive = composerSelection?.harness === "claude-code"
     ? composerSelection.permissionMode === "plan"
@@ -5609,6 +5634,7 @@ export function ChatPanel({
       permissionMode: selection.permissionMode,
       planMode,
       reasoningLevel: selection.reasoningLevel,
+      autonomy: preferredAutonomy,
     }]);
     if (projectVisitRef.current === visit) {
       setSessions((cur) => [session, ...cur.filter((row) => row.id !== session.id)]);
@@ -6712,6 +6738,8 @@ export function ChatPanel({
                   reasoningChoices={activeHarness?.agentReady ? reasoning.choices : []}
                   defaultReasoningId={reasoning.defaultId}
                   onSelectReasoning={setReasoningLevel}
+                  autonomy={openSession?.autonomy ?? preferredAutonomy}
+                  onSelectAutonomy={setAutonomy}
                   lockHarness={!!openSession}
                   openRequest={modelPickerRequest}
                 />
