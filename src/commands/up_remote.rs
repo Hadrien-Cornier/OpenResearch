@@ -1124,6 +1124,7 @@ fn gateway_router(session: Arc<RemoteSession>) -> Router {
         )
         .fallback(gateway_fallback)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(middleware::from_fn(super::up::track_active))
         .layer(middleware::from_fn(gateway_loopback_guard))
         .with_state(session)
 }

@@ -4318,7 +4318,7 @@ impl Drop for Active {
     }
 }
 
-async fn track_active(request: axum::extract::Request, next: Next) -> Response {
+pub(crate) async fn track_active(request: axum::extract::Request, next: Next) -> Response {
     // The dashboard holds its event stream open for as long as it is open.
     if request.uri().path() == "/api/events" {
         return next.run(request).await;
