@@ -1674,7 +1674,10 @@ export interface Harness {
   version?: string;
   authenticated: boolean;
   authState: "ready" | "needsLogin" | "unknown" | "unsupported";
-  authMethod?: "oauth" | "apiKey" | "local";
+  authMethod?: "oauth" | "apiKey" | "thirdParty" | "local";
+  authProvider?: string;
+  loginEligible?: boolean;
+  authCheckFailed?: boolean;
   accountLoading?: boolean;
   account?: string;
   org?: string;

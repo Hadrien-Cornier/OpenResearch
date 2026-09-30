@@ -187,6 +187,35 @@ pub async fn run_antigravity() -> Result<()> {
     use tokio::io::AsyncReadExt;
     let mut input = String::new();
     tokio::io::stdin().read_to_string(&mut input).await?;
+    if let Ok(payload) = serde_json::from_str::<Value>(&input) {
+        if payload.get("initialNumSteps").is_some() {
+            let conversation = payload
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Missing native conversation identity"))?;
+            let step = payload
+                .get("initialNumSteps")
+                .and_then(Value::as_i64)
+                .filter(|step| *step >= 0)
+                .ok_or_else(|| anyhow!("Missing native invocation step"))?;
+            let model = payload
+                .get("modelName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Missing native invocation model"))?;
+            let identity = crate::store::InvocationIdentity {
+                harness: "antigravity".into(),
+                model: model.to_string(),
+                provider: None,
+            };
+            crate::store::Store::open()?.record_native_invocation(
+                &crate::local::harness::antigravity::invocation_sample_id(conversation, step),
+                &identity,
+                Some(conversation),
+            )?;
+            println!("{{}}");
+            return Ok(());
+        }
+    }
     let decision = antigravity_decision(&input).await.unwrap_or_else(|error| {
         json!({"decision": "deny", "reason": format!("OpenResearch approval bridge unavailable: {error}")})
     });

@@ -1750,6 +1750,24 @@ fn opencode_response_is_current(message: &Value, turn_started_at: i64) -> bool {
 /// `input + output + reasoning + cache.read + cache.write`. Returns `None` when
 /// the object is absent, and `None` (not `Some(0)`) when every field is zero —
 /// the early `message.updated` events carry an all-zero placeholder.
+fn opencode_native_usage(tokens: &Value) -> crate::store::TokenUsage {
+    let field = |name| tokens.get(name).and_then(Value::as_u64);
+    let cache_read_tokens = tokens.pointer("/cache/read").and_then(Value::as_u64);
+    let cache_write_tokens = tokens.pointer("/cache/write").and_then(Value::as_u64);
+    let reasoning_tokens = field("reasoning");
+    crate::store::TokenUsage {
+        input_tokens: field("input").and_then(|input| {
+            input
+                .checked_add(cache_read_tokens?)
+                .and_then(|n| n.checked_add(cache_write_tokens?))
+        }),
+        output_tokens: field("output").and_then(|output| output.checked_add(reasoning_tokens?)),
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+    }
+}
+
 fn opencode_used_tokens(tokens: Option<&Value>) -> Option<u64> {
     let tokens = tokens?;
     let field = |v: &Value, name: &str| v.get(name).and_then(Value::as_u64).unwrap_or(0);
@@ -1820,6 +1838,17 @@ fn handle_event(
         // events stream into that row's `children`.
         Some("session.created") => {
             let info = props.get("info").unwrap_or(&Value::Null);
+            if info
+                .get("parentID")
+                .and_then(Value::as_str)
+                .is_some_and(|parent| {
+                    parent == native_id || ctx.native_usage_scopes.contains(parent)
+                })
+            {
+                if let Some(child) = info.get("id").and_then(Value::as_str) {
+                    ctx.native_usage_scopes.insert(child.to_string());
+                }
+            }
             if info.get("parentID").and_then(Value::as_str) == Some(native_id) {
                 if let Some(child_id) = info.get("id").and_then(Value::as_str) {
                     if let Some(spawn) = newest_task_part_id(&ctx.assistant.parts, sub_sessions) {
@@ -1848,6 +1877,24 @@ fn handle_event(
                     assistant_msgs.insert(id.to_string());
                 }
             }
+            let accountable = session == Some(native_id)
+                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session));
+            if accountable && info.get("role").and_then(Value::as_str) == Some("assistant") {
+                if let (Some(id), Some(model), Some(provider)) = (
+                    info.get("id").and_then(Value::as_str),
+                    info.get("modelID").and_then(Value::as_str),
+                    info.get("providerID").and_then(Value::as_str),
+                ) {
+                    ctx.native_message_models.insert(
+                        id.to_string(),
+                        crate::store::InvocationIdentity {
+                            harness: "opencode".into(),
+                            model: model.to_string(),
+                            provider: Some(provider.to_string()),
+                        },
+                    );
+                }
+            }
             // Only the MAIN session's tokens drive the context meter; a
             // sub-agent's smaller counts must not overwrite it.
             if session == Some(native_id) && is_assistant {
@@ -1870,6 +1917,25 @@ fn handle_event(
                 .get("messageID")
                 .and_then(Value::as_str)
                 .is_some_and(|mid| assistant_msgs.contains(mid));
+            if (session == Some(native_id)
+                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session)))
+                && part.get("type").and_then(Value::as_str) == Some("step-finish")
+            {
+                if let (Some(id), Some(tokens)) =
+                    (part.get("id").and_then(Value::as_str), part.get("tokens"))
+                {
+                    let identity = part
+                        .get("messageID")
+                        .and_then(Value::as_str)
+                        .and_then(|id| ctx.native_message_models.get(id));
+                    ctx.record_native_usage(
+                        id,
+                        identity.map(|i| i.model.as_str()),
+                        identity.and_then(|i| i.provider.as_deref()),
+                        opencode_native_usage(tokens),
+                    );
+                }
+            }
             // A sub-agent's part (foreign sessionID we've registered) streams
             // into its owning `task` row's children, with a namespaced id — but
             // only assistant-owned parts (skip the child's user prompt echo).
@@ -2472,6 +2538,18 @@ opencode/unknown
     }
 
     #[test]
+    fn native_step_tokens_restore_inclusive_counters() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/opencode-mock-usage.json")).unwrap();
+        let usage = opencode_native_usage(&fixture[0]["tokens"]);
+        usage.validate().unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.reasoning_tokens, Some(5));
+        assert_eq!(usage.total(), Some(120));
+    }
+
+    #[test]
     fn message_updated_reports_summed_tokens_without_window() {
         let mut ctx = TurnCtx::test_stub();
         let mut msgs = HashSet::new();
@@ -2662,6 +2740,25 @@ opencode/unknown
             &mut subs,
         );
         assert_eq!(subs.get("ses_child").map(String::as_str), Some("prt_task"));
+        handle_event(
+            &mut ctx,
+            "ses_main",
+            &json!({"type":"session.created","properties":{"info":{"id":"ses_grandchild","parentID":"ses_child"}}}),
+            &mut msgs,
+            &mut subs,
+        );
+        handle_event(
+            &mut ctx,
+            "ses_main",
+            &json!({"type":"message.updated","properties":{"info":{"id":"msg_grandchild","sessionID":"ses_grandchild","role":"assistant","modelID":"child-model","providerID":"fixture"}}}),
+            &mut msgs,
+            &mut subs,
+        );
+        assert!(ctx.native_usage_scopes.contains("ses_grandchild"));
+        assert_eq!(
+            ctx.native_message_models["msg_grandchild"].model,
+            "child-model"
+        );
         // The child session's assistant message + a tool part → nests under task.
         handle_event(
             &mut ctx,

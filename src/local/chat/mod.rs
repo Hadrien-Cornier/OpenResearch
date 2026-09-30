@@ -5662,6 +5662,11 @@ impl ChatHost {
             ctx.steering = Some(rx);
             self.register_steering(&sid, tx, TurnSettings::of(&ctx))
         });
+        Store::open()?.begin_usage_execution(
+            &ctx.usage_execution_id,
+            &ctx.turn_id,
+            &ctx.harness,
+        )?;
         let task = tokio::spawn(async move {
             ctx.attempt_count = 1;
             let _ = Store::open().and_then(|store| {
@@ -5701,6 +5706,7 @@ impl ChatHost {
                 }
                 Ok(crate::local::harness::TurnOutcome::Completed) => ctx.terminal_error.take(),
             };
+            let usage_outcome = if failure.is_some() { "failed" } else { "done" };
             let _terminal_won = if let Some((kind, message)) = failure {
                 let action = ctx.delivery_state.recovery_action();
                 let retry_owner = ctx
@@ -5746,6 +5752,11 @@ impl ChatHost {
             } else {
                 false
             };
+            if _terminal_won {
+                let _ = Store::open()
+                    .and_then(|store| store.finalize_turn_usage(&ctx.turn_id, usage_outcome));
+            }
+            crate::telemetry::retry_outbox();
             ctx.assistant.completed_at = Some(now_ms());
             let _ = ctx.flush();
             if let Some(path) = ctx.target_event_path.as_ref() {
@@ -5933,6 +5944,9 @@ impl ChatHost {
                 .flatten();
             if let Some(active) = active {
                 let _ = active.handle.await;
+                let _ = Store::open()
+                    .and_then(|store| store.finalize_turn_usage(&active.turn_id, "cancelled"));
+                crate::telemetry::retry_outbox();
                 let mut message = reconcile_target_file(&session_id, &active.message_id);
                 if let Some(items) = interrupted_items.as_deref() {
                     message = crate::local::harness::codex::reconcile_interrupted_items(
@@ -6890,6 +6904,9 @@ pub struct TurnCtx {
     pub host: Arc<ChatHost>,
     pub turn_id: String,
     durable: bool,
+    usage_execution_id: String,
+    pub(crate) native_message_models: HashMap<String, crate::store::InvocationIdentity>,
+    pub(crate) native_usage_scopes: HashSet<String>,
     delivery_state: DeliveryState,
     attempt_count: i64,
     retry_owner: Option<String>,
@@ -6945,6 +6962,9 @@ fn turn_ctx_from_stored(
         host,
         turn_id: turn.id.clone(),
         durable: true,
+        usage_execution_id: uuid::Uuid::new_v4().to_string(),
+        native_message_models: HashMap::new(),
+        native_usage_scopes: HashSet::new(),
         delivery_state: DeliveryState::NotSent,
         attempt_count: turn.attempt_count,
         retry_owner: None,
@@ -7009,6 +7029,126 @@ fn rebase_prepared_attachment_paths(input: &str) -> String {
 }
 
 impl TurnCtx {
+    pub(crate) fn record_native_invocations(&self, message: &Value) {
+        if !self.durable {
+            return;
+        }
+        let Some(model) = message.get("model").and_then(Value::as_str) else {
+            return;
+        };
+        let identity = crate::store::InvocationIdentity {
+            harness: self.harness.clone(),
+            model: model.to_string(),
+            provider: message
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        if let Some(parts) = message.get("content").and_then(Value::as_array) {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if let Some(call_id) = part.get("id").and_then(Value::as_str) {
+                        if let Err(error) = Store::open().and_then(|store| {
+                            store.record_native_invocation(
+                                call_id,
+                                &identity,
+                                Some(&self.session_id),
+                            )
+                        }) {
+                            eprintln!("orx up: could not capture native tool identity: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record_cumulative_usage(
+        &self,
+        native_scope: &str,
+        native_turn: &str,
+        total: crate::store::TokenUsage,
+        last: crate::store::TokenUsage,
+    ) {
+        if !self.durable {
+            return;
+        }
+        if let Err(error) = Store::open().and_then(|store| {
+            store.record_cumulative_usage(
+                &self.usage_execution_id,
+                &self.harness,
+                native_scope,
+                native_turn,
+                &total,
+                &last,
+            )
+        }) {
+            eprintln!("orx up: could not persist cumulative usage: {error}");
+        }
+    }
+
+    pub(crate) fn begin_native_usage_attempt(&self, prefix: &str) -> Result<()> {
+        if !self.durable {
+            return Ok(());
+        }
+        Store::open()?.begin_native_usage_attempt(
+            &self.usage_execution_id,
+            prefix,
+            &self.harness,
+            self.native_session_id.as_deref(),
+        )
+    }
+
+    pub(crate) fn record_native_aggregate(
+        &self,
+        prefix: &str,
+        native_scope: &str,
+        samples: &[(String, Option<String>, crate::store::TokenUsage)],
+    ) {
+        if !self.durable {
+            return;
+        }
+        if let Err(error) = Store::open().and_then(|store| {
+            store.replace_native_usage_aggregate(
+                &self.usage_execution_id,
+                prefix,
+                &self.harness,
+                native_scope,
+                samples,
+            )
+        }) {
+            eprintln!("orx up: could not reconcile native token usage: {error}");
+        }
+    }
+
+    pub(crate) fn attempt_count_for_usage(&self) -> i64 {
+        self.attempt_count
+    }
+
+    pub(crate) fn record_native_usage(
+        &self,
+        sample_id: &str,
+        model: Option<&str>,
+        provider: Option<&str>,
+        usage: crate::store::TokenUsage,
+    ) {
+        if !self.durable {
+            return;
+        }
+        if let Err(error) = Store::open().and_then(|store| {
+            store.record_usage_sample(
+                &self.usage_execution_id,
+                sample_id,
+                &self.harness,
+                model,
+                provider,
+                &usage,
+            )
+        }) {
+            eprintln!("orx up: could not persist native token usage: {error}");
+        }
+    }
+
     pub fn http(&self) -> &reqwest::Client {
         &self.host.http
     }
@@ -7203,6 +7343,9 @@ impl TurnCtx {
             )),
             turn_id: "test-turn".into(),
             durable: false,
+            usage_execution_id: "test-execution".into(),
+            native_message_models: HashMap::new(),
+            native_usage_scopes: HashSet::new(),
             delivery_state: DeliveryState::NotSent,
             attempt_count: 0,
             retry_owner: None,

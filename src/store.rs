@@ -8,6 +8,9 @@
 //! Data dir: `$ORX_DATA_DIR`, else `$XDG_DATA_HOME/openresearch`, else
 //! `~/.local/share/openresearch`.
 
+mod telemetry;
+pub(crate) use telemetry::{InvocationIdentity, TokenUsage};
+
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -450,6 +453,51 @@ impl Store {
                 ended_at     INTEGER,
                 exit_code    INTEGER
             );
+            CREATE TABLE IF NOT EXISTS native_invocation_identities (
+                harness TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                identity_json TEXT NOT NULL,
+                PRIMARY KEY (harness, call_id)
+            );
+            CREATE TABLE IF NOT EXISTS run_telemetry (
+                run_id TEXT PRIMARY KEY,
+                identity_json TEXT,
+                report_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS telemetry_pending_events (
+                event_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS native_usage_totals (
+                harness TEXT NOT NULL,
+                native_scope TEXT NOT NULL,
+                totals_json TEXT NOT NULL,
+                PRIMARY KEY (harness, native_scope)
+            );
+            CREATE TABLE IF NOT EXISTS native_usage_baselines (
+                execution_id TEXT NOT NULL,
+                prefix TEXT NOT NULL,
+                totals_json TEXT,
+                PRIMARY KEY (execution_id, prefix)
+            );
+            CREATE TABLE IF NOT EXISTS chat_usage_executions (
+                execution_id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                report_id TEXT NOT NULL,
+                suppressed INTEGER NOT NULL,
+                outcome TEXT
+            );
+            CREATE TABLE IF NOT EXISTS chat_usage_samples (
+                execution_id TEXT NOT NULL,
+                sample_id TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                model TEXT,
+                provider TEXT,
+                usage_json TEXT NOT NULL,
+                complete INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (execution_id, sample_id)
+            );
             CREATE TABLE IF NOT EXISTS local_projects (
                 id              TEXT PRIMARY KEY,
                 name            TEXT NOT NULL,
@@ -617,6 +665,9 @@ impl Store {
         // Best-effort migrations for pre-existing dbs; re-runs fail with
         // "duplicate column name", which is exactly the no-op we want.
         for ddl in [
+            "ALTER TABLE native_invocation_identities ADD COLUMN session_id TEXT",
+            "ALTER TABLE native_invocation_identities ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_usage_samples ADD COLUMN complete INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE runs ADD COLUMN commit_sha TEXT",
             "ALTER TABLE runs ADD COLUMN result_markdown TEXT",
             "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
@@ -657,6 +708,11 @@ impl Store {
         ] {
             let _ = conn.execute(ddl, []);
         }
+        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
+        conn.execute(
+            "DELETE FROM native_invocation_identities WHERE session_id IS NULL AND created_at < ?1",
+            [now_ms() - 7 * 24 * 60 * 60 * 1000],
+        )?;
         // Legacy tool failures cannot identify the missing dependency, so require one fresh check.
         conn.execute(
             "DELETE FROM ssh_host_tests
@@ -975,8 +1031,12 @@ impl Store {
     pub fn upsert_run(&self, run: &StoredRun) -> Result<()> {
         let status = RunStatus::parse(&run.status)
             .ok_or_else(|| anyhow!("Unknown run status: {}", run.status))?;
-        let tx = self.begin()?;
-        tx.execute(
+        let tx = self
+            .conn
+            .is_autocommit()
+            .then(|| self.begin())
+            .transpose()?;
+        self.conn.execute(
             "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, command,
                                created_at, updated_at, ended_at, exit_code,
                                commit_sha, result_markdown, cancel_requested,
@@ -1007,12 +1067,14 @@ impl Store {
         )?;
         // Late submission handles must survive even when their status update is stale.
         if self.update_status(&run.id, status, run.ended_at, run.exit_code)? {
-            tx.execute(
+            self.conn.execute(
                 "UPDATE runs SET result_markdown = ?2, updated_at = ?3 WHERE id = ?1",
                 params![run.id, run.result_markdown, run.updated_at],
             )?;
         }
-        tx.commit()?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -1024,6 +1086,11 @@ impl Store {
         ended_at: Option<i64>,
         exit_code: Option<i64>,
     ) -> Result<bool> {
+        let tx = self
+            .conn
+            .is_autocommit()
+            .then(|| self.begin())
+            .transpose()?;
         let applied = self.conn.execute(
             "UPDATE runs SET status = ?2, updated_at = ?3, ended_at = COALESCE(?4, ended_at),
                              exit_code = COALESCE(?5, exit_code)
@@ -1038,6 +1105,12 @@ impl Store {
                 RunStatus::Running.can_transition_to(status),
             ],
         )?;
+        if applied == 1 && status.is_terminal() {
+            self.stage_run_terminal(run_id, status)?;
+        }
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(applied == 1)
     }
 
@@ -2747,6 +2820,7 @@ impl Store {
             params![now],
         )?;
         transaction.commit()?;
+        self.recover_terminal_usage()?;
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {CHAT_TURN_COLS} FROM chat_turns
              WHERE state = 'failed' AND recovery_action IS NOT NULL

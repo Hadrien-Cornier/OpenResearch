@@ -788,8 +788,22 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     Ok(())
 }
 
+fn cursor_native_usage(usage: &Value) -> crate::store::TokenUsage {
+    let field = |key| usage.get(key).and_then(Value::as_u64);
+    crate::store::TokenUsage {
+        input_tokens: field("inputTokens")
+            .and_then(|input| input.checked_add(field("cacheReadTokens")?))
+            .and_then(|input| input.checked_add(field("cacheWriteTokens")?)),
+        output_tokens: field("outputTokens"),
+        cache_read_tokens: field("cacheReadTokens"),
+        cache_write_tokens: field("cacheWriteTokens"),
+        reasoning_tokens: None,
+    }
+}
+
 #[derive(Default)]
 struct TurnState {
+    reported_auto: bool,
     native_session_id: Option<String>,
     text_part_id: Option<String>,
     reasoning_part_id: Option<String>,
@@ -805,6 +819,13 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         state.native_session_id = Some(sid.to_string());
     }
     match event.get("type").and_then(Value::as_str) {
+        Some("system") if event.get("subtype").and_then(Value::as_str) == Some("init") => {
+            state.reported_auto = event
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| model.eq_ignore_ascii_case("auto"));
+            false
+        }
         Some("thinking") => {
             if event.get("subtype").and_then(Value::as_str) == Some("delta") {
                 if let Some(text) = event.get("text").and_then(Value::as_str) {
@@ -851,6 +872,14 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             false
         }
         Some("result") => {
+            if let Some(usage) = event.get("usage") {
+                ctx.record_native_usage(
+                    &format!("cursor-result-{}", ctx.attempt_count_for_usage()),
+                    state.reported_auto.then_some("Auto"),
+                    None,
+                    cursor_native_usage(usage),
+                );
+            }
             state.saw_result = true;
             let is_error = event
                 .get("is_error")
@@ -1113,6 +1142,18 @@ fn plan_card(parts: &[WirePart], assistant_id: &str, errored: bool) -> Option<Wi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_usage_restores_inclusive_cached_input() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/cursor-usage.json")).unwrap();
+        let usage = super::cursor_native_usage(&fixture[0]["usage"]);
+        usage.validate().unwrap();
+        assert_eq!(usage.input_tokens, Some(14304));
+        assert_eq!(usage.output_tokens, Some(34));
+        assert_eq!(usage.total(), Some(14338));
+        assert_eq!(usage.reasoning_tokens, None);
+    }
+
     use super::*;
     use crate::local::chat::TurnCtx;
 

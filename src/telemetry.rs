@@ -617,6 +617,7 @@ pub(crate) fn set_persisted_disabled(disabled: bool) -> std::io::Result<()> {
     if result.is_ok() && disabled {
         cancel_pending();
         remove_queued_product_events();
+        let _ = crate::store::Store::open().and_then(|store| store.purge_pending_telemetry());
     }
     result
 }
@@ -696,7 +697,7 @@ fn build_payload(
 /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`). Pure civil-date math on the UTC timeline — no
 /// timezone or DST involved — so no date crate is needed (the codebase has
 /// none). Uses the standard days-from-civil algorithm.
-fn iso8601_utc(ms: i64) -> String {
+pub(crate) fn iso8601_utc(ms: i64) -> String {
     let ms = ms.max(0);
     let secs = ms / 1000;
     let millis = ms % 1000;
@@ -750,12 +751,14 @@ fn persist_payload(event_id: uuid::Uuid, payload: &serde_json::Value) -> Option<
     let dir = outbox_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("{event_id}.json"));
-    let tmp = dir.join(format!(".{event_id}.tmp"));
-    std::fs::write(&tmp, serde_json::to_vec(payload).ok()?).ok()?;
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(tmp);
-        return None;
-    }
+    crate::local::git::atomic_write_with_mode(
+        &path,
+        &serde_json::to_vec(payload).ok()?,
+        Some(0o600),
+    )
+    .ok()?;
+    #[cfg(unix)]
+    std::fs::File::open(&dir).ok()?.sync_all().ok()?;
     Some(path)
 }
 
@@ -812,10 +815,47 @@ fn remove_queued_product_events() {
     }
 }
 
+pub(crate) fn accounting_reports_enabled() -> bool {
+    is_enabled(flag())
+}
+
+pub(crate) fn pending_event_payload(
+    event: &str,
+    properties: serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    if !is_enabled(flag()) {
+        return None;
+    }
+    let event_id = uuid::Uuid::new_v4();
+    let payload = build_payload_with_id(event, &install_id()?, event_id, properties);
+    Some((event_id.to_string(), payload))
+}
+
+fn transfer_pending_events() {
+    if !is_enabled(flag()) {
+        return;
+    }
+    let Ok(store) = crate::store::Store::open() else {
+        return;
+    };
+    let Ok(events) = store.pending_telemetry() else {
+        return;
+    };
+    for (id, payload) in events {
+        let Ok(event_id) = uuid::Uuid::parse_str(&id) else {
+            continue;
+        };
+        if persist_payload(event_id, &payload).is_some() {
+            let _ = store.acknowledge_pending_telemetry(&id);
+        }
+    }
+}
+
 pub(crate) fn retry_outbox() {
     if environment_disabled_reason().is_some() {
         return;
     }
+    transfer_pending_events();
     let Ok(entries) = std::fs::read_dir(outbox_dir()) else {
         return;
     };
@@ -1071,6 +1111,7 @@ impl TelemetrySession {
     /// site in `main` already threads it, so keeping the param avoids
     /// re-touching main).
     pub(crate) async fn finish(self, _success: bool) {
+        retry_outbox();
         flush_pending().await;
     }
 }

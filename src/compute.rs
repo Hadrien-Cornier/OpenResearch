@@ -808,7 +808,27 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         cancel_requested: false,
         chat_session_id: args.launching_chat_session(),
     };
-    reserve_run(&store, &pending, args.force)?;
+    let identity = args.invocation_identity()?;
+    let report = (!args.telemetry_suppressed)
+        .then(|| {
+            crate::telemetry::pending_event_payload(
+                "experiment_finished",
+                serde_json::json!({
+                    "harness": identity.as_ref().map(|identity| &identity.harness),
+                    "model": identity.as_ref().map(|identity| &identity.model),
+                    "provider": identity.as_ref().and_then(|identity| identity.provider.as_ref()),
+                    "status": "failed",
+                }),
+            )
+        })
+        .flatten();
+    reserve_run(
+        &store,
+        &pending,
+        args.force,
+        identity.as_ref(),
+        report.as_ref(),
+    )?;
     let pending_backend_json = descriptor.to_json();
     match backend.submit(args, source, run_id.clone()).await {
         Ok(run) => {
@@ -847,7 +867,13 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     }
 }
 
-fn reserve_run(store: &Store, pending: &StoredRun, force: bool) -> Result<()> {
+fn reserve_run(
+    store: &Store,
+    pending: &StoredRun,
+    force: bool,
+    identity: Option<&crate::store::InvocationIdentity>,
+    report: Option<&(String, serde_json::Value)>,
+) -> Result<()> {
     let dir = crate::store::data_dir().join("submission-locks");
     std::fs::create_dir_all(&dir)?;
     let file = std::fs::OpenOptions::new()
@@ -873,7 +899,11 @@ fn reserve_run(store: &Store, pending: &StoredRun, force: bool) -> Result<()> {
             ));
         }
     }
-    store.upsert_run(pending)
+    let tx = store.begin()?;
+    store.reserve_run_telemetry(&pending.id, identity, report)?;
+    store.upsert_run(pending)?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn record_submission_handle(run_id: &str, descriptor: &BackendDescriptor) -> Result<()> {
@@ -947,6 +977,8 @@ mod tests {
             timeout: None,
             force: false,
             chat_session_id: None,
+            invocation_context: None,
+            telemetry_suppressed: false,
         }
     }
 
