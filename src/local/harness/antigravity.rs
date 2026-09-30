@@ -594,6 +594,12 @@ fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
             "PreToolUse": [{"matcher":"*","hooks":[{"type":"command","command":command,"timeout":3600}]}]
         }),
     );
+    object.insert(
+        "openresearch-accounting".into(),
+        serde_json::json!({
+            "enabled": true, "PostInvocation": [{"type":"command","command":command}]
+        }),
+    );
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(path, serde_json::to_vec_pretty(&hooks)?)?;
     Ok(())
@@ -682,6 +688,22 @@ struct TurnState {
     turn_errored: bool,
 }
 
+pub(crate) fn invocation_sample_id(conversation: &str, step: i64) -> String {
+    format!("antigravity:{conversation}:step:{step}")
+}
+
+fn antigravity_step_usage(step: &Value) -> Option<crate::store::TokenUsage> {
+    let usage = step.get("usage")?;
+    let field = |key| usage.get(key).and_then(Value::as_u64);
+    Some(crate::store::TokenUsage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        cache_read_tokens: field("cache_read_tokens"),
+        cache_write_tokens: None,
+        reasoning_tokens: field("thinking_tokens"),
+    })
+}
+
 fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool {
     let event_type = event.get("event").and_then(Value::as_str).unwrap_or("");
     match event_type {
@@ -703,6 +725,19 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     .filter(|id| !id.is_empty())
                 {
                     state.conversation_id = Some(cid.to_string());
+                }
+                if let (Some(index), Some(usage)) = (
+                    step.get("step_index").and_then(Value::as_i64),
+                    antigravity_step_usage(step),
+                ) {
+                    let sample_id = state
+                        .conversation_id
+                        .as_deref()
+                        .map(|conversation| invocation_sample_id(conversation, index))
+                        .unwrap_or_else(|| {
+                            format!("antigravity-{}:{index}", ctx.attempt_count_for_usage())
+                        });
+                    ctx.record_native_usage(&sample_id, None, None, usage);
                 }
                 let step_type = step.get("step_type").and_then(Value::as_str).unwrap_or("");
                 let step_state = step.get("state").and_then(Value::as_str).unwrap_or("");
@@ -853,6 +888,18 @@ fn plan_card(parts: &[WirePart], assistant_id: &str) -> Option<WirePart> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_step_usage_includes_reasoning_without_double_counting() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/antigravity-usage.json")).unwrap();
+        let usage = super::antigravity_step_usage(&fixture[0]["step_update"]).unwrap();
+        usage.validate().unwrap();
+        assert_eq!(usage.total(), Some(13155));
+        assert_eq!(usage.reasoning_tokens, Some(138));
+        assert_eq!(usage.cache_write_tokens, None);
+        assert!(super::antigravity_step_usage(&serde_json::json!({})).is_none());
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -1132,6 +1179,14 @@ mod tests {
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(content["openresearch-approval"]["enabled"], false);
+        assert_eq!(content["openresearch-accounting"]["enabled"], true);
+        assert_eq!(
+            content["openresearch-accounting"]["PostInvocation"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         write_approval_hook(&repo, true).unwrap();
         let content: Value =

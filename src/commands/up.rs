@@ -2050,6 +2050,9 @@ async fn compute_backends() -> Json<Value> {
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateRunReq {
+    invocation_context: Option<String>,
+    #[serde(default)]
+    telemetry_suppressed: bool,
     experiment_id: String,
     backend: Option<String>,
     flavor: Option<String>,
@@ -2130,6 +2133,12 @@ pub(crate) async fn submit_run_via_up(
     args: &crate::ExpRunArgs,
 ) -> Result<RunLaunchSummary> {
     let request = CreateRunReq {
+        telemetry_suppressed: args.telemetry_suppressed
+            || !crate::telemetry::accounting_reports_enabled(),
+        invocation_context: args
+            .invocation_identity()?
+            .map(|identity| serde_json::to_string(&identity))
+            .transpose()?,
         experiment_id: args.exp_id.clone(),
         backend: args.backend.clone(),
         flavor: args.flavor.clone(),
@@ -2211,6 +2220,8 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
     // Dashboard callers may omit these; forwarded CLI requests arrive resolved.
     local::apply_compute_default(&mut backend, &mut flavor);
     let args = crate::ExpRunArgs {
+        invocation_context: req.invocation_context,
+        telemetry_suppressed: req.telemetry_suppressed,
         exp_id: req.experiment_id,
         disk: req.disk,
         provider: req.provider,
@@ -8123,6 +8134,8 @@ mod tests {
     #[test]
     fn create_run_request_round_trips_agent_attribution_and_force() {
         let request = CreateRunReq {
+            invocation_context: None,
+            telemetry_suppressed: true,
             experiment_id: "experiment-1".into(),
             backend: Some("local".into()),
             flavor: None,

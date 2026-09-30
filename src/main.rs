@@ -158,6 +158,9 @@ enum Command {
     #[command(name = "plan-gate", hide = true)]
     PlanGate,
 
+    #[command(name = "invocation-gate", hide = true)]
+    InvocationGate,
+
     /// Internal: the plan-mode permission bridge. A stdio MCP server Claude
     /// Code spawns (`--mcp-config`) and consults (`--permission-prompt-tool`);
     /// relays each permission request to the running `orx up`, which surfaces
@@ -560,9 +563,29 @@ pub struct ExpRunArgs {
     /// Internal attribution forwarded through the local orx up API.
     #[arg(skip)]
     pub chat_session_id: Option<String>,
+    #[arg(long, hide = true)]
+    pub invocation_context: Option<String>,
+    #[arg(skip)]
+    pub telemetry_suppressed: bool,
 }
 
 impl ExpRunArgs {
+    pub(crate) fn invocation_identity(
+        &self,
+    ) -> crate::error::Result<Option<crate::store::InvocationIdentity>> {
+        let context = self
+            .invocation_context
+            .clone()
+            .or_else(|| std::env::var("ORX_INVOCATION_CONTEXT").ok());
+        let identity: Option<crate::store::InvocationIdentity> = context
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        if let Some(identity) = &identity {
+            identity.validate()?;
+        }
+        Ok(identity)
+    }
+
     pub fn launching_chat_session(&self) -> Option<String> {
         self.chat_session_id
             .clone()
@@ -922,6 +945,16 @@ async fn main() {
     // `plan-gate` is a per-tool-call hook body (fires on every Bash call during
     // plan mode): it must stay fast and touch neither stdout nor the network, so
     // skip the update check and telemetry and run it directly.
+    if matches!(command, Command::InvocationGate) {
+        if let Err(error) = commands::invocation_gate::run().await {
+            eprintln!("orx invocation-gate: {error}");
+            println!(
+                "{}",
+                serde_json::json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"OpenResearch could not capture this tool invocation's model"}})
+            );
+        }
+        return;
+    }
     if matches!(command, Command::PlanGate) {
         // The hook fires on every Bash call during plan mode; it must NEVER
         // block the turn. Swallow any error to stderr and still exit 0 — a
@@ -1137,6 +1170,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Telemetry(_) => "telemetry",
         Command::Feedback(_) => "feedback",
         Command::PlanGate => "plan-gate",
+        Command::InvocationGate => "invocation-gate",
         Command::McpGate => "mcp-gate",
         Command::AntigravityGate => "antigravity-gate",
         Command::PublishBranch(_) => "publish-branch",
@@ -1192,6 +1226,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Feedback(args) => commands::feedback::run(args).await,
         // Handled before dispatch (fast path, no telemetry/update check).
         Command::PlanGate => commands::plan_gate::run().await,
+        Command::InvocationGate => commands::invocation_gate::run().await,
         Command::McpGate => commands::mcp_gate::run().await,
         Command::AntigravityGate => commands::mcp_gate::run_antigravity().await,
         Command::PublishBranch(_) => unreachable!("handled before dispatch"),
@@ -1212,6 +1247,7 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
             | Command::Telemetry(_)
             | Command::Feedback(_)
             | Command::PlanGate
+            | Command::InvocationGate
             | Command::McpGate
             | Command::AntigravityGate
             | Command::PublishBranch(_)

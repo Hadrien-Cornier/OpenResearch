@@ -44,8 +44,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 use crate::error::{anyhow, Result};
 use crate::local::harness::claude::{
-    claude_permission_mode, find_claude, uses_permission_bridge, write_mcp_config,
-    write_plan_settings,
+    claude_permission_mode, find_claude, uses_permission_bridge, write_mcp_config, write_settings,
 };
 use crate::local::harness::{HarnessAuthState, PermissionMode};
 use crate::local::native_store::NativeStore;
@@ -553,18 +552,11 @@ async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<Clau
     // today's no-bridge plan gating, never worse.
     let mut config = spec.config.clone();
     config.bridge_active = false;
-    if spec.config.permission_mode == Some(PermissionMode::Plan) {
-        match write_plan_settings(&spec.repo) {
-            Ok(path) => {
-                cmd.arg("--settings").arg(path);
-            }
-            Err(e) => {
-                eprintln!(
-                    "orx up: plan-mode settings not written, orx inspection will be gated: {e}"
-                );
-            }
-        }
-    }
+    let settings = write_settings(
+        &spec.repo,
+        spec.config.permission_mode == Some(PermissionMode::Plan),
+    )?;
+    cmd.arg("--settings").arg(settings);
     if uses_permission_bridge(spec.config.permission_mode) {
         // The gate token is minted HERE and ONLY here — once per child, riding
         // the mcp-gate bridge for the child's whole life. Re-minting mid-child

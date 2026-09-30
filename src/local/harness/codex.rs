@@ -61,6 +61,37 @@ use crate::local::opencode::ensure_playbook;
 use crate::local::shell_env::find_on_path;
 use crate::store::{Store, StoredChatMessage};
 
+fn codex_native_usage(usage: &Value) -> crate::store::TokenUsage {
+    let field = |name| usage.get(name).and_then(Value::as_u64);
+    crate::store::TokenUsage {
+        input_tokens: field("inputTokens"),
+        output_tokens: field("outputTokens"),
+        cache_read_tokens: field("cachedInputTokens"),
+        cache_write_tokens: field("cacheWriteInputTokens"),
+        reasoning_tokens: field("reasoningOutputTokens"),
+    }
+}
+
+fn capture_token_notification(ctx: &mut TurnCtx, method: &str, params: &Value) {
+    if method != "thread/tokenUsage/updated" {
+        return;
+    }
+    let (Some(thread), Some(turn), Some(total), Some(last)) = (
+        params.get("threadId").and_then(Value::as_str),
+        params.get("turnId").and_then(Value::as_str),
+        params.pointer("/tokenUsage/total"),
+        params.pointer("/tokenUsage/last"),
+    ) else {
+        return;
+    };
+    ctx.record_cumulative_usage(
+        thread,
+        turn,
+        codex_native_usage(total),
+        codex_native_usage(last),
+    );
+}
+
 /// Codex usage occupying the context window: `input_tokens + output_tokens`
 /// (`cached_input_tokens` is a subset of `input_tokens`, not additive). Returns
 /// `None` when the object is absent, or when the sum is zero (an all-zero
@@ -1201,6 +1232,20 @@ fn apply_notification(ctx: &mut TurnCtx, method: &str, params: &Value) -> Option
         ctx.clear_retry_status();
     }
     match method {
+        "thread/tokenUsage/updated" => {
+            if let Some(last) = params.pointer("/tokenUsage/last") {
+                if let Some(used_tokens) =
+                    codex_native_usage(last).total().filter(|total| *total > 0)
+                {
+                    ctx.report_usage(ContextUsage {
+                        used_tokens,
+                        context_window: params
+                            .pointer("/tokenUsage/modelContextWindow")
+                            .and_then(Value::as_u64),
+                    });
+                }
+            }
+        }
         "item/started" | "item/completed" => {
             if let Some(item) = params.get("item") {
                 apply_item(ctx, item, method == "item/completed");
@@ -2616,6 +2661,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 match classify_event_thread(turn_id.as_deref(), &sub_threads, &params) {
                     EventScope::Stale => continue,
                     EventScope::SubAgent(tid) => {
+                        capture_token_notification(ctx, &method, &params);
                         route_sub_event(ctx, &mut sub_threads, &thread_id, &tid, &method, &params);
                         ctx.maybe_flush();
                         // Draining after the parent's turn/completed: the last
@@ -2636,6 +2682,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                     }
                     EventScope::Parent => {}
                 }
+                capture_token_notification(ctx, &method, &params);
                 // Codex settled a request itself (its approval deadline hit,
                 // or our reply raced this notification): the card must not
                 // stay live. Part ids are a pure function of the request id;
@@ -3834,6 +3881,21 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_camel_case_usage_keeps_cache_and_reasoning_as_breakdowns() {
+        let events: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/codex-token-usage.json")).unwrap();
+        assert_eq!(events.len(), 2);
+        let usage = super::codex_native_usage(&events[0]["total"]);
+        usage.validate().unwrap();
+        assert_eq!(usage.total(), Some(25162));
+        assert_eq!(usage.cache_read_tokens, Some(12672));
+        assert_eq!(usage.output_tokens, Some(6));
+        assert_eq!(usage.reasoning_tokens, Some(0));
+        let last = super::codex_native_usage(&events[1]["last"]);
+        assert_eq!(last.total(), Some(28916));
+    }
+
     use super::super::options::REASONING_DEFAULT_ID;
     use super::*;
     use serde_json::json;
@@ -5709,6 +5771,20 @@ requires_openai_auth = false
             server_req_kind("item/permissions/requestApproval"),
             ServerReqKind::Other
         );
+    }
+
+    #[test]
+    fn token_notification_reports_last_request_context() {
+        let mut ctx = TurnCtx::test_stub();
+        let params = serde_json::json!({"tokenUsage": {
+            "total": {"inputTokens": 5000, "outputTokens": 600},
+            "last": {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 20},
+            "modelContextWindow": 272000
+        }});
+        apply_notification(&mut ctx, "thread/tokenUsage/updated", &params);
+        let usage = ctx.context_usage.unwrap();
+        assert_eq!(usage.used_tokens, 120);
+        assert_eq!(usage.context_window, Some(272000));
     }
 
     #[test]

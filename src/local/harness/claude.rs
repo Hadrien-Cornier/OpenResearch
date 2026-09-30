@@ -1095,7 +1095,7 @@ pub(crate) fn uses_permission_bridge(mode: Option<PermissionMode>) -> bool {
     )
 }
 
-/// Path (relative to the worktree) of the plan-mode settings file we write and
+/// Path (relative to the worktree) of the native-hook settings file we write and
 /// pass via `--settings`. Lives under the same agent dir as the playbook, which
 /// is already git-excluded.
 const PLAN_SETTINGS_REL: &str = ".openresearch/agent/claude-plan-settings.json";
@@ -1104,19 +1104,10 @@ const PLAN_SETTINGS_REL: &str = ".openresearch/agent/claude-plan-settings.json";
 /// `orx mcp-gate` permission bridge. Same git-excluded agent dir.
 const MCP_CONFIG_REL: &str = ".openresearch/agent/claude-mcp.json";
 
-/// Write the plan-mode `--settings` file into `repo` and return its path. The
-/// file registers `PreToolUse` hooks running `orx plan-gate` (this same
-/// binary): on `Bash` it allows read-only inspection through plan mode's gate,
-/// and on `ExitPlanMode` it forces an `ask` — headless plan mode otherwise
-/// SELF-approves the call ("User has approved exiting plan mode", nobody
-/// asked; verified on claude 2.1.197) and starts editing. The `ask` routes
-/// plan approval to the permission bridge card. See `plan_gate`.
-///
-/// The hook command is this executable's absolute path, so it resolves without
-/// depending on `orx` being on Claude's `PATH`.
-pub(crate) fn write_plan_settings(repo: &std::path::Path) -> Result<PathBuf> {
+// Attribution updates input without granting permission; plan decisions stay separate.
+pub(crate) fn write_settings(repo: &std::path::Path, plan: bool) -> Result<PathBuf> {
     let orx = crate::paths::spawnable_exe()
-        .map_err(|e| anyhow!("cannot resolve orx binary path for plan-mode hook: {e}"))?;
+        .map_err(|e| anyhow!("cannot resolve orx binary path for native hooks: {e}"))?;
     let hook = serde_json::json!([{
         "type": "command",
         "command": format!(
@@ -1124,14 +1115,14 @@ pub(crate) fn write_plan_settings(repo: &std::path::Path) -> Result<PathBuf> {
             crate::jobs::ssh::sh_quote(&orx.to_string_lossy())
         ),
     }]);
-    let settings = serde_json::json!({
-        "hooks": {
-            "PreToolUse": [
-                { "matcher": "Bash", "hooks": hook },
-                { "matcher": "ExitPlanMode", "hooks": hook },
-            ],
-        }
-    });
+    let mut hooks = vec![
+        serde_json::json!({"matcher":"Bash","hooks":[{"type":"command","command":format!("{} invocation-gate", crate::jobs::ssh::sh_quote(&orx.to_string_lossy()))}]}),
+    ];
+    if plan {
+        hooks.push(serde_json::json!({"matcher":"Bash","hooks":hook}));
+        hooks.push(serde_json::json!({"matcher":"ExitPlanMode","hooks":hook}));
+    }
+    let settings = serde_json::json!({"hooks":{"PreToolUse":hooks}});
     let path = repo.join(PLAN_SETTINGS_REL);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1692,6 +1683,32 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             _ => {}
         },
         Some("assistant") => {
+            if let Some(message) = event.get("message") {
+                ctx.record_native_invocations(message);
+            }
+            if let (Some(sample_id), Some(model), Some(usage)) = (
+                event.pointer("/message/id").and_then(Value::as_str),
+                event.pointer("/message/model").and_then(Value::as_str),
+                event.pointer("/message/usage"),
+            ) {
+                let field = |key| usage.get(key).and_then(Value::as_u64);
+                let input_tokens = field("input_tokens")
+                    .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
+                    .and_then(|input| input.checked_add(field("cache_creation_input_tokens")?));
+                ctx.record_native_usage(
+                    &format!("claude-{}:{sample_id}", ctx.attempt_count_for_usage()),
+                    Some(model),
+                    None,
+                    crate::store::TokenUsage {
+                        input_tokens,
+                        // Assistant output is a partial subtotal; terminal modelUsage includes reasoning.
+                        output_tokens: field("output_tokens"),
+                        cache_read_tokens: field("cache_read_input_tokens"),
+                        cache_write_tokens: field("cache_creation_input_tokens"),
+                        reasoning_tokens: None,
+                    },
+                );
+            }
             if event
                 .get("error")
                 .or_else(|| event.pointer("/message/error"))
@@ -1911,6 +1928,14 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             }
         }
         Some("result") => {
+            if let Some(scope) = event.get("session_id").and_then(Value::as_str) {
+                let samples = claude_result_usage_samples(event);
+                ctx.record_native_aggregate(
+                    &format!("claude-{}:", ctx.attempt_count_for_usage()),
+                    scope,
+                    &samples,
+                );
+            }
             state.saw_result = true;
             // Resume mints a fresh session id per turn — track the latest.
             if let Some(sid) = event.get("session_id").and_then(Value::as_str) {
@@ -1968,6 +1993,36 @@ fn mark_stream_final(ctx: &mut TurnCtx, state: &TurnState) {
         let prefix = format!("{mid}-");
         ctx.mark_final_text(|part| part.id.starts_with(&prefix));
     }
+}
+
+fn claude_result_usage_samples(
+    event: &Value,
+) -> Vec<(String, Option<String>, crate::store::TokenUsage)> {
+    event
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|models| models.iter())
+        .map(|(model, usage)| {
+            let field = |name| usage.get(name).and_then(Value::as_u64);
+            (
+                model.clone(),
+                usage
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                crate::store::TokenUsage {
+                    input_tokens: field("inputTokens")
+                        .and_then(|input| input.checked_add(field("cacheReadInputTokens")?))
+                        .and_then(|input| input.checked_add(field("cacheCreationInputTokens")?)),
+                    output_tokens: field("outputTokens"),
+                    cache_read_tokens: field("cacheReadInputTokens"),
+                    cache_write_tokens: field("cacheCreationInputTokens"),
+                    reasoning_tokens: field("thinkingTokens"),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Sum the four token buckets of a Claude `usage` object into the context-window
@@ -2110,6 +2165,7 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
     let client = route.client();
     let auth_generation = client.auth_generation();
     let bridge_active = client.config().bridge_active;
+    ctx.begin_native_usage_attempt(&format!("claude-{}:", ctx.attempt_count_for_usage()))?;
     ctx.persist_delivery(DeliveryState::Unknown)?;
     if let Err(e) = client.send_user_message(&ctx.text).await {
         ctx.host.claude.kill_session(&ctx.session_id).await;
@@ -2782,6 +2838,36 @@ mod tests {
         // this into an error that keeps the card actionable.
         let (text, _) = synthesize_resume("question", &answer(true, None, &[], None));
         assert!(text.trim().is_empty());
+    }
+
+    #[test]
+    fn native_model_usage_preserves_child_models_and_inclusive_totals() {
+        let events: Vec<Value> =
+            serde_json::from_str(include_str!("fixtures/claude-model-usage.json")).unwrap();
+        let samples = claude_result_usage_samples(&events[0]);
+        assert_eq!(samples.len(), 2);
+        let parent = samples
+            .iter()
+            .find(|(model, _, _)| model == "claude-opus-5-5")
+            .unwrap();
+        assert_eq!(parent.2.input_tokens, Some(290410));
+        assert_eq!(parent.2.output_tokens, Some(392));
+        assert_eq!(parent.2.reasoning_tokens, Some(198));
+        let child = samples
+            .iter()
+            .find(|(model, _, _)| model == "claude-haiku-4-5-20251001")
+            .unwrap();
+        assert_eq!(child.2.total(), Some(101006));
+        let resumed = claude_result_usage_samples(&events[1]);
+        assert_eq!(
+            resumed
+                .iter()
+                .find(|(model, _, _)| model == "claude-opus-5-5")
+                .unwrap()
+                .2
+                .output_tokens,
+            Some(484)
+        );
     }
 
     /// Fold a hand-written stream-json transcript through `apply_event` against a
