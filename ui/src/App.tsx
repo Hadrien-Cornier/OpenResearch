@@ -818,11 +818,16 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     return write;
   }, []);
 
+  const preferredAutonomyWrite = useRef<Promise<unknown>>(Promise.resolve());
+  const preferredAutonomySaveSeq = useRef(0);
   const persistPreferredAutonomy = useCallback((autonomy: Autonomy) => {
+    const saveSeq = ++preferredAutonomySaveSeq.current;
     setUiState((current) => current && { ...current, preferredAutonomy: autonomy });
-    void updateUiStateMutation
-      .mutateAsync({ preferredAutonomy: autonomy })
-      .catch(() => uiStateQuery.refetch());
+    preferredAutonomyWrite.current = preferredAutonomyWrite.current
+      .then(() => updateUiStateMutation.mutateAsync({ preferredAutonomy: autonomy }))
+      .catch(() => {
+        if (saveSeq === preferredAutonomySaveSeq.current) void uiStateQuery.refetch();
+      });
   }, []);
 
   // Shrinking the window can push a fixed-width panel past its usable max —
