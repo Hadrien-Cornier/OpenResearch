@@ -250,7 +250,7 @@ pub(crate) async fn current_auth_state() -> AuthProbe {
 }
 
 pub(crate) fn auth_recovery_note(method: Option<&str>, provider: Option<&str>) -> &'static str {
-    if method == Some("thirdParty") || provider.is_some_and(|provider| provider != "firstParty") {
+    if external_provider(method, provider) {
         "Check the configured Claude Code provider and run `claude auth status`, then re-check this harness."
     } else if has_api_credential() {
         "Claude Code rejected the configured `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. Replace or unset it, then re-check this harness."
@@ -259,6 +259,10 @@ pub(crate) fn auth_recovery_note(method: Option<&str>, provider: Option<&str>) -
     } else {
         "Check Claude Code authentication with `claude auth status`, then re-check this harness."
     }
+}
+
+fn external_provider(method: Option<&str>, provider: Option<&str>) -> bool {
+    method == Some("thirdParty") || provider.is_some_and(|provider| provider != "firstParty")
 }
 
 /// One child answering both detection questions: `--effort ultracode`
@@ -395,19 +399,23 @@ async fn claude_spec_probes(bin: PathBuf, sequence: u64) -> (AuthProbe, bool, Op
         probe_auth_and_ultracode(&bin, sequence),
     )
     .await;
-    let models = match (models, auth.state) {
-        (Some(task), HarnessAuthState::Ready) => task.await.ok().flatten(),
-        (Some(task), _) => {
+    // External provider model enumeration can stall; the CLI default remains usable.
+    let external = external_provider(auth.method, auth.provider.as_deref());
+    let models = match models {
+        Some(task) if auth.state == HarnessAuthState::Ready && !external => {
+            task.await.ok().flatten()
+        }
+        Some(task) => {
             task.abort();
             // Await teardown so the aborted probe's timing row lands in the
             // fill's sink before the pass can drain it.
             let _ = task.await;
             None
         }
-        (None, HarnessAuthState::Ready) => {
+        None if auth.state == HarnessAuthState::Ready && !external => {
             super::detect::timed_probe("claude-code", "models", claude_models_response(bin)).await
         }
-        (None, _) => None,
+        None => None,
     };
     (auth, ultracode, models)
 }
@@ -671,7 +679,10 @@ impl ClaudeCode {
                 let parsed = parse_claude_model_list(&resp, ultracode);
                 (!parsed.is_empty()).then_some(parsed)
             });
-            if models.is_none() && !snapshot {
+            if models.is_none()
+                && !snapshot
+                && !external_provider(info.auth_method, info.auth_provider.as_deref())
+            {
                 info.agent_note = Some("Could not load Claude Code models. Re-check this harness or update Claude Code; the CLI default model is still available.".to_string());
             }
             info = info.with_models(models.unwrap_or_default());

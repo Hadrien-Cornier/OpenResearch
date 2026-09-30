@@ -841,9 +841,7 @@ impl ClaudeHost {
             let rotate = auth.state != probe.state
                 || (auth.state == HarnessAuthState::Ready
                     && probe.state == HarnessAuthState::Ready
-                    && auth.provider != probe.provider
-                    && auth.provider.is_some()
-                    && probe.provider.is_some());
+                    && (auth.method != probe.method || auth.provider != probe.provider));
             auth.state = probe.state;
             auth.method = probe.method;
             auth.provider = probe.provider.clone();
@@ -1723,5 +1721,23 @@ mod tests {
             assert_eq!(snapshot.provider.as_deref(), Some("bedrock"));
             assert!(!host.observe_auth_probe(&newer));
         }
+    }
+
+    #[test]
+    fn ready_credential_route_change_recycles_workers() {
+        let host = ClaudeHost::new();
+        for status in [
+            br#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}"#.as_slice(),
+            br#"{"loggedIn":true,"authMethod":"api-key","apiProvider":"firstParty"}"#.as_slice(),
+            br#"{"loggedIn":true,"authMethod":"api-key"}"#.as_slice(),
+        ] {
+            let probe = crate::local::harness::claude::parse_auth_status(
+                Some(0),
+                status,
+                crate::local::harness::claude::auth_barrier_sequence(),
+            );
+            assert!(host.observe_auth_probe(&probe));
+        }
+        assert_eq!(host.auth_snapshot().generation, 3);
     }
 }
