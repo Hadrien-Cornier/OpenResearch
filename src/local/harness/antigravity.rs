@@ -2105,7 +2105,7 @@ mod tests {
         let properties = &staged[0].1["events"][0]["properties"];
         assert_eq!(properties["attribution"], "exact");
         assert_eq!(properties["model"], "gemini-3.1-pro-high");
-        drop(store);
+        drop((db, store));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2298,7 +2298,40 @@ mod tests {
             !samples.iter().any(|(id, _)| id.contains(":subagent:#")),
             "the late output replaced the hook-time placeholder"
         );
-        drop(store);
+
+        // The next turn resumes `parent` from step 13 and is cancelled before any planner: its
+        // final pass (and startup recovery) accounts nothing from earlier turns.
+        use std::io::Write;
+        let path = transcript_path(&root, "parent").with_file_name("transcript_full.jsonl");
+        let mut transcript = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        write!(
+            transcript,
+            "\n{}",
+            serde_json::json!({"step_index":13,"type":"USER_INPUT"})
+        )
+        .unwrap();
+        store
+            .begin_usage_execution("cancelled", "turn-2", "antigravity")
+            .unwrap();
+        assert!(reconcile_turn(
+            &store,
+            Some("cancelled"),
+            "session",
+            &root,
+            "parent",
+            13,
+            false
+        )
+        .is_empty());
+        let cancelled: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM chat_usage_samples WHERE execution_id = 'cancelled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancelled, 0);
+        drop((db, store));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

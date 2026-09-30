@@ -197,15 +197,11 @@ pub(super) async fn run_turn(
         .iter()
         .filter_map(|child| Some((child.clone(), captured.descendants.get(child)?.clone())))
         .collect();
-    if let Some(sink) = (!roots.is_empty())
-        .then(|| hold_execution(ctx, &native_id, started_at, json!(roots)))
-        .flatten()
-    {
-        let native = native_id.clone();
-        tokio::spawn(async move {
-            watch_background(&sink, &endpoint, &native, &roots, started_at).await;
-            sink.release();
-        });
+    if !roots.is_empty() {
+        hold_and_watch(
+            ctx,
+            json!({"v2": true, "native": native_id, "startedAt": started_at, "roots": roots}),
+        );
     }
     result
 }
@@ -292,9 +288,11 @@ async fn merge_projection(
 
 /// Native evidence already recorded, so repeated polls of an unchanged projection write nothing.
 #[derive(Default)]
-struct Captured {
+pub(super) struct Captured {
     samples: HashMap<String, String>,
     invokers: HashSet<String>,
+    /// Tool parts kept as run evidence, by their last recorded state.
+    evidence: HashMap<String, String>,
     /// This turn's subagent sessions at any depth, each with its parent session.
     descendants: HashMap<String, String>,
     /// Background subagents spawned this turn, which can outlive it.
@@ -302,6 +300,15 @@ struct Captured {
 }
 
 impl Captured {
+    /// A held execution's background subagents (child → parent session), as its watcher starts.
+    pub(super) fn watching(roots: &[(String, String)]) -> Self {
+        Self {
+            background: roots.iter().map(|(child, _)| child.clone()).collect(),
+            descendants: roots.iter().cloned().collect(),
+            ..Default::default()
+        }
+    }
+
     fn sessions(&self, native_id: &str) -> Vec<String> {
         std::iter::once(native_id.to_string())
             .chain(self.descendants.keys().cloned())
@@ -357,11 +364,15 @@ fn subagent_children<'a>(
             return Err(anyhow!("OpenCode returned an unrelated subagent session"));
         }
         let mut children = Vec::new();
-        for message in messages(&child)? {
+        let all = messages(&child)?;
+        let woken = woken_runs(all);
+        for message in all {
+            // A run another execution's subagent woke is that execution's, as in the chat session.
             let current = message
                 .pointer("/time/created")
                 .and_then(Value::as_i64)
-                .is_some_and(|created| created >= started_at);
+                .is_some_and(|created| created >= started_at)
+                && !foreign_run(message, &woken, captured);
             if current {
                 capture(sink, message, true, captured);
             }
@@ -369,8 +380,10 @@ fn subagent_children<'a>(
                 continue;
             }
             for (mut part, content) in projected_parts(message) {
-                if let Some(grandchild) =
-                    subagent_session(content, child_id, captured).filter(|_| current)
+                // An earlier turn's spawn is not this turn's descendant, even if still running.
+                if let Some(grandchild) = current
+                    .then(|| subagent_session(content, child_id, captured))
+                    .flatten()
                 {
                     part.children = subagent_children(
                         sink, endpoint, child_id, grandchild, started_at, captured,
@@ -402,9 +415,17 @@ fn capture(sink: &dyn UsageSink, message: &Value, child: bool, captured: &mut Ca
     if let Some(sample) = executed_usage(message) {
         captured.record(sink, id, attribution.clone(), sample);
     }
-    if let crate::store::Attribution::Exact { model, provider } = &attribution {
-        for (part, content) in projected_parts(message) {
-            if content["type"] == "tool" && captured.invokers.insert(part.id.clone()) {
+    for (part, _) in projected_parts(message) {
+        if part.kind != "tool" {
+            continue;
+        }
+        // After the turn no transcript holds a subagent's or woken run's tool parts.
+        let state = serde_json::to_string(&part).unwrap_or_default();
+        if captured.evidence.insert(part.id.clone(), state.clone()) != Some(state) {
+            sink.tool_evidence(&part);
+        }
+        if let crate::store::Attribution::Exact { model, provider } = &attribution {
+            if captured.invokers.insert(part.id.clone()) {
                 sink.invoker(&part.id, model, provider.as_deref());
             }
         }
@@ -504,52 +525,43 @@ pub(super) async fn capture_interrupted(
     }
 }
 
-/// Keeps capturing background subagents after their turn ended, and the parent runs their results
-/// natively wake with no app turn, until none of the tree is active and each result was delivered.
-pub(super) async fn watch_background(
+/// One watcher poll of a held execution's background subagents and the runs their results natively
+/// woke (no app turn) in each session they report to: whether any of the tree is still active, and
+/// whether a subagent's result is still undelivered.
+pub(super) async fn poll_background(
     sink: &dyn UsageSink,
     endpoint: &AgentEndpoint,
     native_id: &str,
     roots: &[(String, String)],
     started_at: i64,
-) {
-    let mut captured = Captured {
-        background: roots.iter().map(|(child, _)| child.clone()).collect(),
-        ..Default::default()
-    };
-    let mut waited = 0;
-    loop {
-        // Read before capturing, so a session idle here has settled everything captured below.
-        let active = get(endpoint, "/api/session/active").await.ok();
-        for (child, parent) in roots {
-            let _ =
-                subagent_children(sink, endpoint, parent, child, started_at, &mut captured).await;
-        }
-        // Includes the woken parent runs (only those this execution's subagents woke).
-        let _ = capture_tree(sink, endpoint, native_id, started_at, &mut captured, true).await;
-        let delivered: HashSet<String> = get(endpoint, &endpoint.v2_export_path(native_id))
-            .await
-            .ok()
-            .and_then(|projection| Some(woken_deliveries(messages(&projection).ok()?).collect()))
-            .unwrap_or_default();
-        let busy = active.is_some_and(|active| {
-            std::iter::once(native_id)
-                .chain(captured.descendants.keys().map(String::as_str))
-                .chain(roots.iter().map(|(child, _)| child.as_str()))
-                .any(|session| active["data"].get(session).is_some())
-        });
-        let undelivered = captured
-            .background
-            .iter()
-            .any(|child| !delivered.contains(child));
-        if !busy && (!undelivered || waited >= super::DELIVERY_GRACE_POLLS) {
-            break;
-        }
-        if !busy {
-            waited += 1;
-        }
-        tokio::time::sleep(BACKGROUND_POLL).await;
+    captured: &mut Captured,
+) -> Result<(bool, bool)> {
+    // Read before capturing, so a session idle here has settled everything captured below.
+    let active = get(endpoint, "/api/session/active").await?;
+    for (child, parent) in roots {
+        subagent_children(sink, endpoint, parent, child, started_at, captured).await?;
     }
+    let parents: HashSet<String> = std::iter::once(native_id.to_string())
+        .chain(
+            captured
+                .background
+                .iter()
+                .filter_map(|child| captured.descendants.get(child).cloned()),
+        )
+        .collect();
+    let mut delivered = HashSet::new();
+    for parent in &parents {
+        delivered.extend(capture_tree(sink, endpoint, parent, started_at, captured, true).await?);
+    }
+    let busy = parents
+        .iter()
+        .chain(captured.descendants.keys())
+        .any(|session| active["data"].get(session).is_some());
+    let undelivered = captured
+        .background
+        .iter()
+        .any(|child| !delivered.contains(child));
+    Ok((busy, undelivered))
 }
 
 /// Assistant runs a subagent's delivered result woke (native `synthetic` message with
@@ -592,7 +604,7 @@ fn foreign_run(message: &Value, woken: &HashMap<String, String>, captured: &Capt
 }
 
 /// `woken_only`: after the turn, only runs its own subagents' results woke (later turns' own
-/// messages belong to them).
+/// messages belong to them). Returns the subagents whose results `native_id` received.
 async fn capture_tree(
     sink: &dyn UsageSink,
     endpoint: &AgentEndpoint,
@@ -600,7 +612,7 @@ async fn capture_tree(
     started_at: i64,
     captured: &mut Captured,
     woken_only: bool,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
     let projection = get(endpoint, &endpoint.v2_export_path(native_id)).await?;
     let all = messages(&projection)?;
     let woken = woken_runs(all);
@@ -613,13 +625,6 @@ async fn capture_tree(
         if foreign_run(message, &woken, captured) || (woken_only && !is_woken) {
             continue;
         }
-        if is_woken {
-            for (part, _) in projected_parts(message) {
-                if part.kind == "tool" {
-                    sink.tool_evidence(&part);
-                }
-            }
-        }
         capture(sink, message, false, captured);
         for content in message["content"].as_array().into_iter().flatten() {
             if let Some(child) = subagent_session(content, native_id, captured) {
@@ -627,7 +632,7 @@ async fn capture_tree(
             }
         }
     }
-    Ok(())
+    Ok(woken_deliveries(all).collect())
 }
 
 /// Waits (bounded) until none of `sessions` is natively active.
@@ -1302,6 +1307,42 @@ mod tests {
         assert!(executed_usage(&partial).is_some());
     }
 
+    /// The live merge captures a terminally failed step before failing the turn: one that streamed
+    /// keeps its observed model without counters; one that failed before streaming records nothing.
+    #[tokio::test]
+    async fn failed_v2_steps_keep_the_model_only_when_executed() {
+        let endpoint = AgentEndpoint {
+            base_url: "http://127.0.0.1:9".into(),
+            client: reqwest::Client::new(),
+            protocol: crate::local::opencode::Protocol::V2,
+            legacy_v2_api: true,
+        };
+        let failed = json!({"id":"msg_x","type":"assistant","agent":"build","model":{"id":"big-pickle","providerID":"opencode"},"content":[],"time":{"created":1,"completed":2},"finish":"error","error":{"type":"provider.auth","message":"Unauthorized"}});
+        let mut after = failed.clone();
+        after["time"]["streamed"] = json!(1);
+        for (message, executed) in [(failed, false), (after, true)] {
+            let mut ctx = TurnCtx::test_stub();
+            let mut captured = Captured::default();
+            let merged = merge_projection(
+                &mut ctx,
+                &endpoint,
+                "ses_main",
+                &[message],
+                &HashSet::new(),
+                0,
+                &mut captured,
+            )
+            .await;
+            assert!(merged.is_err());
+            let exact = crate::store::Attribution::Exact {
+                model: "big-pickle".into(),
+                provider: Some("opencode".into()),
+            };
+            let expected = json!([exact, crate::store::TokenUsage::default(), false]).to_string();
+            assert_eq!(captured.samples.get("msg_x"), executed.then_some(&expected));
+        }
+    }
+
     /// A fake V2 server over fixed session exports. `active` answers `/api/session/active` in turn
     /// (the last repeats); interrupts are logged.
     async fn fake_v2(
@@ -1337,7 +1378,12 @@ mod tests {
                 get(move || {
                     let poll = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let active = active[poll.min(active.len() - 1)].clone();
-                    async move { Json(active) }
+                    // `null` stands for a failed status read.
+                    async move {
+                        (!active.is_null())
+                            .then_some(Json(active))
+                            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                    }
                 }),
             )
             .route(
@@ -1371,7 +1417,8 @@ mod tests {
     }
 
     /// An interrupt stops this turn's background subagent (V2 spares it natively) and the parent it
-    /// wakes, then captures every depth, the retrying step's model, and nothing from earlier turns.
+    /// wakes, then captures every depth, the retrying step's model, and nothing from earlier turns,
+    /// not even a background subagent an earlier turn left running in a continued session.
     #[tokio::test]
     async fn interrupted_v2_turn_captures_its_whole_tree() {
         let shell = json!([{"type":"tool","name":"shell","callID":"call_sh","state":{"status":"completed","input":{"command":"true"},"content":[]}}]);
@@ -1393,6 +1440,10 @@ mod tests {
                                 subagent("ses_bg", "running")
                             ]),
                         ),
+                        // Interrupted before its provider responded: never executed.
+                        json!({"id":"msg_unstarted","sessionID":"ses_main","type":"assistant",
+                            "model":{"id":"main-model","providerID":"p"},"content":[],
+                            "time":{"created":15,"completed":16}}),
                     ],
                 ),
             ),
@@ -1402,7 +1453,13 @@ mod tests {
                     "ses_child",
                     Some("ses_main"),
                     vec![
-                        step("msg_child_old", "ses_child", "child-model", 5, json!([])),
+                        step(
+                            "msg_child_old",
+                            "ses_child",
+                            "child-model",
+                            5,
+                            json!([subagent("ses_old_bg", "running")]),
+                        ),
                         step(
                             "msg_child",
                             "ses_child",
@@ -1568,15 +1625,11 @@ mod tests {
         // With no later turn at all, the held execution's watcher accounts only the woken run
         // (plus the subagent), never the turn's own steps again.
         let watched = super::super::tests::Recorded::default();
-        watch_background(
+        super::super::settle_watch(
             &watched,
-            &endpoint,
-            main,
-            &[(
-                "ses_f0c0c01a4ffebVNIrsOFXsVCSI".to_string(),
-                main.to_string(),
-            )],
-            started_at,
+            &json!({"v2": true, "native": main, "startedAt": started_at,
+                "roots": [["ses_f0c0c01a4ffebVNIrsOFXsVCSI", main]]}),
+            super::super::tests::live(endpoint.clone()),
         )
         .await;
         server.abort();
@@ -1588,14 +1641,17 @@ mod tests {
     /// A background subagent keeps being captured after its turn until its tree goes quiet.
     #[tokio::test]
     async fn background_watch_captures_until_the_subagent_tree_is_quiet() {
-        let exports = HashMap::from([(
-            "ses_bg".to_string(),
-            export(
-                "ses_bg",
-                Some("ses_main"),
-                vec![step("msg_bg", "ses_bg", "bg-model", 13, json!([]))],
+        let exports = HashMap::from([
+            (
+                "ses_bg".to_string(),
+                export(
+                    "ses_bg",
+                    Some("ses_main"),
+                    vec![step("msg_bg", "ses_bg", "bg-model", 13, json!([]))],
+                ),
             ),
-        )]);
+            ("ses_main".to_string(), export("ses_main", None, vec![])),
+        ]);
         let (endpoint, _, server) = fake_v2(
             exports,
             json!({"data":[],"cursor":{}}),
@@ -1607,17 +1663,182 @@ mod tests {
         )
         .await;
         let recorded = super::super::tests::Recorded::default();
-        watch_background(
+        super::super::settle_watch(
             &recorded,
-            &endpoint,
-            "ses_main",
-            &[("ses_bg".to_string(), "ses_main".to_string())],
-            10,
+            &json!({"v2": true, "native": "ses_main", "startedAt": 10,
+                "roots": [["ses_bg", "ses_main"]]}),
+            super::super::tests::live(endpoint),
         )
         .await;
         server.abort();
         let samples = recorded.samples.into_inner().unwrap();
         assert!(samples["msg_bg"].2);
+    }
+
+    /// A status read failing while the subagent still runs must not look idle or end the watch:
+    /// the same watcher retries and captures the step that finishes once the server answers again.
+    #[tokio::test]
+    async fn background_watch_retries_a_failed_status_read_until_the_tree_is_quiet() {
+        use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = polls.clone();
+        let app = Router::new()
+            .route(
+                "/api/session/active",
+                get(move || {
+                    let poll = polls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        match poll {
+                            0 => Ok(Json(json!({"data":{"ses_bg":{}}}))),
+                            1 => Err(StatusCode::SERVICE_UNAVAILABLE),
+                            _ => Ok(Json(json!({"data":{}}))),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{id}/export",
+                get(move |Path(id): Path<String>| {
+                    // The step settles only after the status outage.
+                    let mut bg = step("msg_bg", "ses_bg", "bg-model", 13, json!([]));
+                    if seen.load(Ordering::SeqCst) < 3 {
+                        bg["tokens"] = Value::Null;
+                    }
+                    let delivery = json!({"id":"msg_d","type":"synthetic","time":{"created":20},
+                        "metadata":{"source":"subagent","childID":"ses_bg"}});
+                    async move {
+                        Json(if id == "ses_bg" {
+                            export("ses_bg", Some("ses_main"), vec![bg])
+                        } else {
+                            export("ses_main", None, vec![delivery])
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = AgentEndpoint {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            client: reqwest::Client::new(),
+            protocol: crate::local::opencode::Protocol::V2,
+            legacy_v2_api: true,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let recorded = super::super::tests::Recorded::default();
+        super::super::settle_watch(
+            &recorded,
+            &json!({"v2": true, "native": "ses_main", "startedAt": 10,
+                "roots": [["ses_bg", "ses_main"]]}),
+            super::super::tests::live(endpoint),
+        )
+        .await;
+        server.abort();
+        let samples = recorded.samples.into_inner().unwrap();
+        assert_eq!(samples["msg_bg"].1.input_tokens, Some(10));
+        assert!(samples["msg_bg"].2);
+        assert!(!samples.contains_key("opencode-background:unrecoverable"));
+    }
+
+    /// A run a background grandchild's result woke in a continued child session belongs to the turn
+    /// that spawned the grandchild, even while a later turn is using that child session.
+    #[tokio::test]
+    async fn a_grandchild_woken_child_run_belongs_to_the_turn_that_spawned_the_grandchild() {
+        let shell = json!([{"type":"tool","name":"shell","callID":"call_run","state":{"status":"completed","input":{"command":"orx exp run exp"},"content":[]}}]);
+        let delivery = json!({"id":"msg_delivery","type":"synthetic","time":{"created":30},
+            "metadata":{"source":"subagent","childID":"ses_grand"}});
+        let exports = HashMap::from([
+            (
+                "ses_main".to_string(),
+                export(
+                    "ses_main",
+                    None,
+                    vec![
+                        step(
+                            "msg_a",
+                            "ses_main",
+                            "main-model",
+                            10,
+                            json!([subagent("ses_child", "completed")]),
+                        ),
+                        step(
+                            "msg_b",
+                            "ses_main",
+                            "main-model",
+                            20,
+                            json!([subagent("ses_child", "completed")]),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "ses_child".to_string(),
+                export(
+                    "ses_child",
+                    Some("ses_main"),
+                    vec![
+                        step(
+                            "msg_child_a",
+                            "ses_child",
+                            "child-model",
+                            11,
+                            json!([subagent("ses_grand", "running")]),
+                        ),
+                        step("msg_child_b", "ses_child", "child-model", 21, json!([])),
+                        delivery,
+                        step("msg_child_woken", "ses_child", "child-model", 31, shell),
+                    ],
+                ),
+            ),
+            (
+                "ses_grand".to_string(),
+                export(
+                    "ses_grand",
+                    Some("ses_child"),
+                    vec![step("msg_grand", "ses_grand", "grand-model", 12, json!([]))],
+                ),
+            ),
+        ]);
+        let (endpoint, _, server) = fake_v2(
+            exports,
+            json!({"data":[],"cursor":{}}),
+            vec![json!({"data":{}})],
+        )
+        .await;
+
+        // Turn B (started at 20) continues the child session: the woken run is not its own.
+        let later = super::super::tests::Recorded::default();
+        let mut captured = Captured::default();
+        capture_tree(&later, &endpoint, "ses_main", 20, &mut captured, false)
+            .await
+            .unwrap();
+        let mut ids: Vec<_> = later.samples.into_inner().unwrap().into_keys().collect();
+        ids.sort();
+        assert_eq!(ids, ["msg_b", "msg_child_b"]);
+        assert!(captured.background.is_empty());
+
+        // Turn A's held watcher accounts the grandchild and the child run it woke, with its tool.
+        let held = super::super::tests::Recorded::default();
+        super::super::settle_watch(
+            &held,
+            &json!({"v2": true, "native": "ses_main", "startedAt": 10,
+                "roots": [["ses_grand", "ses_child"]]}),
+            super::super::tests::live(endpoint),
+        )
+        .await;
+        server.abort();
+        let mut ids: Vec<_> = held.samples.into_inner().unwrap().into_keys().collect();
+        ids.sort();
+        assert_eq!(ids, ["msg_child_woken", "msg_grand"]);
+        assert_eq!(
+            held.invokers.into_inner().unwrap()["msg_child_woken:0"],
+            "child-model"
+        );
+        assert!(held
+            .evidence
+            .into_inner()
+            .unwrap()
+            .iter()
+            .any(|part| part.id == "msg_child_woken:0"));
     }
 
     #[tokio::test]

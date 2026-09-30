@@ -6915,6 +6915,9 @@ pub struct TurnCtx {
     pub host: Arc<ChatHost>,
     pub turn_id: String,
     durable: bool,
+    /// Test-only store for the native capture methods; see [`TurnCtx::test_capture`].
+    #[cfg(test)]
+    store_dir: Option<PathBuf>,
     usage_execution_id: String,
     pub(crate) native_message_models: HashMap<String, crate::store::InvocationIdentity>,
     pub(crate) native_usage_scopes: HashSet<String>,
@@ -6973,6 +6976,8 @@ fn turn_ctx_from_stored(
         host,
         turn_id: turn.id.clone(),
         durable: true,
+        #[cfg(test)]
+        store_dir: None,
         usage_execution_id: uuid::Uuid::new_v4().to_string(),
         native_message_models: HashMap::new(),
         native_usage_scopes: HashSet::new(),
@@ -7114,6 +7119,14 @@ impl TurnCtx {
         crate::store::Attribution::native(&self.harness, model, provider, missing)
     }
 
+    fn capture_store(&self) -> Result<Store> {
+        #[cfg(test)]
+        if let Some(dir) = &self.store_dir {
+            return Store::open_at(dir.clone());
+        }
+        Store::open()
+    }
+
     /// Record one native sample. `complete` means the counters cover the whole native request.
     /// Record an identity with `TokenUsage::default()` when the model is reported without usage.
     pub(crate) fn record_attributed_usage(
@@ -7126,7 +7139,7 @@ impl TurnCtx {
         if !self.durable {
             return;
         }
-        if let Err(error) = Store::open().and_then(|store| {
+        if let Err(error) = self.capture_store().and_then(|store| {
             store.record_attributed_sample(
                 &self.usage_execution_id,
                 sample_id,
@@ -7151,7 +7164,7 @@ impl TurnCtx {
             model: model.to_string(),
             provider: provider.map(str::to_string),
         };
-        if let Err(error) = Store::open().and_then(|store| {
+        if let Err(error) = self.capture_store().and_then(|store| {
             store.record_native_invocation(part_id, &identity, Some(&self.session_id))
         }) {
             eprintln!("orx up: could not capture native tool identity: {error}");
@@ -7162,7 +7175,7 @@ impl TurnCtx {
         if !self.durable {
             return Ok(());
         }
-        Store::open()?.begin_native_usage_attempt(
+        self.capture_store()?.begin_native_usage_attempt(
             &self.usage_execution_id,
             prefix,
             &self.harness,
@@ -7179,7 +7192,7 @@ impl TurnCtx {
         if !self.durable {
             return;
         }
-        if let Err(error) = Store::open().and_then(|store| {
+        if let Err(error) = self.capture_store().and_then(|store| {
             store.replace_native_usage_aggregate(
                 &self.usage_execution_id,
                 prefix,
@@ -7414,6 +7427,7 @@ impl TurnCtx {
             )),
             turn_id: "test-turn".into(),
             durable: false,
+            store_dir: None,
             usage_execution_id: "test-execution".into(),
             native_message_models: HashMap::new(),
             native_usage_scopes: HashSet::new(),
@@ -7468,6 +7482,68 @@ impl TurnCtx {
             pending_target_events: Vec::new(),
             target_event_bindings: HashMap::new(),
         }
+    }
+
+    /// A durable [`Self::test_stub`] on its first attempt: native capture methods write into a
+    /// fresh store at `dir` holding its running, accepted turn and open usage execution. Other
+    /// persistence still targets the real data dir, so don't flush it.
+    #[cfg(test)]
+    pub(crate) fn test_capture(dir: PathBuf, harness: &str) -> Self {
+        let store = Store::open_at(dir.clone()).unwrap();
+        rusqlite::Connection::open(dir.join("orx.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('test-session', 'test-project', '{harness}', 1, 1);
+                 INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('test-turn', 'test-session', 'test-msg', 'c', 'h', '', '{{}}', 'running', 'accepted', 1, 1);"
+            ))
+            .unwrap();
+        store
+            .begin_usage_execution("test-execution", "test-turn", harness)
+            .unwrap();
+        Self {
+            durable: true,
+            store_dir: Some(dir),
+            harness: harness.into(),
+            attempt_count: 1,
+            ..Self::test_stub()
+        }
+    }
+
+    /// The [`Self::test_capture`] execution's outcome and samples (id, attribution, usage, complete).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn test_ledger(
+        dir: &std::path::Path,
+    ) -> (
+        Option<String>,
+        Vec<(
+            String,
+            crate::store::Attribution,
+            crate::store::TokenUsage,
+            bool,
+        )>,
+    ) {
+        let db = rusqlite::Connection::open(dir.join("orx.db")).unwrap();
+        let outcome = db
+            .query_row("SELECT outcome FROM chat_usage_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let samples = db
+            .prepare("SELECT sample_id, attribution_json, usage_json, complete FROM chat_usage_samples ORDER BY sample_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::from_str(&row.get::<_, String>(1)?).unwrap(),
+                    serde_json::from_str(&row.get::<_, String>(2)?).unwrap(),
+                    row.get(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        (outcome, samples)
     }
 
     fn apply_target_events(&mut self) {

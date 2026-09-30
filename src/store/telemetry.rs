@@ -2563,6 +2563,108 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Runs the real finalization while a hook's sample is in flight, then writes a late sample.
+    fn finalize_during_an_in_flight_sample(dir: &std::path::Path) -> Store {
+        let store = Store::open_at(dir.to_path_buf()).unwrap();
+        store
+            .begin_usage_execution("execution", "turn", "antigravity")
+            .unwrap();
+        let sample = |store: &Store, id: &str| {
+            store.record_attributed_sample(
+                "execution",
+                id,
+                "antigravity",
+                &Attribution::native(
+                    "antigravity",
+                    Some("gemini-3.1-pro-high"),
+                    None,
+                    Missing::IdentityNotReported,
+                ),
+                &TokenUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(1),
+                    ..Default::default()
+                },
+                true,
+            )
+        };
+        // A hook process is mid-write when the real finalization starts in another process.
+        let hook = Store::open_at(dir.to_path_buf()).unwrap();
+        let finalizer = Store::open_at(dir.to_path_buf()).unwrap();
+        let tx = hook.begin_immediate().unwrap();
+        sample(&hook, "antigravity:conv:step:1").unwrap();
+        let finalizer =
+            std::thread::spawn(move || finalizer.finalize_usage_execution("execution", "done"));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !finalizer.is_finished(),
+            "finalization waits for the writer"
+        );
+        tx.commit().unwrap();
+        finalizer.join().unwrap().unwrap();
+        sample(&hook, "antigravity:conv:step:2").unwrap();
+        assert_eq!(sample_ids(&store, "execution"), ["antigravity:conv:step:1"]);
+        assert_eq!(outcome(&store, "execution").as_deref(), Some("done"));
+        store
+    }
+
+    #[test]
+    fn finalization_snapshots_after_an_in_flight_sample_commits_and_rejects_later_ones() {
+        let dir = std::env::temp_dir().join(format!("orx-final-order-{}", uuid::Uuid::new_v4()));
+        let store = finalize_during_an_in_flight_sample(&dir);
+        if crate::telemetry::build_channel() != "production" {
+            assert!(store.pending_telemetry().unwrap().is_empty());
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Official builds only; run alone:
+    /// `ORX_OFFICIAL_RELEASE_BUILD=1 GITHUB_ACTIONS=true GITHUB_REPOSITORY=alphaXiv/OpenResearch cargo test --locked --bin orx store::telemetry::tests::official_finalization_reports_the_in_flight_sample_not_the_late_one -- --ignored --exact --test-threads=1`
+    #[test]
+    #[ignore = "official-build accounting gate; see the invocation above"]
+    fn official_finalization_reports_the_in_flight_sample_not_the_late_one() {
+        assert_eq!(crate::telemetry::build_channel(), "production");
+        let _env = crate::telemetry::tests::EnvGuard::new(&[
+            "XDG_CONFIG_HOME",
+            "ORX_DATA_DIR",
+            "ORX_TELEMETRY_ENV",
+            "ORX_TELEMETRY_HOST",
+        ]);
+        let dir = std::env::temp_dir().join(format!("orx-official-final-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        // Any stray default-store open lands here, never in the user's data dir.
+        std::env::set_var("ORX_DATA_DIR", dir.join("default-data"));
+        // Any send lands on this loopback sink, never production; none is expected.
+        let receiver = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        std::env::set_var(
+            "ORX_TELEMETRY_HOST",
+            format!("http://{}", receiver.local_addr().unwrap()),
+        );
+        assert!(crate::telemetry::accounting_reports_enabled());
+
+        let store = finalize_during_an_in_flight_sample(&dir.join("data"));
+        let staged = store.pending_telemetry().unwrap();
+        assert_eq!(staged.len(), 1, "one report for the one model");
+        let event = &staged[0].1["events"][0];
+        assert_eq!(event["name"], "cli_chat_model_usage");
+        let properties = &event["properties"];
+        assert_eq!(properties["model"], "gemini-3.1-pro-high");
+        assert_eq!(properties["attribution"], "exact");
+        assert_eq!(properties["outcome"], "done");
+        // Exactly the in-flight sample's counters: the late sample was rejected, not added.
+        assert_eq!(properties["inputTokens"], 3);
+        assert_eq!(properties["outputTokens"], 1);
+        assert_eq!(properties["coverage"], "complete");
+        assert!(
+            matches!(receiver.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "finalization only stages; nothing is sent"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn claude_aggregates_replace_only_listed_identities_per_attempt() {
         let dir = std::env::temp_dir().join(format!("orx-claude-agg-{}", uuid::Uuid::new_v4()));

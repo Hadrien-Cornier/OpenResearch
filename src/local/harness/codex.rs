@@ -98,6 +98,8 @@ pub(crate) struct NativeTurnModels {
     current: Option<String>,
     /// Sub-agent thread → the execution its requests belong to: the turn that last drove it.
     owners: HashMap<String, String>,
+    /// Parent native turn → its execution; a child turn's `root_turn_id` names the turn that started it.
+    roots: HashMap<String, String>,
     /// Sub-agent thread → its latest native turn is still running (rollout task start/complete).
     running: HashMap<String, bool>,
     /// Executions held open for sub-agents that outlived their turn.
@@ -107,6 +109,9 @@ pub(crate) struct NativeTurnModels {
     pending: Vec<(Option<String>, NativeRecord)>,
     /// Records owned by an execution other than the current turn's.
     foreign: Vec<(String, NativeRecord)>,
+    /// Test-only store for `persist_owner`, instead of the default data dir.
+    #[cfg(test)]
+    store_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -236,10 +241,10 @@ impl NativeTurnModels {
                     .insert(thread.to_string(), (session.path, 0, None));
             }
         }
-        let Some((path, offset, current)) = self.rollouts.get_mut(thread) else {
+        let Some((path, mut offset, mut current)) = self.rollouts.get(thread).cloned() else {
             return;
         };
-        for record in read_rollout(path, offset) {
+        for record in read_rollout(&path, &mut offset) {
             match record {
                 RolloutRecord::Context { turn, model } => {
                     if let Some(turn) = turn {
@@ -249,7 +254,7 @@ impl NativeTurnModels {
                         }
                         self.turns.insert(thread.to_string(), turn);
                     }
-                    *current = model;
+                    current = model;
                 }
                 RolloutRecord::Tokens { total, last } => {
                     let turn = self.turns.get(thread).cloned().unwrap_or_default();
@@ -265,11 +270,21 @@ impl NativeTurnModels {
                             .push((self.owners.get(thread).cloned(), record));
                     }
                 }
-                RolloutRecord::Task { running } => {
+                RolloutRecord::Task { running, root } => {
                     self.running.insert(thread.to_string(), running);
+                    // A new child turn belongs to the parent turn that started it; messaging a running child moves nothing.
+                    let owner = root.and_then(|root| self.roots.get(&root).cloned());
+                    if let Some(owner) = owner.filter(|_| self.children.contains_key(thread)) {
+                        if self.owners.get(thread) != Some(&owner) {
+                            self.owners.insert(thread.to_string(), owner);
+                            self.persist_owner(thread);
+                        }
+                    }
                 }
             }
         }
+        self.rollouts
+            .insert(thread.to_string(), (path, offset, current));
     }
 
     /// Records owned by the current turn; the rest wait in `foreign` for their own execution.
@@ -343,7 +358,14 @@ impl NativeTurnModels {
         ) else {
             return;
         };
-        if let Err(error) = Store::open().and_then(|store| {
+        #[cfg(test)]
+        let store = self
+            .store_dir
+            .clone()
+            .map_or_else(Store::open, Store::open_at);
+        #[cfg(not(test))]
+        let store = Store::open();
+        if let Err(error) = store.and_then(|store| {
             store.set_native_scope(
                 owner,
                 &format!("codex-child:{thread}"),
@@ -364,6 +386,7 @@ impl NativeTurnModels {
         let Some(current) = self.current.clone() else {
             return;
         };
+        self.roots.insert(turn.to_string(), current.clone());
         self.scan(thread).await;
         if let Some((path, _, _)) = self.rollouts.get(thread) {
             if let Err(error) = Store::open().and_then(|store| {
@@ -507,14 +530,18 @@ impl NativeTurnModels {
                         }
                         self.persist_owner(thread);
                     }
-                    records.extend(child_request(
+                    if let Some(record) = child_request(
                         &mut self.children,
                         thread,
                         turn,
                         model.as_deref(),
                         &total,
                         last,
-                    ));
+                    ) {
+                        // Live, like scanned: the child turn's owner, not whichever turn is listening.
+                        self.pending
+                            .push((self.owners.get(thread).cloned(), record));
+                    }
                 } else {
                     records.push(NativeRecord::Cumulative {
                         thread: thread.to_string(),
@@ -565,8 +592,9 @@ enum RolloutRecord {
         total: crate::store::TokenUsage,
         last: crate::store::TokenUsage,
     },
-    /// `task_started` / `task_complete`: whether the thread's latest turn is still running.
-    Task { running: bool },
+    /// `task_started` / `task_complete`: whether the thread's latest turn is still running, and the
+    /// parent turn that started it.
+    Task { running: bool, root: Option<String> },
 }
 
 /// `turn_context` and `token_count` records from complete rollout lines appended since `offset`.
@@ -614,10 +642,14 @@ fn read_rollout(path: &Path, offset: &mut u64) -> Vec<RolloutRecord> {
                     total: codex_native_usage(payload.pointer("/info/total_token_usage")?),
                     last: codex_native_usage(payload.pointer("/info/last_token_usage")?),
                 }),
-                ("event_msg", Some("task_started")) => Some(RolloutRecord::Task { running: true }),
-                ("event_msg", Some("task_complete")) => {
-                    Some(RolloutRecord::Task { running: false })
-                }
+                ("event_msg", Some("task_started")) => Some(RolloutRecord::Task {
+                    running: true,
+                    root: text("root_turn_id"),
+                }),
+                ("event_msg", Some("task_complete")) => Some(RolloutRecord::Task {
+                    running: false,
+                    root: None,
+                }),
                 _ => None,
             }
         })
@@ -3619,6 +3651,14 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                         sweep_open_requests(ctx, &client, &mut open_requests).await;
                         settle_turn_usage(ctx, &client, &mut models, live_threads(&sub_threads))
                             .await;
+                        let recorded = ctx.usage_execution_id().map_or(Ok(None), |execution| {
+                            Store::open().and_then(|store| {
+                                store.cumulative_usage_total(execution, &thread_id)
+                            })
+                        });
+                        if refused_before_execution(ctx, params.pointer("/turn/error"), recorded) {
+                            ctx.mark_delivery(DeliveryState::Rejected);
+                        }
                         settle_running_subagents(&mut ctx.assistant.parts);
                         // A terminal `error` notification may have already
                         // pushed this exact message — don't render it twice.
@@ -4015,6 +4055,31 @@ fn has_error_part(ctx: &TurnCtx, message: &str) -> bool {
             .as_ref()
             .is_some_and(|s| s.status == "error" && s.error.as_deref() == Some(message))
     })
+}
+
+/// The provider refused the turn's model itself (codex 0.156: 400 `invalid_request_error`, info
+/// `other`), and the execution has neither output nor recorded usage: no request ran.
+fn refused_before_execution(
+    ctx: &TurnCtx,
+    error: Option<&Value>,
+    recorded: Result<Option<crate::store::TokenUsage>>,
+) -> bool {
+    let body = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .and_then(|message| serde_json::from_str::<Value>(message).ok())
+        .unwrap_or_default();
+    matches!(recorded, Ok(None))
+        && body["status"] == 400
+        && body["error"]["type"] == "invalid_request_error"
+        && body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("model is not supported"))
+        && ctx
+            .assistant
+            .parts
+            .iter()
+            .all(|part| part.tool.as_deref() == Some("error"))
 }
 
 fn retry_after(error: &JsonRpcError) -> Option<Duration> {
@@ -7289,7 +7354,10 @@ requires_openai_auth = false
                 rollout_tokens((90, 10), (90, 10)),
             ],
         );
-        let mut models = NativeTurnModels::default();
+        let mut models = NativeTurnModels {
+            store_dir: Some(dir.join("store")),
+            ..Default::default()
+        };
         models
             .rollouts
             .insert("child".into(), (rollout.clone(), 0, None));
@@ -7358,8 +7426,127 @@ requires_openai_auth = false
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A parent message (`interacted`) reassigns nothing: the running child turn stays with the
+    /// turn that started it, and the next child turn goes, durably, to its `root_turn_id`'s turn.
+    #[tokio::test]
+    async fn child_turns_belong_to_the_parent_turn_that_started_them() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join("rollout-child.jsonl");
+        let started = |turn: &str, root: &str| {
+            json!({"timestamp":"2026-09-30T21:07:23.056Z","type":"event_msg",
+                "payload":{"type":"task_started","turn_id":turn,"root_turn_id":root}})
+            .to_string()
+        };
+        append_lines(
+            &rollout,
+            &[
+                started("c-1", "t-1"),
+                rollout_context("c-1", "gpt-6-mini"),
+                rollout_tokens((90, 10), (90, 10)),
+            ],
+        );
+        let (first, second) = (
+            format!("first-{}", uuid::Uuid::new_v4()),
+            format!("second-{}", uuid::Uuid::new_v4()),
+        );
+        let mut models = NativeTurnModels {
+            store_dir: Some(dir.join("store")),
+            ..Default::default()
+        };
+        models
+            .rollouts
+            .insert("child".into(), (rollout.clone(), 0, None));
+        models.roots.insert("t-1".into(), first.clone());
+        models.current = Some(first.clone());
+        let live = |total: (u64, u64), last: (u64, u64)| {
+            json!({"threadId":"child","turnId":"c-1","tokenUsage":{
+                "total":{"inputTokens":total.0,"outputTokens":total.1},
+                "last":{"inputTokens":last.0,"outputTokens":last.1}}})
+        };
+        assert_eq!(
+            models
+                .capture("thread/tokenUsage/updated", &live((90, 10), (90, 10)), true)
+                .await
+                .len(),
+            2,
+            "identity + request:100 are the first turn's"
+        );
+
+        // Turn 2 messages the still-running child, which keeps working on c-1.
+        models.roots.insert("t-2".into(), second.clone());
+        models.current = Some(second.clone());
+        let message = json!({"threadId":"parent","turnId":"t-2","item":{"type":"subAgentActivity",
+            "id":"call_f","kind":"interacted","agentThreadId":"child","agentPath":"/root/child"}});
+        assert!(models
+            .capture("item/completed", &message, false)
+            .await
+            .is_empty());
+        append_lines(&rollout, &[rollout_tokens((130, 20), (40, 10))]);
+        assert!(models
+            .capture(
+                "thread/tokenUsage/updated",
+                &live((130, 20), (40, 10)),
+                true
+            )
+            .await
+            .is_empty());
+        assert_eq!(
+            std::mem::take(&mut models.foreign),
+            [(
+                first.clone(),
+                NativeRecord::Request(
+                    "child:c-1:request:150".into(),
+                    exact("gpt-6-mini"),
+                    crate::store::TokenUsage {
+                        input_tokens: Some(40),
+                        output_tokens: Some(10),
+                        ..Default::default()
+                    }
+                )
+            )]
+        );
+        let db = rusqlite::Connection::open(dir.join("store").join("orx.db")).unwrap();
+        let start = |execution: &str| -> Option<u64> {
+            let json: String = db
+                .query_row(
+                    "SELECT totals_json FROM native_usage_baselines WHERE execution_id = ?1 AND prefix = 'codex-child:child'",
+                    [execution],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            serde_json::from_str::<Value>(&json).unwrap()["start"].as_u64()
+        };
+        assert_eq!((start(&first), start(&second)), (Some(0), None));
+
+        // The child goes idle; turn 2's follow-up starts c-2, which is turn 2's from its first request.
+        append_lines(
+            &rollout,
+            &[
+                rollout_task("c-1", false),
+                started("c-2", "t-2"),
+                rollout_context("c-2", "gpt-6-mini"),
+                rollout_tokens((200, 30), (70, 10)),
+            ],
+        );
+        assert_eq!(
+            models.catch_up_children().await,
+            [NativeRecord::Request(
+                "child:c-2:request:230".into(),
+                exact("gpt-6-mini"),
+                usage(70, 10)
+            )]
+        );
+        assert!(models.foreign.is_empty());
+        assert_eq!((start(&first), start(&second)), (Some(0), Some(150)));
+        // Windows cannot delete a database file while a handle is still open.
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// After a crash, startup recovery reads what the dead process never did: the interrupted
-    /// turn's own requests past its recorded total, and each sub-agent's share per owner.
+    /// turn's own requests past its recorded total, and each sub-agent's share per owner. A turn
+    /// with no request (the cancel capture's same fold) takes nothing from earlier turns.
     #[test]
     fn startup_recovery_reads_orphaned_turn_and_child_rollouts_once() {
         let dir = std::env::temp_dir().join(format!("orx-codex-orphan-{}", uuid::Uuid::new_v4()));
@@ -7374,6 +7561,11 @@ requires_openai_auth = false
                 rollout_context("turn-1", "gpt-6-astra"),
                 rollout_tokens((160, 15), (110, 10)),
                 rollout_tokens((300, 30), (140, 15)),
+                // Live 0.156 shape of a turn that never ran (the 240ddd6c model refusal).
+                rollout_context("turn-2", "gpt-6.1-sol"),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2",
+                    "error":{"message":"400","codex_error_info":"other"}}})
+                .to_string(),
             ],
         );
         append_lines(
@@ -7386,11 +7578,18 @@ requires_openai_auth = false
                 rollout_tokens((150, 30), (60, 10)),
             ],
         );
-        for execution in ["first", "second"] {
+        for execution in ["first", "second", "third"] {
             store
                 .begin_usage_execution(execution, execution, "codex")
                 .unwrap();
         }
+        store
+            .set_native_scope(
+                "third",
+                "codex-turn:parent:turn-2",
+                &json!({"path": parent, "thread": "parent", "turn": "turn-2"}),
+            )
+            .unwrap();
         // Live, the dead process saw turn-1's first request only.
         store
             .record_cumulative_usage(
@@ -7464,6 +7663,76 @@ requires_openai_auth = false
             120 + 155,
             "turn-1's two requests, the live one not recounted"
         );
+        assert!(samples("third").is_empty());
+        // Windows cannot delete a database file while a handle is still open.
+        drop((db, store));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Live codex 0.156 default-model refusal (execution 240ddd6c): only a refusal with neither
+    /// output nor recorded usage is rejected, which the store reports as `not_executed`
+    /// (`empty_and_exceptional_executions_are_explicit`). Earlier usage keeps its exact sample.
+    #[test]
+    fn only_a_model_refusal_before_anything_ran_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-refusal-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let native = |message: &str| {
+            json!({"message": json!({"type":"error","status":400,
+                "error":{"type":"invalid_request_error","message":message}}).to_string(),
+                "codexErrorInfo":"other"})
+        };
+        let refusal = native(
+            "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.",
+        );
+        let other = native("Your input exceeds the context window of this model.");
+        for (execution, error, output, rejected) in [
+            ("refused", &refusal, None, true),
+            ("retried", &refusal, None, false),
+            ("output", &refusal, Some("partial"), false),
+            ("other", &other, None, false),
+        ] {
+            store
+                .begin_usage_execution(execution, execution, "codex")
+                .unwrap();
+            if execution == "retried" {
+                store
+                    .record_cumulative_usage(
+                        execution,
+                        "codex",
+                        "thread",
+                        "t-1",
+                        &exact("gpt-6-astra"),
+                        &usage(100, 10),
+                        &usage(100, 10),
+                    )
+                    .unwrap();
+            }
+            let mut ctx = TurnCtx::test_stub();
+            if let Some(text) = output {
+                ctx.upsert_part(WirePart::text("reply", text));
+            }
+            ctx.push_error(error["message"].as_str().unwrap().into());
+            let recorded = store.cumulative_usage_total(execution, "thread");
+            assert_eq!(
+                refused_before_execution(&ctx, Some(error), recorded),
+                rejected,
+                "{execution}"
+            );
+        }
+        let db = rusqlite::Connection::open(dir.join("orx.db")).unwrap();
+        let kept: String = db
+            .query_row(
+                "SELECT attribution_json FROM chat_usage_samples WHERE execution_id = 'retried'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::store::Attribution>(&kept).unwrap(),
+            exact("gpt-6-astra")
+        );
+        // Windows cannot delete a database file while a handle is still open.
+        drop((db, store));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

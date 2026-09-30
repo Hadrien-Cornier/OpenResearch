@@ -844,24 +844,33 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
             Ok(run)
         }
         Err(error) => {
-            let current = store.get_run(&run_id)?;
-            let handle_was_persisted = current
-                .as_ref()
-                .is_some_and(|run| run.backend_json != pending_backend_json);
-            if !handle_was_persisted
-                && store.update_status(
-                    &run_id,
-                    RunStatus::Failed,
-                    Some(crate::store::now_ms()),
-                    None,
-                )?
-            {
-                store
-                    .set_result_markdown(&run_id, &format!("Compute submission failed: {error}"))?;
-            }
+            fail_unsubmitted_run(&store, &run_id, &pending_backend_json, &error)?;
             Err(error)
         }
     }
+}
+
+fn fail_unsubmitted_run(
+    store: &Store,
+    run_id: &str,
+    pending_backend_json: &str,
+    error: &crate::error::Error,
+) -> Result<()> {
+    let current = store.get_run(run_id)?;
+    let handle_was_persisted = current
+        .as_ref()
+        .is_some_and(|run| run.backend_json != pending_backend_json);
+    if !handle_was_persisted
+        && store.update_status(
+            run_id,
+            RunStatus::Failed,
+            Some(crate::store::now_ms()),
+            None,
+        )?
+    {
+        store.set_result_markdown(run_id, &format!("Compute submission failed: {error}"))?;
+    }
+    Ok(())
 }
 
 fn reserve_run(
@@ -1116,5 +1125,93 @@ mod tests {
         }
         args.timeout = Some("1h".into());
         assert!(validate_run_args(&args).is_ok());
+    }
+
+    #[test]
+    fn a_failed_submission_reports_once_with_its_reserved_invoker() {
+        let dir = std::env::temp_dir().join(format!("orx-submit-fail-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let identity = crate::store::InvocationIdentity {
+            harness: "claude-code".into(),
+            model: "claude-opus-5-5".into(),
+            provider: None,
+        };
+        let reserve = |id: &str, identity: Option<&crate::store::InvocationIdentity>| {
+            let report = (
+                format!("event-{id}"),
+                serde_json::json!({"events":[{"eventId":format!("event-{id}"),"properties":{"status":"failed"}}]}),
+            );
+            let tx = store.begin().unwrap();
+            store
+                .reserve_run_telemetry(id, identity, None, None, None, Some(&report))
+                .unwrap();
+            store
+                .upsert_run(&StoredRun {
+                    id: id.into(),
+                    experiment_id: "exp".into(),
+                    project_id: "p".into(),
+                    status: "starting".into(),
+                    backend_json: "{}".into(),
+                    command: String::new(),
+                    created_at: 1,
+                    updated_at: 1,
+                    ended_at: None,
+                    exit_code: None,
+                    commit_sha: None,
+                    result_markdown: None,
+                    cancel_requested: false,
+                    chat_session_id: None,
+                })
+                .unwrap();
+            tx.commit().unwrap();
+        };
+        let error = anyhow!("provider rejected the job");
+
+        reserve("unsubmitted", Some(&identity));
+        fail_unsubmitted_run(&store, "unsubmitted", "{}", &error).unwrap();
+        // A monitor or retry observing the same failure later must not report again.
+        assert!(!store
+            .update_status("unsubmitted", RunStatus::Failed, Some(3), None)
+            .unwrap());
+        fail_unsubmitted_run(&store, "unsubmitted", "{}", &error).unwrap();
+        let run = store.get_run("unsubmitted").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert_eq!(
+            run.result_markdown.as_deref(),
+            Some("Compute submission failed: provider rejected the job")
+        );
+        let staged = store.pending_telemetry().unwrap();
+        assert_eq!(staged.len(), 1, "exactly one terminal report");
+        let properties = &staged[0].1["events"][0]["properties"];
+        assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["attribution"], "exact");
+        assert_eq!(properties["harness"], "claude-code");
+        assert_eq!(properties["model"], "claude-opus-5-5");
+        store
+            .acknowledge_pending_telemetry("event-unsubmitted")
+            .unwrap();
+
+        // The backend persisted its handle before failing: the job may exist, so its monitor settles it.
+        reserve("handled", None);
+        store
+            .set_backend_json("handled", r#"{"kind":"ssh_job","jobId":"42"}"#)
+            .unwrap();
+        fail_unsubmitted_run(&store, "handled", "{}", &error).unwrap();
+        assert_eq!(
+            store.get_run("handled").unwrap().unwrap().status,
+            "starting"
+        );
+        assert!(store.pending_telemetry().unwrap().is_empty());
+        assert!(store
+            .update_status("handled", RunStatus::Failed, Some(4), Some(1))
+            .unwrap());
+        let staged = store.pending_telemetry().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            staged[0].1["events"][0]["properties"]["attribution"],
+            "manual"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

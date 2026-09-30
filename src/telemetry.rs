@@ -1227,7 +1227,7 @@ pub(crate) fn capture_experiment_started(kind: &str, local: bool, target: Option
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
@@ -1239,16 +1239,16 @@ mod tests {
     // k8s/slurm/ssh tests are pure functions; localbox uses a disjoint
     // ORX_DATA_DIR), so there's no race. Any NEW test elsewhere that touches
     // these vars or config_dir() must isolate itself (e.g. its own temp
-    // XDG_CONFIG_HOME) — it cannot rely on this lock.
+    // XDG_CONFIG_HOME) or hold an `EnvGuard` too.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    struct EnvGuard {
+    pub(crate) struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
         saved: Vec<(&'static str, Option<String>)>,
     }
 
     impl EnvGuard {
-        fn new(vars: &[&'static str]) -> Self {
+        pub(crate) fn new(vars: &[&'static str]) -> Self {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let saved = vars
                 .iter()
@@ -2288,6 +2288,99 @@ mod tests {
         assert!(load_settings().and_then(|s| s.install_id).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn development_accounting_never_stages_or_reaches_the_outbox() {
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir = std::env::temp_dir().join(format!("orx-tel-dev-acct-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        if build_channel() == "production" {
+            std::env::set_var("ORX_TELEMETRY_ENV", "off");
+        }
+        let session = TelemetrySession::start(None);
+        let store = crate::store::Store::open_at(dir.join("data")).unwrap();
+
+        // A chat turn's execution: suppressed from the start and staged nowhere at finalization.
+        store
+            .begin_usage_execution("execution", "turn", "codex")
+            .unwrap();
+        store
+            .record_usage_sample(
+                "execution",
+                "sample",
+                "codex",
+                Some("gpt-6-sol"),
+                None,
+                &crate::store::TokenUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.finalize_turn_usage("turn", "done").unwrap();
+
+        // A run: `compute::submit` builds its report this way before reserving.
+        let report = pending_event_payload("experiment_finished", json!({ "status": "failed" }));
+        assert!(report.is_none());
+        let tx = store.begin().unwrap();
+        store
+            .reserve_run_telemetry(
+                "run",
+                Some(&crate::store::InvocationIdentity {
+                    harness: "codex".into(),
+                    model: "gpt-6-sol".into(),
+                    provider: None,
+                }),
+                None,
+                None,
+                None,
+                report.as_ref(),
+            )
+            .unwrap();
+        store
+            .upsert_run(&crate::store::StoredRun {
+                id: "run".into(),
+                experiment_id: "exp".into(),
+                project_id: "p".into(),
+                status: "starting".into(),
+                backend_json: "{}".into(),
+                command: String::new(),
+                created_at: 1,
+                updated_at: 1,
+                ended_at: None,
+                exit_code: None,
+                commit_sha: None,
+                result_markdown: None,
+                cancel_requested: false,
+                chat_session_id: None,
+            })
+            .unwrap();
+        tx.commit().unwrap();
+        assert!(store
+            .update_status("run", crate::store::RunStatus::Done, Some(2), Some(0))
+            .unwrap());
+
+        assert!(store.pending_telemetry().unwrap().is_empty());
+        let db = rusqlite::Connection::open(dir.join("data/orx.db")).unwrap();
+        let (suppressed, report_json): (bool, Option<String>) = db
+            .query_row(
+                "SELECT (SELECT suppressed FROM chat_usage_executions), (SELECT report_json FROM run_telemetry)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(suppressed);
+        assert!(report_json.is_none());
+        session.finish(true).await;
+        assert!(
+            !outbox_dir().exists(),
+            "nothing entered the outbound outbox"
+        );
+        assert!(load_settings().and_then(|s| s.install_id).is_none());
+        drop((db, store));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
