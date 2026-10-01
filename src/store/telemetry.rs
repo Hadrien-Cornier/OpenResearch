@@ -144,6 +144,18 @@ impl Store {
         Ok(())
     }
 
+    /// A native turn's current model after a reroute; unlike tool invocations, a later reroute
+    /// replaces it.
+    pub(crate) fn record_native_reroute(
+        &self,
+        call_id: &str,
+        identity: &InvocationIdentity,
+    ) -> Result<()> {
+        identity.validate()?;
+        self.conn.execute("INSERT INTO native_invocation_identities (harness, call_id, identity_json, session_id, created_at) VALUES (?1, ?2, ?3, NULL, ?4) ON CONFLICT(harness, call_id) DO UPDATE SET identity_json = excluded.identity_json", params![identity.harness, call_id, serde_json::to_string(identity)?, now_ms()])?;
+        Ok(())
+    }
+
     pub(crate) fn reserve_run_telemetry(
         &self,
         run_id: &str,
@@ -206,6 +218,15 @@ impl Store {
         {
             return Ok(());
         }
+        // A scope changing executions (a sub-agent outliving its parent's turn) can repeat the
+        // snapshot the previous execution already counted.
+        let seen: Option<String> = tx.query_row("SELECT totals_json FROM native_usage_totals WHERE harness = ?1 AND native_scope = ?2", params![harness, prefix], |row| row.get(0)).optional()?;
+        let repeated = previous.is_none()
+            && seen
+                .map(|json| serde_json::from_str::<TokenUsage>(&json))
+                .transpose()?
+                .as_ref()
+                == Some(total);
         let delta = if let Some(previous) = &previous {
             TokenUsage {
                 input_tokens: total
@@ -231,7 +252,7 @@ impl Store {
             previous.is_some() && (delta.input_tokens.is_none() || delta.output_tokens.is_none());
         let generation =
             previous.as_ref().map_or(0, |previous| previous.generation) + u64::from(reset);
-        if !reset {
+        if !reset && !repeated {
             let sample_id = format!(
                 "{native_scope}:{native_turn}:{generation}:{}",
                 serde_json::to_string(total)?
@@ -245,6 +266,7 @@ impl Store {
             generation,
         };
         tx.execute("INSERT INTO native_usage_baselines (execution_id, prefix, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(execution_id, prefix) DO UPDATE SET totals_json = excluded.totals_json", params![execution_id, prefix, serde_json::to_string(&baseline)?])?;
+        tx.execute("INSERT INTO native_usage_totals (harness, native_scope, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(harness, native_scope) DO UPDATE SET totals_json = excluded.totals_json", params![harness, prefix, serde_json::to_string(total)?])?;
         tx.commit()?;
         Ok(())
     }
@@ -376,6 +398,18 @@ impl Store {
                     _ => "failed",
                 },
             )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finalize_usage_turns(&self, turn_prefix: &str, outcome: &str) -> Result<()> {
+        let turns: Vec<String> = self
+            .conn
+            .prepare("SELECT DISTINCT turn_id FROM chat_usage_executions WHERE outcome IS NULL AND substr(turn_id, 1, length(?1)) = ?1")?
+            .query_map([turn_prefix], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for turn in turns {
+            self.finalize_turn_usage(&turn, outcome)?;
         }
         Ok(())
     }
@@ -638,6 +672,93 @@ mod tests {
             .query_row("SELECT outcome FROM chat_usage_executions", [], |row| {
                 row.get(0)
             })
+            .unwrap();
+        assert_eq!(outcome, "done");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sub-agent outliving its parent's turn: the parent counted its first snapshot, the late
+    /// execution counts only what follows (a repeat adds nothing), under its native reroute even
+    /// after the in-memory model cache is gone, and closes with the child's own `turn/completed`.
+    #[test]
+    fn late_codex_child_usage_continues_from_its_parent_execution() {
+        let dir = std::env::temp_dir().join(format!("orx-late-child-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let models = std::sync::Mutex::new(std::collections::HashMap::new());
+        let record = |method: &str, params: serde_json::Value| {
+            crate::local::harness::codex::record_unowned_in(&store, "s", &models, method, &params)
+                .unwrap()
+        };
+        let counters = |n: u64| TokenUsage {
+            input_tokens: Some(n),
+            output_tokens: Some(n),
+            ..Default::default()
+        };
+        let usage = |total: u64, last: u64| {
+            serde_json::json!({"threadId": "child", "turnId": "ct", "tokenUsage": {
+                "total": {"inputTokens": total, "outputTokens": total},
+                "last": {"inputTokens": last, "outputTokens": last}}})
+        };
+        let samples = |execution: &str| -> Vec<(Option<String>, u64)> {
+            store
+                .conn
+                .prepare("SELECT model, usage_json FROM chat_usage_samples WHERE execution_id = ?1")
+                .unwrap()
+                .query_map([execution], |row| {
+                    Ok((row.get(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .map(|row| {
+                    let (model, json) = row.unwrap();
+                    (
+                        model,
+                        serde_json::from_str::<TokenUsage>(&json)
+                            .unwrap()
+                            .input_tokens
+                            .unwrap(),
+                    )
+                })
+                .collect()
+        };
+        store
+            .begin_usage_execution("parent", "parent-turn", "codex")
+            .unwrap();
+        store
+            .record_cumulative_usage(
+                "parent",
+                "codex",
+                "child",
+                "ct",
+                Some("gpt-6-safe"),
+                &counters(10),
+                &counters(4),
+            )
+            .unwrap();
+        store.finalize_turn_usage("parent-turn", "done").unwrap();
+        crate::local::harness::codex::capture_reroute(
+            Some(&store),
+            &models,
+            &serde_json::json!({"threadId": "child", "turnId": "ct", "toModel": "gpt-6-safe"}),
+        );
+        models.lock().unwrap().clear();
+        record("thread/tokenUsage/updated", usage(10, 4));
+        record("thread/tokenUsage/updated", usage(15, 5));
+        record(
+            "turn/completed",
+            serde_json::json!({"threadId": "child", "turn": {"id": "ct", "status": "completed"}}),
+        );
+        record("thread/tokenUsage/updated", usage(20, 5));
+        let late = "codex-late:s:child:ct";
+        assert_eq!(samples("parent"), [(Some("gpt-6-safe".into()), 4)]);
+        assert_eq!(samples(late), [(Some("gpt-6-safe".into()), 5)]);
+        let outcome: String = store
+            .conn
+            .query_row(
+                "SELECT outcome FROM chat_usage_executions WHERE execution_id = ?1",
+                [late],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outcome, "done");
         drop(store);

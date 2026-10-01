@@ -72,46 +72,218 @@ fn codex_native_usage(usage: &Value) -> crate::store::TokenUsage {
     }
 }
 
-/// Records token usage under the model that (thread, turn) natively ran: `model/rerouted` wins,
-/// else the thread's own rollout `turn_context` (notifications carry only configuration).
-fn capture_token_notification(
-    ctx: &mut TurnCtx,
-    models: &mut HashMap<(String, String), String>,
+type TurnModels = std::sync::Mutex<HashMap<(String, String), String>>;
+
+struct TokenNotification<'a> {
+    thread: &'a str,
+    turn: &'a str,
+    model: Option<String>,
+    total: crate::store::TokenUsage,
+    last: crate::store::TokenUsage,
+}
+
+/// Token usage under the model that (thread, turn) natively ran: `model/rerouted` wins, else the
+/// thread's own rollout `turn_context` (notifications carry only configuration).
+fn token_notification<'a>(
+    store: Option<&Store>,
+    models: &TurnModels,
     method: &str,
-    params: &Value,
-) {
-    let (Some(thread), Some(turn)) = (
-        params.get("threadId").and_then(Value::as_str),
-        event_turn_id(params),
-    ) else {
-        return;
-    };
+    params: &'a Value,
+) -> Option<TokenNotification<'a>> {
+    let thread = params.get("threadId").and_then(Value::as_str)?;
+    let turn = event_turn_id(params)?;
     let key = (thread.to_string(), turn.to_string());
-    if method == "model/rerouted" {
-        if let Some(model) = params.get("toModel").and_then(Value::as_str) {
-            models.insert(key, model.to_string());
-        }
-        return;
-    }
     let (true, Some(total), Some(last)) = (
         method == "thread/tokenUsage/updated",
         params.pointer("/tokenUsage/total"),
         params.pointer("/tokenUsage/last"),
     ) else {
-        return;
+        return None;
     };
-    if !models.contains_key(&key) {
-        if let Some(model) = rollout_turn_model(thread, turn) {
-            models.insert(key.clone(), model);
-        }
-    }
-    ctx.record_cumulative_usage(
+    let known = models.lock().unwrap().get(&key).cloned();
+    let model = known.or_else(|| {
+        let opened;
+        let store = match store {
+            Some(store) => Some(store),
+            None => {
+                opened = Store::open().ok();
+                opened.as_ref()
+            }
+        };
+        let model = store
+            .and_then(|store| rerouted_model(store, thread, turn))
+            .or_else(|| rollout_turn_model(thread, turn))?;
+        models.lock().unwrap().insert(key, model.clone());
+        Some(model)
+    });
+    Some(TokenNotification {
         thread,
         turn,
-        models.get(&key).map(String::as_str),
-        codex_native_usage(total),
-        codex_native_usage(last),
-    );
+        model,
+        total: codex_native_usage(total),
+        last: codex_native_usage(last),
+    })
+}
+
+fn reroute_key(thread: &str, turn: &str) -> String {
+    format!("codex-reroute:{thread}:{turn}")
+}
+
+/// Rollouts never persist reroutes, so the live notification is captured, before any consumer
+/// sees it, as the turn's durable latest model.
+pub(crate) fn capture_reroute(store: Option<&Store>, models: &TurnModels, params: &Value) {
+    let (Some(thread), Some(turn), Some(model)) = (
+        params.get("threadId").and_then(Value::as_str),
+        event_turn_id(params),
+        params.get("toModel").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    models
+        .lock()
+        .unwrap()
+        .insert((thread.to_string(), turn.to_string()), model.to_string());
+    let identity = crate::store::InvocationIdentity {
+        harness: "codex".into(),
+        model: model.to_string(),
+        provider: None,
+    };
+    let record = |store: &Store| store.record_native_reroute(&reroute_key(thread, turn), &identity);
+    if let Err(error) = store.map_or_else(|| Store::open().and_then(|store| record(&store)), record)
+    {
+        eprintln!("orx up: could not record codex reroute: {error}");
+    }
+}
+
+fn rerouted_model(store: &Store, thread: &str, turn: &str) -> Option<String> {
+    let identity = store.native_invocation_identity("codex", &reroute_key(thread, turn));
+    Some(identity.ok()??.model)
+}
+
+fn capture_token_notification(
+    ctx: &mut TurnCtx,
+    models: &TurnModels,
+    method: &str,
+    params: &Value,
+) {
+    if let Some(usage) = token_notification(None, models, method, params) {
+        ctx.record_cumulative_usage(
+            usage.thread,
+            usage.turn,
+            usage.model.as_deref(),
+            usage.total,
+            usage.last,
+        );
+    }
+}
+
+/// Usage no live turn owns (a sub-agent outliving its parent's bounded drain, or reporting during
+/// a later turn) goes to that native turn's own execution, closed by its own `turn/completed`.
+pub(crate) fn record_unowned(session: &str, models: &TurnModels, method: &str, params: &Value) {
+    if !matches!(method, "thread/tokenUsage/updated" | "turn/completed") {
+        return;
+    }
+    if let Err(error) =
+        Store::open().and_then(|store| record_unowned_in(&store, session, models, method, params))
+    {
+        eprintln!("orx up: could not record codex sub-agent usage: {error}");
+    }
+}
+
+pub(crate) fn record_unowned_in(
+    store: &Store,
+    session: &str,
+    models: &TurnModels,
+    method: &str,
+    params: &Value,
+) -> Result<()> {
+    let execution = |thread: &str, turn: &str| format!("codex-late:{session}:{thread}:{turn}");
+    if method == "turn/completed" {
+        let (Some(thread), Some(turn)) = (
+            params.get("threadId").and_then(Value::as_str),
+            event_turn_id(params),
+        ) else {
+            return Ok(());
+        };
+        let outcome = match params.pointer("/turn/status").and_then(Value::as_str) {
+            Some("completed") => "done",
+            Some("interrupted") => "cancelled",
+            Some("failed") => "failed",
+            _ => return Ok(()),
+        };
+        return store.finalize_turn_usage(&execution(thread, turn), outcome);
+    }
+    let Some(usage) = token_notification(Some(store), models, method, params) else {
+        return Ok(());
+    };
+    let execution = execution(usage.thread, usage.turn);
+    store.begin_usage_execution(&execution, &execution, "codex")?;
+    store.record_cumulative_usage(
+        &execution,
+        "codex",
+        usage.thread,
+        usage.turn,
+        usage.model.as_deref(),
+        &usage.total,
+        &usage.last,
+    )
+}
+
+/// The connection is gone, and with it every sub-agent it was still running.
+pub(crate) fn close_unowned(session: &str) {
+    if let Err(error) = Store::open().and_then(|store| {
+        store.finalize_usage_turns(&format!("codex-late:{session}:"), "cancelled")
+    }) {
+        eprintln!("orx up: could not close codex sub-agent usage: {error}");
+    }
+}
+
+/// The invoking identity of a shell in `thread` (its `CODEX_THREAD_ID`): the model of the
+/// thread's running native turn.
+pub(crate) fn running_turn_identity(thread: &str) -> Option<crate::store::InvocationIdentity> {
+    let rollout = std::fs::read_to_string(native_store::codex_session(thread).ok()??.path).ok()?;
+    running_turn_identity_in(&Store::open().ok()?, thread, &rollout)
+}
+
+fn running_turn_identity_in(
+    store: &Store,
+    thread: &str,
+    rollout: &str,
+) -> Option<crate::store::InvocationIdentity> {
+    let (turn, model) = running_turn(rollout)?;
+    Some(crate::store::InvocationIdentity {
+        harness: "codex".into(),
+        model: rerouted_model(store, thread, &turn).or(model)?,
+        provider: None,
+    })
+}
+
+/// The rollout's running turn and its `turn_context` model.
+fn running_turn(rollout: &str) -> Option<(String, Option<String>)> {
+    let mut running: Option<(String, Option<String>)> = None;
+    for line in rollout.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let payload = &record["payload"];
+        let turn = payload["turn_id"].as_str();
+        let current = running.as_ref().map(|(id, _)| id.as_str());
+        match (record["type"].as_str(), payload["type"].as_str()) {
+            (Some("event_msg"), Some("task_started")) => {
+                running = turn.map(|turn| (turn.to_string(), None));
+            }
+            (Some("event_msg"), Some("task_complete" | "turn_aborted")) if turn == current => {
+                running = None;
+            }
+            (Some("turn_context"), _) if turn.is_some() && turn == current => {
+                if let Some((_, model)) = &mut running {
+                    *model = payload["model"].as_str().map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    running
 }
 
 /// The model in `turn`'s `turn_context` record of `thread`'s rollout.
@@ -734,6 +906,7 @@ impl Harness for Codex {
                     TurnEvent::Closed => return Err(anyhow!("codex closed during compaction")),
                 };
                 if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+                    record_unowned(client.session_id(), client.turn_models(), &method, &params);
                     continue;
                 }
                 let event_turn = event_turn_id(&params);
@@ -2618,7 +2791,6 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     // stream on this same connection with a foreign turnId; we route them into
     // the spawning part's `children` instead of dropping them.
     let mut sub_threads: HashMap<String, SubThread> = HashMap::new();
-    let mut turn_models = HashMap::new();
     // The parent turn's `turn/completed` arrived while sub-agent threads were
     // still live — we're draining their tails before ending the turn (bounded
     // by DRAIN_QUIET_SETTLE, see the deadline below).
@@ -2702,10 +2874,14 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         };
         match event {
             TurnEvent::Notification { method, params } => {
-                match classify_event_thread(turn_id.as_deref(), &sub_threads, &params) {
+                let scope = classify_event_thread(turn_id.as_deref(), &sub_threads, &params);
+                if matches!(scope, EventScope::Stale) || method == "turn/completed" {
+                    record_unowned(client.session_id(), client.turn_models(), &method, &params);
+                }
+                match scope {
                     EventScope::Stale => continue,
                     EventScope::SubAgent(tid) => {
-                        capture_token_notification(ctx, &mut turn_models, &method, &params);
+                        capture_token_notification(ctx, client.turn_models(), &method, &params);
                         route_sub_event(ctx, &mut sub_threads, &thread_id, &tid, &method, &params);
                         ctx.maybe_flush();
                         // Draining after the parent's turn/completed: the last
@@ -2726,7 +2902,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                     }
                     EventScope::Parent => {}
                 }
-                capture_token_notification(ctx, &mut turn_models, &method, &params);
+                capture_token_notification(ctx, client.turn_models(), &method, &params);
                 // Codex settled a request itself (its approval deadline hit,
                 // or our reply raced this notification): the card must not
                 // stay live. Part ids are a pure function of the request id;
@@ -5913,5 +6089,56 @@ requires_openai_auth = false
             Some("gpt-6-luna")
         );
         assert_eq!(turn_context_model(&rollout, "t3"), None);
+    }
+
+    /// A shell's invoker is its thread's running turn, under its captured native reroute when one
+    /// exists (rollouts never persist reroutes); never a finished turn.
+    #[test]
+    fn running_turn_names_the_invoking_model() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-invoker-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let record =
+            |kind: &str, payload: Value| json!({"type": kind, "payload": payload}).to_string();
+        let started = record(
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t2"}),
+        );
+        let context = record(
+            "turn_context",
+            json!({"turn_id": "t2", "model": "gpt-6-sol"}),
+        );
+        let mut rollout = vec![
+            record(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "turn_context",
+                json!({"turn_id": "t1", "model": "gpt-6-luna"}),
+            ),
+            record(
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
+        ];
+        let model = |rollout: &[String]| {
+            running_turn_identity_in(&store, "th", &rollout.join("\n"))
+                .map(|identity| identity.model)
+        };
+        assert_eq!(model(&rollout), None);
+        rollout.extend([started, context]);
+        assert_eq!(model(&rollout).as_deref(), Some("gpt-6-sol"));
+        for to in ["gpt-6-safe", "gpt-6-safer"] {
+            let reroute = json!({"threadId": "th", "turnId": "t2", "toModel": to});
+            capture_reroute(Some(&store), &Default::default(), &reroute);
+            assert_eq!(model(&rollout).as_deref(), Some(to));
+        }
+        rollout.push(record(
+            "event_msg",
+            json!({"type": "turn_aborted", "turn_id": "t2"}),
+        ));
+        assert_eq!(model(&rollout), None);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

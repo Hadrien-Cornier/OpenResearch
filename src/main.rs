@@ -603,9 +603,16 @@ impl ExpRunArgs {
             .invocation_context
             .clone()
             .or_else(|| (!self.forwarded).then(|| std::env::var("ORX_INVOCATION_CONTEXT").ok())?);
-        let identity: Option<crate::store::InvocationIdentity> = context
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?;
+        let identity: Option<crate::store::InvocationIdentity> = match context {
+            Some(json) => Some(serde_json::from_str(&json)?),
+            // Codex exports only its thread id to shells; that thread's running turn invoked us.
+            None if !self.forwarded && self.launching_chat_session().is_some() => {
+                std::env::var("CODEX_THREAD_ID")
+                    .ok()
+                    .and_then(|thread| crate::local::harness::codex::running_turn_identity(&thread))
+            }
+            None => None,
+        };
         if let Some(identity) = &identity {
             identity.validate()?;
         }

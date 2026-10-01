@@ -590,11 +590,12 @@ fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
         // prepare_env puts this executable's directory first on PATH.
         "orx antigravity-gate".to_string()
     };
+    // Without approval the gate still sees shell commands, to export their invoking model.
     object.insert(
         "openresearch-approval".into(),
         serde_json::json!({
-            "enabled": enabled,
-            "PreToolUse": [{"matcher":"*","hooks":[{"type":"command","command":command,"timeout":3600}]}]
+            "enabled": enabled || !cfg!(windows),
+            "PreToolUse": [{"matcher": if enabled { "*" } else { "run_command" },"hooks":[{"type":"command","command":command,"timeout":3600}]}]
         }),
     );
     object.insert(
@@ -1181,7 +1182,11 @@ mod tests {
         let path = repo.join(".agents/hooks.json");
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(content["openresearch-approval"]["enabled"], false);
+        assert_eq!(content["openresearch-approval"]["enabled"], !cfg!(windows));
+        assert_eq!(
+            content["openresearch-approval"]["PreToolUse"][0]["matcher"],
+            "run_command"
+        );
         assert_eq!(content["openresearch-accounting"]["enabled"], true);
         assert_eq!(
             content["openresearch-accounting"]["PostInvocation"]

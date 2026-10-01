@@ -225,11 +225,37 @@ pub async fn run_antigravity() -> Result<()> {
             return Ok(());
         }
     }
-    let decision = antigravity_decision(&input).await.unwrap_or_else(|error| {
+    let mut decision = antigravity_decision(&input).await.unwrap_or_else(|error| {
         json!({"decision": "deny", "reason": format!("OpenResearch approval bridge unavailable: {error}")})
     });
+    if decision["decision"] == "allow" {
+        if let Some(overwrite) = invocation_overwrite(&input) {
+            decision["overwrite"] = overwrite;
+        }
+    }
     println!("{decision}");
     Ok(())
+}
+
+/// A shell command runs with its invocation's native `modelName` exported, so `orx exp run` knows
+/// the model that launched it (native `overwrite` merges into the tool's arguments).
+fn invocation_overwrite(input: &str) -> Option<Value> {
+    if cfg!(windows) {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(input).ok()?;
+    if payload.pointer("/toolCall/name")? != "run_command" {
+        return None;
+    }
+    let command = payload.pointer("/toolCall/args/CommandLine")?.as_str()?;
+    let identity = crate::store::InvocationIdentity {
+        harness: "antigravity".into(),
+        model: payload.get("modelName")?.as_str()?.to_string(),
+        provider: None,
+    };
+    let command =
+        crate::commands::invocation_gate::with_invocation_context(command, &identity).ok()?;
+    Some(json!({ "CommandLine": command }))
 }
 
 /// The invocation's own planner step from its native transcript (native steps can be inserted at
@@ -347,6 +373,25 @@ mod antigravity_tests {
         let res = antigravity_decision("invalid-json").await.unwrap();
         assert_eq!(res["decision"], "allow");
         std::env::remove_var("ORX_AGY_GATE");
+    }
+
+    #[test]
+    fn shell_commands_carry_their_invocations_native_model() {
+        let payload = |tool: &str| {
+            json!({"modelName": "gemini-3.8-flash-high", "toolCall": {"name": tool, "args": {"CommandLine": "orx exp run e", "Cwd": "/w"}}})
+                .to_string()
+        };
+        let overwrite = invocation_overwrite(&payload("run_command"));
+        if cfg!(windows) {
+            assert_eq!(overwrite, None);
+            return;
+        }
+        let command = overwrite.unwrap()["CommandLine"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(command.contains("gemini-3.8-flash-high") && command.ends_with("; orx exp run e"));
+        assert_eq!(invocation_overwrite(&payload("view_file")), None);
     }
 
     #[test]

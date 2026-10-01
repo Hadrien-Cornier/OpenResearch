@@ -5,8 +5,19 @@ use serde_json::{json, Value};
 use crate::error::{anyhow, Result};
 use crate::store::{InvocationIdentity, Store};
 
-fn rewrite(payload: &Value, identity: &InvocationIdentity) -> Result<Value> {
+/// `command` run with the native invoking identity exported to `orx exp run`.
+pub(crate) fn with_invocation_context(
+    command: &str,
+    identity: &InvocationIdentity,
+) -> Result<String> {
     identity.validate()?;
+    Ok(format!(
+        "export ORX_INVOCATION_CONTEXT={}; {command}",
+        crate::jobs::ssh::sh_quote(&serde_json::to_string(identity)?)
+    ))
+}
+
+fn rewrite(payload: &Value, identity: &InvocationIdentity) -> Result<Value> {
     let mut input = payload
         .get("tool_input")
         .cloned()
@@ -15,10 +26,7 @@ fn rewrite(payload: &Value, identity: &InvocationIdentity) -> Result<Value> {
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Missing native shell command"))?;
-    input["command"] = json!(format!(
-        "export ORX_INVOCATION_CONTEXT={}; {command}",
-        crate::jobs::ssh::sh_quote(&serde_json::to_string(identity)?)
-    ));
+    input["command"] = json!(with_invocation_context(command, identity)?);
     Ok(json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":input}}))
 }
 
