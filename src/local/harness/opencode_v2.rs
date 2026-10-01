@@ -541,10 +541,10 @@ pub(super) async fn capture_interrupted(
     sink: &dyn UsageSink,
     native_id: &str,
     started_at: i64,
-) {
+) -> Result<()> {
     let mut captured = Captured::default();
     wait_idle(endpoint, &[native_id.to_string()]).await;
-    let _ = capture_tree(
+    let mut read = capture_tree(
         sink,
         endpoint.into(),
         native_id,
@@ -553,7 +553,8 @@ pub(super) async fn capture_interrupted(
         false,
         None,
     )
-    .await;
+    .await
+    .map(drop);
     let background: Vec<String> = captured.background.iter().cloned().collect();
     if !background.is_empty() {
         for session in &background {
@@ -573,7 +574,8 @@ pub(super) async fn capture_interrupted(
         )
         .await;
         wait_idle(endpoint, &captured.sessions(native_id)).await;
-        let _ = capture_tree(
+        // A full re-read from the turn's start supersedes the first read.
+        read = capture_tree(
             sink,
             endpoint.into(),
             native_id,
@@ -582,7 +584,8 @@ pub(super) async fn capture_interrupted(
             false,
             None,
         )
-        .await;
+        .await
+        .map(drop);
     }
     for session in captured.sessions(native_id) {
         observe_retry(
@@ -594,6 +597,7 @@ pub(super) async fn capture_interrupted(
         )
         .await;
     }
+    read
 }
 
 /// One watcher poll of a held execution's background subagents and the runs their results natively
@@ -1608,7 +1612,9 @@ mod tests {
         let (endpoint, interrupts, server) =
             fake_v2(exports, retrying, vec![json!({"data":{}})]).await;
         let recorded = super::super::tests::Recorded::default();
-        capture_interrupted(&endpoint, &recorded, "ses_main", 10).await;
+        capture_interrupted(&endpoint, &recorded, "ses_main", 10)
+            .await
+            .unwrap();
         server.abort();
 
         assert_eq!(*interrupts.lock().unwrap(), ["ses_bg", "ses_main"]);
@@ -2093,11 +2099,12 @@ mod tests {
             "opencode-background:unrecoverable",
             Missing::ChildModelUnknown,
         );
-        for (sessions, held, (marker, reason), recorded_samples) in [
-            (vec![main(true), child.clone()], false, root_lost, 3),
-            (vec![main(false), child.clone()], true, root_lost, 3),
-            (vec![child.clone()], false, root_lost, 1),
-            (vec![main(false)], false, child_lost, 2),
+        // A holder alone never seals work native already finished.
+        for (sessions, held, marker, recorded_samples) in [
+            (vec![main(true), child.clone()], false, Some(root_lost), 3),
+            (vec![main(false), child.clone()], true, None, 2),
+            (vec![child.clone()], false, Some(root_lost), 1),
+            (vec![main(false)], false, Some(child_lost), 2),
         ] {
             let path =
                 std::env::temp_dir().join(format!("orx-oc-v2db-{}.db", uuid::Uuid::new_v4()));
@@ -2114,9 +2121,80 @@ mod tests {
             )
             .await;
             let samples = recorded.samples.into_inner().unwrap();
-            assert_eq!(samples[marker].0, Unresolved { reason }, "{marker} {held}");
+            if let Some((marker, reason)) = marker {
+                assert_eq!(samples[marker].0, Unresolved { reason }, "{marker} {held}");
+            }
             assert_eq!(samples.len(), recorded_samples, "{samples:?}");
         }
+    }
+
+    /// Another process still runs the claimed turn: recovery keeps reading past the old grace and
+    /// settles, unmarked, once native releases the claim, with every step written meanwhile.
+    #[tokio::test]
+    async fn stored_recovery_captures_work_a_holder_writes_after_the_grace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = std::env::temp_dir().join(format!("orx-oc-v2db-{}.db", uuid::Uuid::new_v4()));
+        let root = step("msg_root", "ses_main", "root-model", 13, json!([]));
+        v2_database(
+            &path,
+            &[("ses_main", None, true, vec![user("msg_prompt", 12), root])],
+        );
+        let polls = AtomicUsize::new(0);
+        let late = 2 * super::super::DELIVERY_GRACE_POLLS;
+        let held = || {
+            // The holder finishes the turn well after the old grace.
+            if polls.fetch_add(1, Ordering::SeqCst) == late {
+                let db = rusqlite::Connection::open(&path).unwrap();
+                let step = step("msg_late", "ses_main", "late-model", 14, json!([]));
+                let data = json!({"model": step["model"], "content": [], "tokens": step["tokens"],
+                    "time": step["time"]});
+                db.execute(
+                    "INSERT INTO session_message VALUES ('msg_late', 'ses_main', 'assistant', 9, ?1)",
+                    [data.to_string()],
+                )
+                .unwrap();
+                db.execute("UPDATE session_v2 SET time_suspended = NULL", [])
+                    .unwrap();
+            }
+            async { true }
+        };
+        let recorded = super::super::tests::Recorded::default();
+        let scope =
+            json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_prompt"});
+        super::super::settle_stored(&recorded, &scope, &path, || async { None }, held).await;
+        let samples = recorded.samples.into_inner().unwrap();
+        let mut ids: Vec<_> = samples.keys().cloned().collect();
+        ids.sort();
+        assert_eq!(ids, ["msg_late", "msg_root"]);
+        assert_eq!(polls.load(Ordering::SeqCst), late + 1);
+    }
+
+    /// A cancellation whose native history read failed reports the failure, so its caller keeps the
+    /// persisted scope for a retry.
+    #[tokio::test]
+    async fn interrupted_capture_reports_a_failed_history_read() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        let app = Router::new()
+            .route(
+                "/api/session/active",
+                get(|| async { Json(json!({"data":{}})) }),
+            )
+            .route(
+                "/api/session/{id}",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = AgentEndpoint {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            client: reqwest::Client::new(),
+            protocol: crate::local::opencode::Protocol::V2,
+            legacy_v2_api: false,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let recorded = super::super::tests::Recorded::default();
+        let read = capture_interrupted(&endpoint, &recorded, "ses_main", 10).await;
+        server.abort();
+        assert!(read.is_err());
     }
 
     /// While the turn's own server still runs its tree, recovery waits for it rather than sealing;

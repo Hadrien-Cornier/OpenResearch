@@ -2437,16 +2437,16 @@ async fn watch_held(
 
 /// How a root scope's native work stood at one read of its database.
 enum Stored {
-    /// Nothing more will run; `unfinished`: native never finished the turn.
-    Settled { unfinished: bool },
+    /// Nothing more will run; `unfinished`: a session native never finished.
+    Settled { unfinished: Option<String> },
     /// The turn's own server still runs its tree.
     Running,
-    /// Another process holds the database, so work may continue unseen.
+    /// Another process holds the database and native work is unfinished, so it may still run.
     Held,
 }
 
-/// Captures a root scope's prompt run and descendants from its native database until it settles;
-/// work left unfinished, or a holder outlasting the grace, seals it with a partial marker.
+/// Captures a root scope's prompt run and descendants from its native database until native
+/// evidence says it ended; work no process can finish seals it with a partial marker.
 async fn settle_stored<F, G>(
     sink: &impl UsageSink,
     scope: &Value,
@@ -2466,7 +2466,6 @@ async fn settle_stored<F, G>(
     };
     let history = History::Database(database);
     let mut captured = v2::Captured::default();
-    let mut waited = 0;
     loop {
         let polled: Result<Stored> = async {
             // Read before capturing, so a tree found idle has persisted everything captured below.
@@ -2500,39 +2499,35 @@ async fn settle_stored<F, G>(
                 }
                 capture.visited.into_iter().collect()
             };
-            Ok(match active {
-                Some(active) if sessions.iter().any(|session| active.contains(session)) => {
-                    Stored::Running
+            if let Some(active) = &active {
+                if sessions.iter().any(|session| active.contains(session)) {
+                    return Ok(Stored::Running);
                 }
-                _ if held => Stored::Held,
-                _ => Stored::Settled {
-                    unfinished: scope["v2"] == true && {
-                        let (path, id) = (database.to_path_buf(), native.to_string());
-                        tokio::task::spawn_blocking(move || {
-                            native_store::opencode_database::v2_unfinished(&path, &id)
-                        })
-                        .await??
-                    },
-                },
+            }
+            // V1 never resumes, so its history only matters while another process may still write.
+            let v2 = scope["v2"] == true;
+            let unfinished = if v2 || held {
+                unfinished_session(database, sessions, v2, (native, prompt)).await?
+            } else {
+                None
+            };
+            Ok(match unfinished {
+                Some(_) if held => Stored::Held,
+                unfinished => Stored::Settled { unfinished },
             })
         }
         .await;
         match polled {
             Ok(Stored::Settled { unfinished }) => {
-                if unfinished {
+                if let Some(session) = unfinished {
                     let why = anyhow!(
-                        "OpenCode left the turn unfinished; resumed work is not this execution's"
+                        "OpenCode left {session} unfinished; resumed work is not this execution's"
                     );
-                    record_unrecoverable(sink, &why, false);
+                    record_unrecoverable(sink, &why, session != native);
                 }
                 return;
             }
-            Ok(Stored::Held) if waited >= DELIVERY_GRACE_POLLS => {
-                let why = anyhow!("another process still holds the OpenCode database");
-                return record_unrecoverable(sink, &why, false);
-            }
-            Ok(Stored::Held) => waited += 1,
-            Ok(Stored::Running) => {}
+            Ok(Stored::Held | Stored::Running) => {}
             Err(error) => match error.downcast_ref::<SessionGone>() {
                 Some(SessionGone(session)) => {
                     return record_unrecoverable(sink, &error, session != native)
@@ -2542,6 +2537,78 @@ async fn settle_stored<F, G>(
         }
         tokio::time::sleep(BACKGROUND_POLL).await;
     }
+}
+
+/// The first of `sessions` (the root first) whose native work is unfinished: a V2 execution claim,
+/// or V1 history whose run has not ended.
+async fn unfinished_session(
+    database: &std::path::Path,
+    mut sessions: Vec<String>,
+    v2: bool,
+    (native, prompt): (&str, &str),
+) -> Result<Option<String>> {
+    sessions.sort_by_key(|session| session != native);
+    let (path, native, prompt) = (
+        database.to_path_buf(),
+        native.to_string(),
+        prompt.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        for session in sessions {
+            let unfinished = if v2 {
+                native_store::opencode_database::v2_unfinished(&path, &session)?
+            } else {
+                let messages = native_store::opencode_database::v1_history(&path, &session)?
+                    .ok_or_else(|| SessionGone(session.clone()))?;
+                !v1_finished(&messages, (session == native).then_some(prompt.as_str()))
+            };
+            if unfinished {
+                return Ok(Some(session));
+            }
+        }
+        Ok(None)
+    })
+    .await?
+}
+
+/// Native V1's loop exit: the run's last message is an assistant step that errored, or finished
+/// without asking for another tool round. A root run ends at orx's next prompt.
+fn v1_finished(messages: &Value, prompt: Option<&str>) -> bool {
+    let all: Vec<&Value> = messages.as_array().into_iter().flatten().collect();
+    fn id(message: &Value) -> Option<&str> {
+        message.pointer("/info/id").and_then(Value::as_str)
+    }
+    let run = match prompt {
+        Some(prompt) => match all.iter().position(|message| id(message) == Some(prompt)) {
+            None => return true,
+            Some(at)
+                if all[at + 1..]
+                    .iter()
+                    .any(|m| id(m).is_some_and(|id| id.contains("-orx"))) =>
+            {
+                return true
+            }
+            Some(at) => &all[at + 1..],
+        },
+        None => &all[..],
+    };
+    run.last().is_some_and(|message| {
+        let info = &message["info"];
+        let tools = message["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|part| {
+                part["type"] == "tool"
+                    && part.pointer("/metadata/providerExecuted") != Some(&json!(true))
+            });
+        info["role"] == "assistant"
+            && (info.get("error").is_some_and(|error| !error.is_null())
+                || info["finish"]
+                    .as_str()
+                    .is_some_and(|finish| !matches!(finish, "tool-calls" | "unknown"))
+                    && !tools)
+    })
 }
 
 /// Sessions the server is running now.
@@ -2912,29 +2979,57 @@ fn track_turn(ctx: &TurnCtx, native_id: &str, started_at: i64) {
 /// Captures an interrupted turn's native evidence before the shared interrupt finalizes its usage.
 /// V1 abort persists synchronously and cascades to every subagent; V2 settles asynchronously.
 pub(crate) async fn capture_interrupted(
+    agent: &std::sync::Arc<crate::local::opencode::AgentHost>,
     endpoint: &crate::local::opencode::AgentEndpoint,
     turn: &TrackedTurn,
 ) {
-    match endpoint.protocol {
-        crate::local::opencode::Protocol::V1 => {
-            capture_v1(
-                &turn.sink,
-                endpoint.into(),
-                vec![(turn.native_id.clone(), None)],
-                (turn.started_at, None),
-            )
-            .await;
-        }
+    let captured = match endpoint.protocol {
+        crate::local::opencode::Protocol::V1 => capture_v1(
+            &turn.sink,
+            endpoint.into(),
+            vec![(turn.native_id.clone(), None)],
+            (turn.started_at, None),
+        )
+        .await
+        .failed
+        .is_none(),
         crate::local::opencode::Protocol::V2 => {
-            v2::capture_interrupted(endpoint, &turn.sink, &turn.native_id, turn.started_at).await
+            v2::capture_interrupted(endpoint, &turn.sink, &turn.native_id, turn.started_at)
+                .await
+                .is_ok()
         }
+    };
+    let execution = &turn.sink.execution_id;
+    let retry = crate::store::Store::open().and_then(|store| {
+        if captured {
+            // The interrupt stopped and read the whole tree, so a restart has nothing to adopt.
+            store.clear_native_scope(execution, BACKGROUND_SCOPE)?;
+            return Ok(None);
+        }
+        hold_for_retry(&store, execution)
+    });
+    match retry {
+        Ok(Some(scope)) => {
+            let sink = ExecutionSink {
+                execution_id: execution.clone(),
+                session_id: turn.sink.session_id.clone(),
+            };
+            let original = Some(endpoint.base_url.clone());
+            tokio::spawn(watch_held(agent.clone(), sink, scope, original));
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("orx up: could not keep OpenCode scope for retry: {error}"),
     }
-    // The interrupt stopped the whole tree, so a restart has nothing left to adopt.
-    if let Err(error) = crate::store::Store::open()
-        .and_then(|store| store.clear_native_scope(&turn.sink.execution_id, BACKGROUND_SCOPE))
-    {
-        eprintln!("orx up: could not clear OpenCode scope: {error}");
-    }
+}
+
+/// After a failed capture: holds the execution so its finalize waits, and returns the scope
+/// persisted before submission for a watcher to retry from.
+fn hold_for_retry(store: &crate::store::Store, execution: &str) -> Result<Option<Value>> {
+    let scope = store
+        .native_scopes(BACKGROUND_SCOPE)?
+        .into_iter()
+        .find_map(|(id, _, scope, _)| (id == execution).then_some(scope));
+    Ok(scope.filter(|_| store.hold_usage_execution(execution).unwrap_or(false)))
 }
 
 /// An unidentified sub-agent never inherits its parent's model.
@@ -4182,6 +4277,96 @@ opencode/unknown
         assert!(store.native_scopes(BACKGROUND_SCOPE).unwrap().is_empty());
     }
 
+    /// Writes V1 `/session/{id}/message` entries as native `message` and `part` rows.
+    fn insert_v1(db: &rusqlite::Connection, session: &str, messages: Vec<Value>) {
+        for mut message in messages {
+            let info = message["info"].as_object_mut().unwrap();
+            let id = info.remove("id").unwrap();
+            info.remove("sessionID");
+            let created = info["time"]["created"].as_i64();
+            let data = Value::Object(info.clone()).to_string();
+            db.execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id.as_str(), session, created, data],
+            )
+            .unwrap();
+            for mut part in message["parts"].as_array().unwrap().clone() {
+                let part = part.as_object_mut().unwrap();
+                let part_id = part.remove("id").unwrap();
+                part.remove("messageID");
+                part.remove("sessionID");
+                let data = Value::Object(part.clone()).to_string();
+                db.execute(
+                    "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![part_id.as_str(), id.as_str(), session, data],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Another process (a surviving V1 server) still runs the prompt's run: recovery keeps reading
+    /// past the old grace and settles, unmarked, once native history shows the run ended.
+    #[tokio::test]
+    async fn v1_recovery_captures_work_a_holder_writes_after_the_grace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const PROMPT: &str = "msg_0f4a81d5e000-orxabcdefghij";
+        let step = |id: &str, model: &str, finish: &str| {
+            json!({"info":{"id":id,"sessionID":"ses_main","role":"assistant","modelID":model,
+                "providerID":"p","finish":finish,"time":{"created":13,"completed":14}},
+                "parts":[{"id":format!("{id}_1"),"messageID":id,"sessionID":"ses_main","type":"step-start"}]})
+        };
+        let path = std::env::temp_dir().join(format!("orx-oc-v1db-{}.db", uuid::Uuid::new_v4()));
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY); CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT); INSERT INTO session VALUES ('ses_main');").unwrap();
+        let prompt = json!({"info":{"id":PROMPT,"sessionID":"ses_main","role":"user",
+            "time":{"created":12}},"parts":[]});
+        insert_v1(
+            &db,
+            "ses_main",
+            vec![prompt, step("msg_a", "root-model", "tool-calls")],
+        );
+        let polls = AtomicUsize::new(0);
+        let late = 2 * DELIVERY_GRACE_POLLS;
+        let held = || {
+            // The holder writes the run's last step well after the old grace.
+            if polls.fetch_add(1, Ordering::SeqCst) == late {
+                insert_v1(&db, "ses_main", vec![step("msg_b", "late-model", "stop")]);
+            }
+            async { true }
+        };
+        let recorded = Recorded::default();
+        let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":PROMPT});
+        settle_stored(&recorded, &scope, &path, || async { None }, held).await;
+        let samples = recorded.samples.into_inner().unwrap();
+        let mut ids: Vec<_> = samples.keys().cloned().collect();
+        ids.sort();
+        assert_eq!(ids, ["msg_a_1", "msg_b_1"]);
+        assert_eq!(polls.load(Ordering::SeqCst), late + 1);
+    }
+
+    /// A cancellation whose native read failed keeps its persisted scope and holds the execution, so
+    /// the interrupt's finalize waits for the retry instead of closing without the missing usage.
+    #[test]
+    fn a_failed_interrupt_capture_holds_its_scope_for_retry() {
+        let (store, db) = usage_store();
+        let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_p"});
+        store
+            .set_native_scope("exec", BACKGROUND_SCOPE, &scope)
+            .unwrap();
+        assert_eq!(hold_for_retry(&store, "exec").unwrap(), Some(scope.clone()));
+        store.finalize_turn_usage("turn", "cancelled").unwrap();
+        let (outcome, pending): (Option<String>, Option<String>) = db
+            .query_row(
+                "SELECT outcome, pending_outcome FROM chat_usage_executions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((outcome, pending.as_deref()), (None, Some("cancelled")));
+        assert_eq!(store.native_scopes(BACKGROUND_SCOPE).unwrap()[0].2, scope);
+    }
+
     /// V1 crash recovery reads the native database, starting no server: the prompt's run (across
     /// native compaction) and its child only; an unreadable database retries, replays add nothing.
     #[tokio::test]
@@ -4219,30 +4404,7 @@ opencode/unknown
         for (session, messages) in [("ses_main", main), ("ses_child", child)] {
             db.execute("INSERT INTO session VALUES (?1)", [session])
                 .unwrap();
-            for mut message in messages {
-                let info = message["info"].as_object_mut().unwrap();
-                let id = info.remove("id").unwrap();
-                info.remove("sessionID");
-                let created = info["time"]["created"].as_i64();
-                let data = Value::Object(info.clone()).to_string();
-                db.execute(
-                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![id.as_str(), session, created, data],
-                )
-                .unwrap();
-                for mut part in message["parts"].as_array().unwrap().clone() {
-                    let part = part.as_object_mut().unwrap();
-                    let part_id = part.remove("id").unwrap();
-                    part.remove("messageID");
-                    part.remove("sessionID");
-                    let data = Value::Object(part.clone()).to_string();
-                    db.execute(
-                        "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![part_id.as_str(), id.as_str(), session, data],
-                    )
-                    .unwrap();
-                }
-            }
+            insert_v1(&db, session, messages);
         }
         drop(db);
         // The database is unreadable until it appears.

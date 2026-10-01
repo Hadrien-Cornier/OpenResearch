@@ -632,7 +632,11 @@ impl AgentHost {
 
     /// Stops the native turn and, before the shared interrupt finalizes usage, captures the native
     /// evidence of the turn it aborted.
-    pub(crate) async fn interrupt(&self, session_id: &str, native_id: &str) -> Result<()> {
+    pub(crate) async fn interrupt(
+        self: &std::sync::Arc<Self>,
+        session_id: &str,
+        native_id: &str,
+    ) -> Result<()> {
         let turn = self
             .turns
             .lock()
@@ -644,7 +648,7 @@ impl AgentHost {
         };
         abort_session(&endpoint, native_id).await?;
         if let Some(turn) = turn {
-            crate::local::harness::opencode::capture_interrupted(&endpoint, &turn).await;
+            crate::local::harness::opencode::capture_interrupted(self, &endpoint, &turn).await;
         }
         Ok(())
     }
