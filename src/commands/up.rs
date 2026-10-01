@@ -82,7 +82,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
             let url = format!("http://127.0.0.1:{port}");
             eprintln!("orx up: already running — opening {url}");
             if !args.no_browser {
-                browser::open_browser(&url);
+                browser::open_dashboard(&url, crate::telemetry::UpLaunchMode::of(&args));
             }
             return Ok(());
         }
@@ -220,7 +220,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
             eprintln!("orx up: warning: {warning}");
         }
         if !args.no_browser {
-            browser::open_browser(&url);
+            browser::open_dashboard(&url, crate::telemetry::UpLaunchMode::of(&args));
         }
     }
 

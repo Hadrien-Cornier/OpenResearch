@@ -1673,7 +1673,7 @@ pub async fn run(host: &str, args: UpArgs) -> Result<()> {
     };
     eprintln!("orx up --remote: dashboard on {}", session.gateway_url);
     if !args.no_browser {
-        browser::open_browser(&session.gateway_url);
+        browser::open_dashboard(&session.gateway_url, crate::telemetry::UpLaunchMode::Remote);
     }
     eprintln!("orx up --remote: press Ctrl-C to stop.");
     let _ = tokio::signal::ctrl_c().await;

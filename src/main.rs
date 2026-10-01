@@ -1020,6 +1020,10 @@ async fn main() {
     telemetry::set_flag(cli.no_telemetry);
     let session = telemetry::TelemetrySession::start(
         should_capture_command(&command).then(|| command_name(&command)),
+        match &command {
+            Command::Up(args) => Some(telemetry::UpLaunchMode::of(args)),
+            _ => None,
+        },
     );
 
     let result = dispatch(command).await;
