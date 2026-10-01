@@ -123,12 +123,20 @@ pub(crate) fn native_recovery_snapshot(session_id: &str, current_turn_id: &str) 
     let Ok(messages) = store.list_chat_messages(session_id) else {
         return String::new();
     };
+    transcript_snapshot(
+        messages
+            .iter()
+            .filter(|message| current_user_id.as_deref() != Some(message.id.as_str())),
+    )
+}
+
+/// The newest [`RECOVERY_SNAPSHOT_BYTES`] of a transcript, flattened to text.
+pub(crate) fn transcript_snapshot<'a>(
+    messages: impl IntoIterator<Item = &'a crate::store::StoredChatMessage>,
+) -> String {
     let mut entries = Vec::new();
     for message in messages {
-        if current_user_id.as_deref() == Some(message.id.as_str()) {
-            continue;
-        }
-        let wire = stored_to_wire(&message);
+        let wire = stored_to_wire(message);
         let mut lines = Vec::new();
         recovery_part_lines(&wire.parts, &mut lines);
         if !lines.is_empty() {

@@ -741,6 +741,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
             "/api/chat/sessions/{id}/turns/{turnId}/recover",
             post(recover_chat_turn),
         )
+        .route("/api/chat/sessions/{id}/side", post(open_side_chat))
         .route("/api/chat/sessions/{id}/fork", post(fork_chat_turn))
         .route("/api/chat/sessions/{id}/branch", post(select_chat_branch))
         .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
@@ -1299,7 +1300,12 @@ async fn list_project_activity(State(state): State<AppState>) -> ApiResult {
         let store = Store::open()?;
         let mut active_agents = HashMap::<String, usize>::new();
         for (session_id, project_id) in store.list_chat_session_project_ids()? {
-            if busy.contains(&session_id) {
+            // Side chats stay out of project agent counts.
+            if busy.contains(&session_id)
+                && store
+                    .get_chat_session(&session_id)?
+                    .is_some_and(|session| session.side_parent_session_id.is_none())
+            {
                 *active_agents.entry(project_id).or_default() += 1;
             }
         }
@@ -6991,6 +6997,7 @@ async fn create_chat_session(
         autonomy: req.autonomy.map(|autonomy| autonomy.id().to_string()),
         active_leaf_id: None,
         parent_session_id: None,
+        side_parent_session_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -7068,6 +7075,24 @@ async fn import_native_chat(
         .emit_session(Some(session))
         .await
         .ok_or_else(|| not_found("chat session"))?;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, false) }),
+    ))
+}
+
+async fn open_side_chat(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let parent = Store::open()?
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    if parent.side_parent_session_id.is_some() {
+        return Err(bad_request("a side chat cannot open its own side chat"));
+    }
+    let _admission = state
+        .project_lifecycle
+        .admit(&parent.project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    let session = state.chat.open_side_chat(&parent).await?;
     Ok(Json(
         json!({ "session": local::chat::session_json(&session, false) }),
     ))

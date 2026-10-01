@@ -1255,5 +1255,13 @@
   "tree_restore_only": "Restore this experiment",
   "tree_restore_above": "Restore archived ancestors",
   "tree_restore_down": "Restore descendants",
-  "tree_all_experiments_archived": "All experiments are archived. Turn on Show archived to view them."
+  "tree_all_experiments_archived": "All experiments are archived. Turn on Show archived to view them.",
+  "side_command_description": "Ask a quick question in a temporary side chat",
+  "side_chat_open": "Side chat",
+  "side_chat_needs_a_chat": "Open a chat first, then start a side chat from it.",
+  "side_chat_open_failed": "Couldn't open a side chat: {error}",
+  "side_chat_empty": "Ask a quick question about the chat this branched from. It knows that chat as it was when you opened this side chat.",
+  "workspace_more_tools": "More tools",
+  "side_chat_nested": "A side chat can't open its own side chat.",
+  "side_chat_close_failed": "Couldn't delete the side chat: {error}"
 }

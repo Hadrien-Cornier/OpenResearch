@@ -301,15 +301,15 @@
 }
 
 /* Reserve room for the three compact workspace buttons. */
-.workspace-body .chat-header {
+.workspace-body > .chat-pane .chat-header {
   padding-inline-end: 8.5rem;
 }
 
-.workspace-card-visible .chat-pane {
+.workspace-card-visible > .chat-pane {
   padding-inline-end: 16rem;
 }
 
-.workspace-card-visible .chat-header {
+.workspace-card-visible > .chat-pane .chat-header {
   padding-inline-end: 1rem;
 }
 
