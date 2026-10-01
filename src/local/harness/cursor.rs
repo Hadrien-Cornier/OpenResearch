@@ -765,10 +765,6 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let status = child.wait().await?;
     let log_path = crate::store::data_dir().join(format!("agent-{log_name}.log"));
     if !state.saw_result {
-        // Init names the model before the request; an entitlement refusal means it never ran.
-        if !state.executed && read_log_tail(&log_path, 8 * 1024).contains("ActionRequiredError:") {
-            ctx.mark_delivery(DeliveryState::Rejected);
-        }
         return Err(anyhow!("{}", cursor_exit_detail(status, &log_path)));
     }
     if ctx.plan_mode {
@@ -792,6 +788,14 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     Ok(())
 }
 
+/// A success ran the init model even without output or usage; an error without usage did not.
+fn result_usage(result: &Value, is_error: bool) -> Option<crate::store::TokenUsage> {
+    result
+        .get("usage")
+        .map(cursor_native_usage)
+        .or_else(|| (!is_error).then(crate::store::TokenUsage::default))
+}
+
 fn cursor_native_usage(usage: &Value) -> crate::store::TokenUsage {
     let field = |key| usage.get(key).and_then(Value::as_u64);
     crate::store::TokenUsage {
@@ -807,12 +811,10 @@ fn cursor_native_usage(usage: &Value) -> crate::store::TokenUsage {
 
 #[derive(Default)]
 struct TurnState {
-    /// Cursor's `system/init` model label, announced before the request is sent.
+    /// Cursor's `system/init` model label (`Auto` included), announced before the request.
     init_model: Option<String>,
-    /// The model produced output, so `init_model` names an execution.
+    /// The request produced output, so `init_model` names an execution.
     executed: bool,
-    /// Tool calls whose invoking model is recorded.
-    invokers: std::collections::HashSet<String>,
     native_session_id: Option<String>,
     text_part_id: Option<String>,
     reasoning_part_id: Option<String>,
@@ -823,35 +825,19 @@ struct TurnState {
     saw_result: bool,
 }
 
-fn usage_sample_id(ctx: &TurnCtx) -> String {
-    format!("cursor-result-{}", ctx.attempt_count_for_usage())
-}
-
-fn usage_attribution(ctx: &TurnCtx, state: &TurnState) -> crate::store::Attribution {
-    ctx.native_attribution(
-        state.init_model.as_deref(),
-        None,
-        crate::store::Missing::IdentityNotReported,
-    )
-}
-
 fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool {
     if let Some(sid) = event.get("session_id").and_then(Value::as_str) {
         state.native_session_id = Some(sid.to_string());
     }
     let kind = event.get("type").and_then(Value::as_str);
-    let succeeded = kind == Some("result")
-        && event.get("subtype").and_then(Value::as_str) == Some("success")
-        && event.get("is_error").and_then(Value::as_bool) != Some(true);
-    if !state.executed
-        && (matches!(kind, Some("assistant" | "thinking" | "tool_call")) || succeeded)
-    {
+    // Output proves the init model ran even if no result (with usage) follows.
+    if !state.executed && matches!(kind, Some("assistant" | "thinking" | "tool_call")) {
         state.executed = true;
-        ctx.record_attributed_usage(
-            &usage_sample_id(ctx),
-            usage_attribution(ctx, state),
+        ctx.record_native_usage(
+            &format!("cursor-result-{}", ctx.attempt_count_for_usage()),
+            state.init_model.as_deref(),
+            None,
             crate::store::TokenUsage::default(),
-            false,
         );
     }
     match kind {
@@ -908,21 +894,20 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             false
         }
         Some("result") => {
-            if let Some(usage) = event.get("usage") {
-                // `usage` is the turn's native total across every model call.
-                ctx.record_attributed_usage(
-                    &usage_sample_id(ctx),
-                    usage_attribution(ctx, state),
-                    cursor_native_usage(usage),
-                    true,
-                );
-            }
             state.saw_result = true;
             let is_error = event
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
                 || event.get("subtype").and_then(Value::as_str) == Some("error");
+            if let Some(usage) = result_usage(event, is_error) {
+                ctx.record_native_usage(
+                    &format!("cursor-result-{}", ctx.attempt_count_for_usage()),
+                    state.init_model.as_deref(),
+                    None,
+                    usage,
+                );
+            }
             if is_error {
                 state.turn_errored = true;
                 let detail = event
@@ -992,30 +977,12 @@ fn apply_tool_call(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) {
     state.reasoning_part_id = None;
     close_text_segment(state);
     let subtype = event.get("subtype").and_then(Value::as_str).unwrap_or("");
-    let native_call_id = event.get("call_id").and_then(Value::as_str);
-    let call_id = native_call_id
+    let call_id = event
+        .get("call_id")
+        .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("tool-{}", state.text_seq));
-    // Only native call ids: the positional fallback repeats across turns.
-    if let (Some(call_id), Some(model)) = (native_call_id, state.init_model.as_deref()) {
-        if state.invokers.insert(call_id.to_string()) {
-            ctx.record_tool_invoker(call_id, model, None);
-        }
-    }
-    let tool_call = event.get("tool_call").unwrap_or(&Value::Null);
-    // A sub-agent runs as its own conversation: print mode and its local transcript report neither
-    // its model (`args.model` is only the request) nor its usage, which the parent result excludes.
-    if tool_call.get("taskToolCall").is_some() {
-        ctx.record_attributed_usage(
-            &format!("cursor-task-{call_id}"),
-            crate::store::Attribution::Unresolved {
-                reason: crate::store::Missing::ChildModelUnknown,
-            },
-            crate::store::TokenUsage::default(),
-            false,
-        );
-    }
-    let (name, args, result) = tool_call_parts(tool_call);
+    let (name, args, result) = tool_call_parts(event.get("tool_call").unwrap_or(&Value::Null));
     match subtype {
         "started" => {
             ctx.upsert_part(WirePart {
@@ -1408,79 +1375,6 @@ mod tests {
         );
     }
 
-    /// Cursor 2026.09.15 print-mode shapes: init names the model before the request, so only
-    /// model output makes it an execution; every native tool call records its invoker.
-    #[test]
-    fn init_model_attributes_executions_and_tool_invokers() {
-        use crate::store::{Attribution, Missing};
-        let init = |model: &str| {
-            serde_json::json!({"type": "system", "subtype": "init", "apiKeySource": "login",
-                "cwd": "/ws", "session_id": "s1", "model": model, "permissionMode": "default"})
-        };
-        let echo = serde_json::json!({"type": "user", "session_id": "s1",
-            "message": {"role": "user", "content": [{"type": "text", "text": "run it"}]}});
-        let shell = |subtype: &str, call_id: &str| {
-            serde_json::json!({"type": "tool_call", "subtype": subtype, "call_id": call_id,
-                "tool_call": {"shellToolCall": {"args": {"command": "orx exp run"}}},
-                "model_call_id": "mc-1", "session_id": "s1", "timestamp_ms": 1})
-        };
-        let fold = |events: &[Value]| {
-            let mut ctx = TurnCtx::test_stub();
-            ctx.harness = "cursor".into();
-            let mut state = TurnState::default();
-            for event in events {
-                apply_event(&mut ctx, &mut state, event);
-            }
-            (ctx, state)
-        };
-
-        // A refused request prints init and the echo, then fails: no execution evidence.
-        let (_, state) = fold(&[init("Opus 4.8 High"), echo.clone()]);
-        assert!(!state.executed);
-        let failed = serde_json::json!({"type": "result", "is_error": true, "result": "Rate limit exceeded"});
-        let (_, state) = fold(&[init("Opus 4.8 High"), echo.clone(), failed]);
-        assert!(!state.executed);
-
-        // Auto stays explicit routing; each native call records the invoker once, in order.
-        let (ctx, state) = fold(&[
-            init("Auto"),
-            echo,
-            shell("started", "call_a"),
-            shell("completed", "call_a"),
-            shell("completed", "call_b"),
-            serde_json::json!({"type": "tool_call", "subtype": "started",
-                "tool_call": {"shellToolCall": {"args": {"command": "ls"}}}}),
-        ]);
-        assert!(state.executed);
-        assert_eq!(usage_attribution(&ctx, &state), Attribution::AutoRouting);
-        assert_eq!(
-            state.invokers,
-            ["call_a", "call_b"].map(String::from).into_iter().collect()
-        );
-
-        // A named model keeps its full native label; a successful empty answer still executed.
-        let done = serde_json::json!({"type": "result", "subtype": "success", "duration_ms": 1,
-            "duration_api_ms": 1, "is_error": false, "result": "", "session_id": "s1",
-            "request_id": "r1"});
-        let (ctx, state) = fold(&[init("Opus 4.8 High"), done]);
-        assert!(state.executed);
-        assert_eq!(
-            usage_attribution(&ctx, &state),
-            Attribution::Exact {
-                model: "Opus 4.8 High".into(),
-                provider: None
-            }
-        );
-        let (ctx, state) = fold(&[shell("started", "call_c")]);
-        assert!(state.invokers.is_empty());
-        assert_eq!(
-            usage_attribution(&ctx, &state),
-            Attribution::Unresolved {
-                reason: Missing::IdentityNotReported
-            }
-        );
-    }
-
     #[test]
     fn streaming_deltas_append_and_duplicate_flushes_are_skipped() {
         let events = vec![
@@ -1696,88 +1590,14 @@ ActionRequiredError: Named models unavailable Free plans can only use Auto. Swit
         assert!(matches!(reject, ResumeAction::Nothing));
     }
 
-    /// Native print-mode streams → the reports the service receives.
     #[test]
-    fn native_streams_report_the_init_model_once_and_children_stay_unknown() {
-        let init = serde_json::json!({"type": "system", "subtype": "init", "session_id": "s1",
-            "model": "Opus 4.8 High"});
-        let delta = |text: &str| {
-            serde_json::json!({"type": "assistant", "session_id": "s1",
-                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
-        };
-        let echo = serde_json::json!({"type": "user", "session_id": "s1",
-            "message": {"role": "user", "content": [{"type": "text", "text": "run it"}]}});
-        let task = serde_json::json!({"type": "tool_call", "subtype": "started", "call_id": "task-1",
-            "tool_call": {"taskToolCall": {"args": {"prompt": "Find the loader", "model": "gpt-5.5"}}}});
-        let failed = serde_json::json!({"type": "result", "subtype": "error", "is_error": true,
-            "result": "Rate limit exceeded", "session_id": "s1"});
-        let done = serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
-            "result": "Hello", "session_id": "s1",
-            "usage": {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 100, "cacheWriteTokens": 0}});
-        let report = |attribution: &str, model: Value, reason: Value, coverage: &str| {
-            (attribution.to_string(), model, reason, coverage.to_string())
-        };
-        let cases = [
-            // Output before and after a native retry is one request with one result total.
-            (
-                vec![
-                    init.clone(),
-                    delta("Hel"),
-                    serde_json::json!({"type": "retry"}),
-                    delta("Hello"),
-                    done,
-                ],
-                vec![report(
-                    "exact",
-                    "Opus 4.8 High".into(),
-                    Value::Null,
-                    "complete",
-                )],
-            ),
-            // Failed after output: the model executed; the hidden sub-agent never takes it.
-            (
-                vec![init.clone(), delta("Delegating."), task, failed],
-                vec![
-                    report("exact", "Opus 4.8 High".into(), Value::Null, "missing"),
-                    report(
-                        "unresolved",
-                        Value::Null,
-                        "child_model_unknown".into(),
-                        "missing",
-                    ),
-                ],
-            ),
-            // Cancelled after init only: init names a configured model, never an execution.
-            (
-                vec![init, echo],
-                vec![report(
-                    "unresolved",
-                    Value::Null,
-                    "no_usage_reported".into(),
-                    "missing",
-                )],
-            ),
-        ];
-        for (events, expected) in cases {
-            let dir = std::env::temp_dir().join(format!("orx-cursor-{}", uuid::Uuid::new_v4()));
-            let mut ctx = TurnCtx::test_capture(dir.clone(), "cursor");
-            let mut state = TurnState::default();
-            for event in &events {
-                apply_event(&mut ctx, &mut state, event);
-            }
-            let reports: Vec<_> = TurnCtx::test_reports(&dir, "failed")
-                .into_iter()
-                .map(|r| {
-                    report(
-                        r["attribution"].as_str().unwrap(),
-                        r["model"].clone(),
-                        r["attributionReason"].clone(),
-                        r["coverage"].as_str().unwrap(),
-                    )
-                })
-                .collect();
-            assert_eq!(reports, expected, "{events:?}");
-            std::fs::remove_dir_all(dir).unwrap();
-        }
+    fn only_a_successful_or_measured_result_attests_the_init_model() {
+        let usage = serde_json::json!({"usage": {"inputTokens": 3, "outputTokens": 1}});
+        assert_eq!(
+            result_usage(&serde_json::json!({}), false),
+            Some(Default::default())
+        );
+        assert_eq!(result_usage(&serde_json::json!({}), true), None);
+        assert_eq!(result_usage(&usage, true).unwrap().output_tokens, Some(1));
     }
 }

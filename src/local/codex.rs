@@ -28,7 +28,6 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::{anyhow, Result};
 use crate::local::harness::codex::{ensure_orx_data_dir, find_codex_required};
 use crate::local::native_store::{self, NativeStore};
-use crate::store::Store;
 
 /// Ceiling on a request's response wait — generous because `thread/start`
 /// blocks on the user's own MCP servers coming up.
@@ -211,7 +210,6 @@ pub struct CodexClient {
     /// child (crash/restart replacement) — the DB signal covers that case.
     last_collab_mode: std::sync::Mutex<Option<&'static str>>,
     native_store: NativeStore,
-    pub(crate) native: crate::local::harness::codex::NativeTurns,
 }
 
 impl CodexClient {
@@ -355,9 +353,6 @@ impl CodexClient {
             .is_err()
         {
             eprintln!("orx up: timed out reaping codex app-server");
-        }
-        if let Err(error) = Store::open().and_then(|store| self.native.close(&store)) {
-            eprintln!("orx up: could not close codex sub-agent usage: {error}");
         }
     }
 
@@ -550,16 +545,6 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
                             .remove(&request_id.to_string());
                     }
                 }
-                let listening = client.turn.lock().unwrap().is_some();
-                if let Err(error) = client.native.observe(
-                    Store::open,
-                    client.resumed_thread().as_deref(),
-                    &method,
-                    &params,
-                    listening,
-                ) {
-                    eprintln!("orx up: could not record codex native usage: {error}");
-                }
                 let turn = client.turn.lock().unwrap();
                 // Raw event tracing for sub-agent lifecycle debugging; enable
                 // with ORX_CODEX_EVENT_LOG=1 on the backend (dev only). The
@@ -677,7 +662,6 @@ async fn spawn_client(
         thread_model: std::sync::Mutex::new(None),
         last_collab_mode: std::sync::Mutex::new(None),
         native_store,
-        native: crate::local::harness::codex::NativeTurns::new(session_id),
     });
     tokio::spawn(read_loop(client.clone(), stdout));
     Ok(client)
@@ -908,7 +892,6 @@ mod tests {
             thread_model: std::sync::Mutex::new(None),
             last_collab_mode: std::sync::Mutex::new(None),
             native_store: NativeStore::Isolated,
-            native: Default::default(),
         };
 
         client.terminate().await;

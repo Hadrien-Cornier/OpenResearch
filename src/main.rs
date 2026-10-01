@@ -565,19 +565,16 @@ pub struct ExpRunArgs {
     pub chat_session_id: Option<String>,
     #[arg(long, hide = true)]
     pub invocation_context: Option<String>,
-    /// Native agent CLI that launched this outside an OpenResearch chat (see [`agent_origin`]).
+    /// The native agent CLI whose shell ran `orx exp run`, read once in that process.
     #[arg(skip)]
     pub agent_origin: Option<String>,
-    /// Forwarded to `orx up`: launch evidence comes from the request, never the server's own env.
-    #[arg(skip)]
-    pub forwarded: bool,
     #[arg(skip)]
     pub telemetry_suppressed: bool,
 }
 
-/// Markers the native agent CLIs export into their shell tools. Nested agents leave several, so
-/// the innermost is `unknown`. Antigravity exports none.
-pub(crate) fn agent_origin(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+/// Markers the native agent CLIs export to their shells; nested agents are `unknown`.
+/// Antigravity exports none.
+pub(crate) fn agent_origin() -> Option<String> {
     let found: Vec<_> = [
         ("CLAUDECODE", "claude-code"),
         ("CODEX_THREAD_ID", "codex"),
@@ -585,12 +582,12 @@ pub(crate) fn agent_origin(env: impl Fn(&str) -> Option<String>) -> Option<Strin
         ("CURSOR_AGENT", "cursor"),
     ]
     .into_iter()
-    .filter(|(key, _)| env(key).is_some_and(|value| !value.is_empty()))
-    .map(|(_, harness)| harness)
+    .filter(|(key, _)| std::env::var(key).is_ok_and(|value| !value.is_empty()))
+    .map(|(_, harness)| harness.to_string())
     .collect();
-    match found.as_slice() {
-        [] => None,
-        [harness] => Some(harness.to_string()),
+    match found.len() {
+        0 => None,
+        1 => found.into_iter().next(),
         _ => Some("unknown".into()),
     }
 }
@@ -602,42 +599,20 @@ impl ExpRunArgs {
         let context = self
             .invocation_context
             .clone()
-            .or_else(|| self.launch_env("ORX_INVOCATION_CONTEXT"));
-        let identity: Option<crate::store::InvocationIdentity> = match context {
-            Some(json) => Some(serde_json::from_str(&json)?),
-            // Codex exports only its thread id; the thread's running turn is the invoking request.
-            None => self.launch_env("CODEX_THREAD_ID").and_then(|thread| {
-                crate::local::harness::codex::chat_thread_invoker(
-                    &self.launching_chat_session()?,
-                    &thread,
-                )
-            }),
-        };
+            .or_else(|| std::env::var("ORX_INVOCATION_CONTEXT").ok());
+        let identity: Option<crate::store::InvocationIdentity> = context
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
         if let Some(identity) = &identity {
             identity.validate()?;
         }
         Ok(identity)
     }
 
-    fn launch_env(&self, key: &str) -> Option<String> {
-        (!self.forwarded)
-            .then(|| std::env::var(key).ok())
-            .flatten()
-            .filter(|value| !value.is_empty())
-    }
-
     pub fn launching_chat_session(&self) -> Option<String> {
-        self.chat_session_id.clone().or_else(|| {
-            (!self.forwarded)
-                .then(crate::local::chat::launching_chat_session)
-                .flatten()
-        })
-    }
-
-    pub(crate) fn launching_agent_origin(&self) -> Option<String> {
-        self.agent_origin
+        self.chat_session_id
             .clone()
-            .or_else(|| agent_origin(|key| self.launch_env(key)))
+            .or_else(crate::local::chat::launching_chat_session)
     }
 }
 

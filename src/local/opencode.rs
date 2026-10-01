@@ -731,14 +731,6 @@ impl AgentHost {
             return Err(anyhow!("OpenCode startup was cancelled"));
         }
         let status = agent.status();
-        // A pending run report waits only while the server that owns its native step lives.
-        if let Some(pid) = agent.child.id() {
-            if let Err(error) = crate::store::Store::open()
-                .and_then(|store| store.record_native_owner(session_id, pid, agent.port))
-            {
-                eprintln!("orx up: could not record the OpenCode server owner: {error}");
-            }
-        }
         inner.insert(session_id.to_string(), agent);
         Ok(status)
     }

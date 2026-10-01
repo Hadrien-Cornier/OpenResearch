@@ -198,14 +198,29 @@ pub async fn run_antigravity() -> Result<()> {
                 .and_then(Value::as_i64)
                 .filter(|step| *step >= 0)
                 .ok_or_else(|| anyhow!("Missing native invocation step"))?;
-            record_invocation(
-                &crate::store::Store::open()?,
-                &payload,
-                conversation,
-                step,
-                &std::env::var("ORX_SESSION_ID").unwrap_or_else(|_| conversation.into()),
-                std::env::var("ORX_USAGE_EXECUTION_ID").ok().as_deref(),
-            )?;
+            let model = payload
+                .get("modelName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Missing native invocation model"))?;
+            let identity = crate::store::InvocationIdentity {
+                harness: "antigravity".into(),
+                model: model.to_string(),
+                provider: None,
+            };
+            let key = invocation_key(&payload, conversation, step);
+            let store = crate::store::Store::open()?;
+            store.record_native_invocation(&key, &identity, Some(conversation))?;
+            // Sub-agents never reach the stream: this is their only per-call record.
+            if let Ok(execution) = std::env::var("ORX_USAGE_EXECUTION_ID") {
+                store.record_usage_sample(
+                    &execution,
+                    &key,
+                    "antigravity",
+                    Some(model),
+                    None,
+                    &Default::default(),
+                )?;
+            }
             println!("{{}}");
             return Ok(());
         }
@@ -217,27 +232,9 @@ pub async fn run_antigravity() -> Result<()> {
     Ok(())
 }
 
-/// One PostInvocation hook: the native model keyed to the invocation's own planner step (the
-/// stream's usage key), owned by the chat session (`owner`), and as an identity sample of the
-/// running turn's execution — a sub-agent's only per-call record.
-pub(crate) fn record_invocation(
-    store: &crate::store::Store,
-    payload: &Value,
-    conversation: &str,
-    step: i64,
-    owner: &str,
-    execution: Option<&str>,
-) -> Result<()> {
-    let model = payload
-        .get("modelName")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Missing native invocation model"))?;
-    let identity = crate::store::InvocationIdentity {
-        harness: "antigravity".into(),
-        model: model.to_string(),
-        provider: None,
-    };
-    // The invocation's own planner row: native steps inserted at or after `initialNumSteps` precede it.
+/// The invocation's own planner step from its native transcript (native steps can be inserted at
+/// or after `initialNumSteps`); none flushed yet keeps it under its own key, never a step.
+fn invocation_key(payload: &Value, conversation: &str, step: i64) -> String {
     let planner = payload
         .get("transcriptPath")
         .and_then(Value::as_str)
@@ -248,32 +245,12 @@ pub(crate) fn record_invocation(
                 .filter(|row| row["type"] == "PLANNER_RESPONSE")
                 .find_map(|row| row["step_index"].as_i64().filter(|index| *index >= step))
         });
-    // No planner row (a failed call or an unflushed transcript): keep the identity under its own
-    // invocation key, never a step a later invocation's planner may own.
-    let key = match planner {
+    match planner {
         Some(planner) => {
             crate::local::harness::antigravity::invocation_sample_id(conversation, planner)
         }
         None => format!("antigravity:{conversation}:invocation:{step}"),
-    };
-    store.record_native_invocation(&key, &identity, Some(owner))?;
-    if let Some(execution) = execution {
-        store.record_attributed_sample(
-            execution,
-            &key,
-            "antigravity",
-            &crate::store::Attribution::native(
-                "antigravity",
-                Some(model),
-                None,
-                crate::store::Missing::IdentityNotReported,
-            ),
-            &Default::default(),
-            false,
-            false,
-        )?;
     }
-    Ok(())
 }
 
 async fn antigravity_decision(input: &str) -> Result<Value> {
@@ -370,5 +347,25 @@ mod antigravity_tests {
         let res = antigravity_decision("invalid-json").await.unwrap();
         assert_eq!(res["decision"], "allow");
         std::env::remove_var("ORX_AGY_GATE");
+    }
+
+    #[test]
+    fn hooks_key_their_own_planner_and_never_guess_a_step() {
+        let path =
+            std::env::temp_dir().join(format!("orx-agy-hook-{}.jsonl", uuid::Uuid::new_v4()));
+        let rows = [
+            (1, "PLANNER_RESPONSE"),
+            (3, "SYSTEM_MESSAGE"),
+            (4, "PLANNER_RESPONSE"),
+        ]
+        .map(|(step, kind)| json!({"step_index": step, "type": kind}).to_string());
+        std::fs::write(&path, rows.join("\n")).unwrap();
+        let payload = json!({"transcriptPath": path});
+        assert_eq!(invocation_key(&payload, "c", 3), "antigravity:c:step:4");
+        assert_eq!(
+            invocation_key(&payload, "c", 5),
+            "antigravity:c:invocation:5"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

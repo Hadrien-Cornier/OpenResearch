@@ -104,7 +104,7 @@ pub(super) async fn run_turn(
         ctx.persist_delivery(DeliveryState::Accepted)?;
     }
     let mut surfaced = HashSet::new();
-    let mut invokers = HashSet::new();
+    let mut recorded = HashSet::new();
     let mut was_idle = false;
     loop {
         // ponytail: full projected history polling; switch to paged durable log if long chats make this costly.
@@ -117,7 +117,7 @@ pub(super) async fn run_turn(
             &native_id,
             current,
             &previous,
-            &mut invokers,
+            &mut recorded,
         )
         .await?;
         if delivered && ctx.delivery_state() != DeliveryState::Accepted {
@@ -148,7 +148,7 @@ pub(super) async fn run_turn(
                 &native_id,
                 final_messages,
                 &previous,
-                &mut invokers,
+                &mut recorded,
             )
             .await?;
             if delivered
@@ -187,7 +187,7 @@ async fn merge_projection(
     native_id: &str,
     messages: &[Value],
     previous: &HashSet<String>,
-    invokers: &mut HashSet<String>,
+    recorded: &mut HashSet<String>,
 ) -> Result<bool> {
     let mut answered = false;
     for message in messages.iter().filter(|m| {
@@ -208,6 +208,7 @@ async fn merge_projection(
         answered |= message
             .pointer("/time/completed")
             .is_some_and(|v| !v.is_null());
+        record_message_usage(ctx, message, recorded);
         if let Some(used) = opencode_used_tokens(message.get("tokens")) {
             ctx.report_usage(ContextUsage {
                 used_tokens: used,
@@ -225,7 +226,6 @@ async fn merge_projection(
         } else {
             ctx.clear_retry_status();
         }
-        record_invokers(ctx, message, invokers);
         let mut parts = projected_parts(message);
         for (part, content) in &mut parts {
             if content["type"] != "tool" || content["name"] != "subagent" {
@@ -246,7 +246,7 @@ async fn merge_projection(
                 .filter(|m| m["type"] == "assistant")
                 .collect();
             for message in &child_messages {
-                record_invokers(ctx, message, invokers);
+                record_message_usage(ctx, message, recorded);
             }
             part.children = child_messages.into_iter().flat_map(wire_parts).collect();
         }
@@ -257,20 +257,28 @@ async fn merge_projection(
     Ok(answered)
 }
 
-/// A completed tool part's invoker is its own native message's model, a sub-agent's included.
-fn record_invokers(ctx: &TurnCtx, message: &Value, recorded: &mut HashSet<String>) {
-    let Some(model) = message.pointer("/model/id").and_then(Value::as_str) else {
+/// A finished native step's own model and tokens (a sub-agent's included), once.
+fn record_message_usage(ctx: &TurnCtx, message: &Value, recorded: &mut HashSet<String>) {
+    let (Some(id), Some(_)) = (
+        message["id"].as_str(),
+        message
+            .pointer("/time/completed")
+            .filter(|time| !time.is_null()),
+    ) else {
         return;
     };
-    for (part, content) in projected_parts(message) {
-        if content["type"] == "tool"
-            && content.pointer("/time/completed").is_some()
-            && recorded.insert(part.id.clone())
-        {
-            let provider = message.pointer("/model/providerID").and_then(Value::as_str);
-            ctx.record_tool_invoker(&part.id, model, provider);
-        }
+    if !recorded.insert(id.to_string()) {
+        return;
     }
+    ctx.record_native_usage(
+        id,
+        message.pointer("/model/id").and_then(Value::as_str),
+        message.pointer("/model/providerID").and_then(Value::as_str),
+        message
+            .get("tokens")
+            .map(opencode_native_usage)
+            .unwrap_or_default(),
+    );
 }
 
 fn messages(projection: &Value) -> Result<&Vec<Value>> {

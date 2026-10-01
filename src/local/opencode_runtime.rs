@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::error::{anyhow, Result};
-use crate::local::native_store::opencode_database::{DatabaseLease, DatabaseState};
+use crate::local::native_store::opencode_database::DatabaseLease;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -192,28 +192,10 @@ fn protocol_for_version(version: &str) -> Result<Protocol> {
     match semver.major {
         1 => Ok(Protocol::V1),
         2 => Ok(Protocol::V2),
-        0 if is_verified_v2_beta(version) => Ok(Protocol::V2),
         _ => Err(anyhow!(
             "OpenCode {version} is unsupported. Install a V1 or V2 release."
         )),
     }
-}
-
-// Official V2 betas print `opencode2 v0.0.0-beta-<CI run>[.<attempt>]`;
-// run 19271 is the build the V2 protocol was verified against.
-fn is_verified_v2_beta(version: &str) -> bool {
-    let mut words = version.split_whitespace();
-    words.next() == Some("opencode2")
-        && words
-            .find_map(|part| semver::Version::parse(part.trim_start_matches('v')).ok())
-            .is_some_and(|semver| {
-                (semver.major, semver.minor, semver.patch) == (0, 0, 0)
-                    && semver
-                        .pre
-                        .strip_prefix("beta-")
-                        .and_then(|run| run.split('.').next()?.parse::<u64>().ok())
-                        .is_some_and(|run| run >= 19271)
-            })
 }
 
 #[derive(Clone)]
@@ -433,15 +415,6 @@ async fn prepare_database_waiting(
     };
     if !lease.requires_migration() {
         return Ok(lease);
-    }
-    if is_verified_v2_beta(&binary.version)
-        && matches!(lease.state(), DatabaseState::V1 | DatabaseState::V2Pending)
-    {
-        return Err(anyhow!(
-            "OpenCode {} can only start a fresh V2 database; it has not been verified to upgrade the existing OpenCode history in {}. Install a stable OpenCode 2 release to upgrade it. OpenResearch did not start OpenCode or change this database.",
-            binary.version,
-            lease.path().display()
-        ));
     }
     progress("Backing up and preparing the OpenCode database");
     let (mut lease, backup) = tokio::task::spawn_blocking(move || {
@@ -678,42 +651,6 @@ mod tests {
             .is_some());
     }
 
-    #[tokio::test]
-    async fn beta_refuses_existing_history_before_launch() {
-        let fixture = ProbeEnvironment::new().unwrap();
-        let db = fixture.0.path().join("opencode.db");
-        rusqlite::Connection::open(&db)
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT);
-                CREATE TABLE message (id TEXT, session_id TEXT, data TEXT);
-                CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, data TEXT);",
-            )
-            .unwrap();
-        let binary = ResolvedBinary {
-            path: fixture.0.path().join("must-not-launch"),
-            version: "opencode2 v0.0.0-beta-19271".into(),
-            protocol: Protocol::V2,
-            modified: std::time::SystemTime::UNIX_EPOCH,
-            size: 0,
-        };
-        let error = prepare_database(&binary, &db)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            error.contains("can only start a fresh V2 database"),
-            "{error}"
-        );
-        assert!(!fixture
-            .0
-            .path()
-            .join("opencode.db.orx-migration.json")
-            .exists());
-        assert!(!is_verified_v2_beta("opencode2 v2.0.1"));
-    }
-
     #[test]
     fn supported_versions_and_isolated_probes() {
         assert_eq!(protocol_for_version("1.18.31").unwrap(), Protocol::V1);
@@ -724,22 +661,6 @@ mod tests {
         assert_eq!(protocol_for_version("2.0.0-beta.1").unwrap(), Protocol::V2);
         assert!(protocol_for_version("0.0.0-next-unknown").is_err());
         assert!(protocol_for_version("3.0.0").is_err());
-        for (version, supported) in [
-            ("opencode2 v0.0.0-beta-19271", true),
-            ("opencode2 v0.0.0-beta-19300.2", true),
-            // Bare pins, older runs, other channels and other programs stay unsupported.
-            ("0.0.0-beta-19271", false),
-            ("opencode2 v0.0.0-beta-17823", false),
-            ("opencode2 v0.0.0-dev-19271", false),
-            ("opencode v0.0.0-beta-19271", false),
-            ("opencode2 v0.1.0-beta-19271", false),
-        ] {
-            assert_eq!(
-                protocol_for_version(version).ok(),
-                supported.then_some(Protocol::V2),
-                "{version}"
-            );
-        }
         let probe = ProbeEnvironment::new().unwrap();
         let mut cmd = Command::new("opencode");
         cmd.env("OPENCODE_DB", "/do-not-open/user.db");

@@ -774,33 +774,6 @@ Research goal:
 $ARGUMENTS
 "#;
 
-/// Native records a turn's harness keeps durably, read just before its execution closes.
-pub(crate) fn record_turn_steps(store: &crate::store::Store, turn_id: &str) {
-    opencode::record_turn_steps(store, turn_id);
-    antigravity::record_turn_steps(store, turn_id);
-}
-
-/// Native invokers of the tool calls whose output names `run_id`, from the harness's own records
-/// (sub-agents included), and whether the native session is still writing. Errors keep it pending.
-pub(crate) fn native_run_invokers(
-    store: &crate::store::Store,
-    harness: &str,
-    session: &str,
-    native_id: &str,
-    run_id: &str,
-) -> (Vec<crate::store::Attribution>, bool) {
-    let found = match harness {
-        "opencode" => opencode::native_run_invokers(store, session, native_id, run_id),
-        "antigravity" => antigravity::native_run_invokers(store, session, native_id, run_id)
-            .map(|found| (found, false)),
-        _ => Ok((Vec::new(), false)),
-    };
-    found.unwrap_or_else(|error| {
-        eprintln!("orx up: could not read native run evidence: {error}");
-        (Vec::new(), true)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::options::{PlanActivation, REASONING_DEFAULT_ID};

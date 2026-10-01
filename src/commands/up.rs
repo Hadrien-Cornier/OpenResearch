@@ -108,24 +108,6 @@ pub async fn run(args: UpArgs) -> Result<()> {
     let codex = Arc::new(local::codex::CodexHost::new());
     let claude = Arc::new(local::claude::ClaudeHost::new());
     claude.start_reaper();
-    // Native work can finish after its turn with no later turn or restart: OpenCode sub-agents,
-    // and runs whose launch output a natively woken step writes later.
-    tokio::spawn(async {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tick.tick().await;
-            let _ = tokio::task::spawn_blocking(|| {
-                if let Err(error) = Store::open().and_then(|store| {
-                    local::harness::opencode::reconcile_native_usage(&store)?;
-                    store.settle_pending_runs()
-                }) {
-                    eprintln!("orx up: could not reconcile native usage: {error}");
-                }
-                crate::telemetry::retry_outbox();
-            })
-            .await;
-        }
-    });
     let remote_instance_id = persistent_host.then(|| uuid::Uuid::new_v4().to_string());
     let stopping = Arc::new(AtomicBool::new(false));
     let state = AppState {
@@ -2185,7 +2167,7 @@ pub(crate) async fn submit_run_via_up(
         disk: args.disk,
         force: args.force,
         chat_session_id: args.launching_chat_session(),
-        agent_origin: args.launching_agent_origin(),
+        agent_origin: args.agent_origin.clone(),
     };
     let response =
         authenticate_up_request(local_client()?.post(format!("http://127.0.0.1:{port}/api/runs")))
@@ -2270,7 +2252,6 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
         force: req.force,
         chat_session_id: req.chat_session_id,
         agent_origin: req.agent_origin,
-        forwarded: true,
     };
     crate::compute::validate_run_args(&args).map_err(bad_request)?;
     let run = crate::compute::submit(&args).await.map_err(bad_request)?;
@@ -8497,7 +8478,7 @@ mod tests {
             disk: None,
             force: true,
             chat_session_id: Some("session-1".into()),
-            agent_origin: Some("codex".into()),
+            agent_origin: None,
         };
 
         let value = serde_json::to_value(&request).unwrap();

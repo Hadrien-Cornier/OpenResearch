@@ -371,7 +371,6 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     cmd.env("NO_COLOR", "1");
     set_chat_session_env(&mut cmd, &ctx.session_id, "antigravity", Some(up_port));
     cmd.env("ORX_SESSION_ID", &ctx.session_id);
-    // Hooks (this conversation's and every sub-agent's) record into this turn's execution.
     if let Some(execution) = ctx.usage_execution_id() {
         cmd.env("ORX_USAGE_EXECUTION_ID", execution);
     }
@@ -686,261 +685,14 @@ fn denied_actions_error(result: &Value) -> Option<String> {
 #[derive(Default)]
 struct TurnState {
     conversation_id: Option<String>,
-    /// The latest planner step (conversation, index): the model call that issued the tools after it.
-    planner: Option<(String, i64)>,
     text_part_id: Option<String>,
     text_seq: usize,
     saw_result: bool,
     turn_errored: bool,
 }
 
-/// A finished tool's invoker is its planner's hook identity. Part ids repeat across
-/// conversations, so the key is scoped to the chat session.
-fn record_tool_invoker(ctx: &TurnCtx, state: &TurnState, own: Option<&str>, part_id: &str) {
-    let Some((conversation, planner)) = state
-        .planner
-        .as_ref()
-        .filter(|(conversation, _)| Some(conversation.as_str()) == own)
-    else {
-        return;
-    };
-    let identity = ctx.capture_store().and_then(|store| {
-        store.native_invocation_identity(
-            "antigravity",
-            &invocation_sample_id(conversation, *planner),
-        )
-    });
-    if let Ok(Some(identity)) = identity {
-        ctx.record_tool_invoker(
-            &format!("{}:{part_id}", ctx.session_id),
-            &identity.model,
-            None,
-        );
-    }
-}
-
 pub(crate) fn invocation_sample_id(conversation: &str, step: i64) -> String {
     format!("antigravity:{conversation}:step:{step}")
-}
-
-/// Planner steps no hook identified take the model from the conversation's native generation
-/// record (`conversations/<id>.db` `gen_metadata`: field 2 lists the generated steps, 1.19 the model).
-pub(crate) fn record_turn_steps(store: &crate::store::Store, turn_id: &str) {
-    let Some(conversations) = Antigravity
-        .config_home()
-        .map(|home| home.join("conversations"))
-    else {
-        return;
-    };
-    if let Err(error) = record_turn_steps_in(store, turn_id, &conversations) {
-        eprintln!("orx up: could not read Antigravity generation records: {error}");
-    }
-}
-
-fn record_turn_steps_in(
-    store: &crate::store::Store,
-    turn_id: &str,
-    conversations: &Path,
-) -> Result<()> {
-    let Some((execution, conversation, _)) = store.open_turn_execution(turn_id, "antigravity")?
-    else {
-        return Ok(());
-    };
-    let prefix = format!("antigravity:{conversation}:step:");
-    let unidentified = store.unidentified_samples(&execution, &prefix)?;
-    if unidentified.is_empty() {
-        return Ok(());
-    }
-    let models = generation_models(conversations, &conversation)?;
-    for sample in unidentified {
-        let model = sample
-            .strip_prefix(&prefix)
-            .and_then(|step| step.parse::<i64>().ok())
-            .and_then(|step| models.get(&step).cloned().flatten());
-        if let Some(model) = model {
-            store.record_attributed_sample(
-                &execution,
-                &sample,
-                "antigravity",
-                &crate::store::Attribution::native(
-                    "antigravity",
-                    Some(&model),
-                    None,
-                    crate::store::Missing::IdentityNotReported,
-                ),
-                &Default::default(),
-                false,
-                false,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Each step's model from a conversation's native `gen_metadata` records (none without its database).
-fn generation_models(
-    conversations: &Path,
-    conversation: &str,
-) -> Result<std::collections::HashMap<i64, Option<String>>> {
-    let mut models = std::collections::HashMap::new();
-    let db = conversations.join(format!("{conversation}.db"));
-    if !db.exists() {
-        return Ok(models);
-    }
-    let connection =
-        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    for row in connection
-        .prepare("SELECT data FROM gen_metadata")?
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-    {
-        let (steps, model) = generation_steps(&row?);
-        for step in steps {
-            models.insert(step, model.clone());
-        }
-    }
-    Ok(models)
-}
-
-/// The native invokers of the run_command calls whose output names `run_id`, read from every
-/// conversation of the chat (sub-agents report only there): each call's own planner identity, from
-/// its hook or the conversation's generation record.
-pub(crate) fn native_run_invokers(
-    store: &crate::store::Store,
-    session: &str,
-    native_id: &str,
-    run_id: &str,
-) -> Result<Vec<crate::store::Attribution>> {
-    let Some(home) = Antigravity.config_home() else {
-        return Ok(Vec::new());
-    };
-    native_run_invokers_in(store, &home, session, native_id, run_id)
-}
-
-fn native_run_invokers_in(
-    store: &crate::store::Store,
-    home: &Path,
-    session: &str,
-    native_id: &str,
-    run_id: &str,
-) -> Result<Vec<crate::store::Attribution>> {
-    let mut conversations = store.invocation_conversations("antigravity", session)?;
-    conversations.insert(native_id.to_string());
-    let run_id = run_id.to_ascii_lowercase();
-    let mut found = Vec::new();
-    for conversation in conversations {
-        let path = home
-            .join("brain")
-            .join(&conversation)
-            .join(".system_generated/logs/transcript.jsonl");
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut planner = None;
-        let mut models = None;
-        for row in text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        {
-            if row["type"] == "PLANNER_RESPONSE" {
-                planner = Some(row);
-                continue;
-            }
-            let printed = row["type"] == "GENERIC"
-                && row["content"]
-                    .as_str()
-                    .is_some_and(|text| text.to_ascii_lowercase().contains(&run_id));
-            let Some(step) = planner
-                .as_ref()
-                .filter(|planner| printed && planner["tool_calls"].to_string().contains("exp run"))
-                .and_then(|planner| planner["step_index"].as_i64())
-            else {
-                continue;
-            };
-            let hooked = store
-                .native_invocation_identity(
-                    "antigravity",
-                    &invocation_sample_id(&conversation, step),
-                )?
-                .map(|identity| identity.model);
-            let model = match hooked {
-                Some(model) => Some(model),
-                None => models
-                    .get_or_insert(generation_models(
-                        &home.join("conversations"),
-                        &conversation,
-                    )?)
-                    .get(&step)
-                    .cloned()
-                    .flatten(),
-            };
-            found.push(crate::store::Attribution::native(
-                "antigravity",
-                model.as_deref(),
-                None,
-                crate::store::Missing::unidentified(conversation != native_id),
-            ));
-        }
-    }
-    Ok(found)
-}
-
-/// One `gen_metadata` record: the steps that model call generated (field 2, packed or not) and its
-/// model (field 1.19).
-fn generation_steps(record: &[u8]) -> (Vec<i64>, Option<String>) {
-    let fields = proto_fields(record);
-    let model = fields
-        .iter()
-        .filter(|(field, _, _)| *field == 1)
-        .filter_map(|(_, _, bytes)| *bytes)
-        .flat_map(proto_fields)
-        .find(|(field, _, _)| *field == 19)
-        .and_then(|(_, _, bytes)| std::str::from_utf8(bytes?).ok().map(str::to_string));
-    let steps = fields
-        .iter()
-        .filter(|(field, _, _)| *field == 2)
-        .flat_map(|(_, value, bytes)| bytes.map_or_else(|| vec![*value], proto_varints))
-        .filter_map(|step| i64::try_from(step).ok())
-        .collect();
-    (steps, model)
-}
-
-fn proto_varint(bytes: &mut &[u8]) -> Option<u64> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        let (&byte, rest) = bytes.split_first()?;
-        *bytes = rest;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte < 0x80 {
-            return Some(value);
-        }
-    }
-    None
-}
-
-fn proto_varints(mut bytes: &[u8]) -> Vec<u64> {
-    std::iter::from_fn(|| proto_varint(&mut bytes)).collect()
-}
-
-/// Top-level protobuf fields: (number, varint value, length-delimited bytes).
-fn proto_fields(mut bytes: &[u8]) -> Vec<(u64, u64, Option<&[u8]>)> {
-    let mut fields = Vec::new();
-    while let Some(key) = proto_varint(&mut bytes) {
-        let (skip, value) = match key & 7 {
-            0 => (0, proto_varint(&mut bytes)),
-            1 => (8, Some(0)),
-            2 => (proto_varint(&mut bytes).unwrap_or(u64::MAX), Some(0)),
-            5 => (4, Some(0)),
-            _ => break,
-        };
-        let (Some(value), Ok(skip)) = (value, usize::try_from(skip)) else {
-            break;
-        };
-        if skip > bytes.len() {
-            break;
-        }
-        let (data, rest) = bytes.split_at(skip);
-        bytes = rest;
-        fields.push((key >> 3, value, (key & 7 == 2).then_some(data)));
-    }
-    fields
 }
 
 fn antigravity_step_usage(step: &Value) -> Option<crate::store::TokenUsage> {
@@ -970,47 +722,25 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         }
         "step_update" => {
             if let Some(step) = event.get("step_update") {
-                // A forwarded sub-agent step names its own conversation; only the first names the root.
+                // A forwarded sub-agent step names its own conversation; only the first is the root.
                 let own = step
                     .get("conversation_id")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string);
+                    .filter(|id| !id.is_empty());
                 if state.conversation_id.is_none() {
-                    state.conversation_id = own.clone();
+                    state.conversation_id = own.map(str::to_string);
                 }
-                let own = own.or_else(|| state.conversation_id.clone());
-                let usage = antigravity_step_usage(step);
-                // A planner step is a model call even without usage; its identity comes from the
-                // hook or, failing that, the conversation's native generation record.
-                let planner =
-                    step.get("step_type").and_then(Value::as_str) == Some("agent_response");
-                if planner {
-                    state.planner = own
-                        .clone()
-                        .zip(step.get("step_index").and_then(Value::as_i64));
-                }
-                if let Some(index) = step
-                    .get("step_index")
-                    .and_then(Value::as_i64)
-                    .filter(|_| usage.is_some() || planner)
-                {
+                if let (Some(index), Some(usage)) = (
+                    step.get("step_index").and_then(Value::as_i64),
+                    antigravity_step_usage(step),
+                ) {
                     let sample_id = own
-                        .as_deref()
+                        .or(state.conversation_id.as_deref())
                         .map(|conversation| invocation_sample_id(conversation, index))
                         .unwrap_or_else(|| {
                             format!("antigravity-{}:{index}", ctx.attempt_count_for_usage())
                         });
-                    ctx.record_attributed_usage(
-                        &sample_id,
-                        ctx.native_attribution(
-                            None,
-                            None,
-                            crate::store::Missing::IdentityNotReported,
-                        ),
-                        usage.unwrap_or_default(),
-                        false,
-                    );
+                    ctx.record_native_usage(&sample_id, None, None, usage);
                 }
                 let step_type = step.get("step_type").and_then(Value::as_str).unwrap_or("");
                 let step_state = step.get("state").and_then(Value::as_str).unwrap_or("");
@@ -1059,9 +789,6 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                                     _ => None,
                                 });
                         let is_done = step_is_terminal(step_state) || error.is_some();
-                        if is_done {
-                            record_tool_invoker(ctx, state, own.as_deref(), &call_id);
-                        }
 
                         let status = if !is_done {
                             "running"
@@ -1568,262 +1295,5 @@ mod tests {
         );
         assert_eq!(models[1].id, "gemini-3.1-pro-high");
         assert_eq!(models[2].id, "claude-sonnet-4-6");
-    }
-
-    /// Native Antigravity evidence → reports. Hooks key each identity to the invocation's planner
-    /// step from the native transcript (sub-agents included); a planner no hook identified takes the
-    /// model from the conversation's real `gen_metadata` record; a finished tool's invoker is its
-    /// planner's model.
-    #[test]
-    fn hooks_and_generation_records_identify_every_planner() {
-        let dir = std::env::temp_dir().join(format!("orx-agy-{}", uuid::Uuid::new_v4()));
-        let mut ctx = TurnCtx::test_capture(dir.clone(), "antigravity");
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store
-            .conn_for_tests()
-            .execute_batch("UPDATE chat_sessions SET native_session_id = 'conv'")
-            .unwrap();
-        let transcript = |name: &str, rows: &[(i64, &str)]| {
-            let path = dir.join(name);
-            let text: Vec<String> = rows
-                .iter()
-                .map(|(step, kind)| {
-                    json!({"step_index": step, "type": kind, "source": "MODEL"}).to_string()
-                })
-                .collect();
-            std::fs::write(&path, text.join("\n")).unwrap();
-            json!({"transcriptPath": path, "modelName": "gemini-3.8-flash-high"})
-        };
-        // Native code inserted a SYSTEM step at the hook's n = 3; the planner is step 4.
-        let parent = transcript(
-            "parent.jsonl",
-            &[
-                (1, "PLANNER_RESPONSE"),
-                (3, "SYSTEM_MESSAGE"),
-                (4, "PLANNER_RESPONSE"),
-            ],
-        );
-        crate::commands::mcp_gate::record_invocation(
-            &store,
-            &parent,
-            "conv",
-            3,
-            "test-session",
-            Some("test-execution"),
-        )
-        .unwrap();
-        let child = transcript(
-            "child.jsonl",
-            &[(0, "SYSTEM_MESSAGE"), (1, "PLANNER_RESPONSE")],
-        );
-        // Planner 1's hook ran before its transcript row flushed: kept apart, never guessed onto a step.
-        let unflushed = transcript("unflushed.jsonl", &[]);
-        crate::commands::mcp_gate::record_invocation(
-            &store,
-            &unflushed,
-            "conv",
-            1,
-            "test-session",
-            Some("test-execution"),
-        )
-        .unwrap();
-        crate::commands::mcp_gate::record_invocation(
-            &store,
-            &child,
-            "child",
-            0,
-            "test-session",
-            Some("test-execution"),
-        )
-        .unwrap();
-        let mut state = TurnState::default();
-        for event in [
-            json!({"event": "init", "conversation_id": "conv"}),
-            // Planner 1 ran with no hook; planner 4 had one.
-            json!({"event": "step_update", "step_update": {"step_index": 1, "step_type": "agent_response", "state": "DONE", "usage": {"input_tokens": 14479, "output_tokens": 234, "thinking_tokens": 223}}}),
-            json!({"event": "step_update", "step_update": {"step_index": 4, "step_type": "agent_response", "state": "DONE", "usage": {"input_tokens": 15004, "output_tokens": 421, "thinking_tokens": 336}}}),
-            json!({"event": "step_update", "step_update": {"step_index": 5, "step_type": "tool", "tool_name": "run_command", "state": "DONE", "tool_info": {"output": "ok"}}}),
-        ] {
-            apply_event(&mut ctx, &mut state, &event);
-        }
-        // Real native generation records: steps [1] and [4, 5], model gemini-3.8-flash.
-        let conversations = dir.join("conversations");
-        std::fs::create_dir_all(&conversations).unwrap();
-        let generations = rusqlite::Connection::open(conversations.join("conv.db")).unwrap();
-        generations
-            .execute_batch("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
-            .unwrap();
-        for (idx, hex) in include_str!("fixtures/antigravity-gen-metadata.hex")
-            .lines()
-            .enumerate()
-        {
-            let bytes: Vec<u8> = (0..hex.len())
-                .step_by(2)
-                .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
-                .collect();
-            assert_eq!(
-                generation_steps(&bytes).1.as_deref(),
-                Some("gemini-3.8-flash")
-            );
-            generations
-                .execute(
-                    "INSERT INTO gen_metadata VALUES (?1, ?2)",
-                    rusqlite::params![idx as i64, bytes],
-                )
-                .unwrap();
-        }
-        record_turn_steps_in(&store, "test-turn", &conversations).unwrap();
-        let reports: Vec<_> = TurnCtx::test_reports(&dir, "done")
-            .iter()
-            .map(|r| (r["model"].clone(), r["inputTokens"].clone()))
-            .collect();
-        assert_eq!(
-            reports,
-            [
-                (json!("gemini-3.8-flash"), json!(14479)),
-                (json!("gemini-3.8-flash-high"), json!(15004))
-            ]
-        );
-        // A sub-agent's run_command never reaches the parent stream: its own transcript output
-        // naming the run binds it to the sub-agent's own planner identity.
-        let brain = dir.join("brain/child/.system_generated/logs");
-        std::fs::create_dir_all(&brain).unwrap();
-        std::fs::write(
-            brain.join("transcript.jsonl"),
-            [
-                json!({"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"orx exp run e\""}}]}),
-                json!({"step_index": 2, "type": "GENERIC", "content": "Run 7f3a-run started"}),
-            ]
-            .map(|row| row.to_string())
-            .join("\n"),
-        )
-        .unwrap();
-        assert_eq!(
-            native_run_invokers_in(&store, &dir, "test-session", "conv", "7f3a-run").unwrap(),
-            [crate::store::Attribution::Exact {
-                model: "gemini-3.8-flash-high".into(),
-                provider: None
-            }]
-        );
-        // The parent's run came from planner 1, whose hook never reached a step key: its own
-        // native generation record still names it exactly.
-        let parent_logs = dir.join("brain/conv/.system_generated/logs");
-        std::fs::create_dir_all(&parent_logs).unwrap();
-        std::fs::write(
-            parent_logs.join("transcript.jsonl"),
-            [
-                json!({"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"orx exp run e\""}}]}),
-                json!({"step_index": 2, "type": "GENERIC", "content": "Run 5d2e-run started"}),
-            ]
-            .map(|row| row.to_string())
-            .join("\n"),
-        )
-        .unwrap();
-        let hooked = |key: &str| {
-            store
-                .native_invocation_identity("antigravity", key)
-                .unwrap()
-                .map(|identity| identity.model)
-        };
-        assert_eq!(
-            hooked("antigravity:conv:invocation:1").as_deref(),
-            Some("gemini-3.8-flash-high")
-        );
-        assert_eq!(hooked("antigravity:conv:step:1"), None);
-        assert_eq!(
-            native_run_invokers_in(&store, &dir, "test-session", "conv", "5d2e-run").unwrap(),
-            [crate::store::Attribution::Exact {
-                model: "gemini-3.8-flash".into(),
-                provider: None
-            }]
-        );
-        assert!(
-            native_run_invokers_in(&store, &dir, "test-session", "conv", "9c1b-run")
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            store
-                .native_invocation_identity("antigravity", "test-session:tool-5-run_command")
-                .unwrap()
-                .map(|identity| identity.model),
-            Some("gemini-3.8-flash-high".into())
-        );
-        drop((generations, store));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A forwarded sub-agent step keeps its own conversation without becoming the chat's root,
-    /// and an invocation with no planner row never claims a step a later planner owns.
-    #[test]
-    fn sub_agent_steps_and_unmatched_hooks_keep_their_own_identity() {
-        let dir = std::env::temp_dir().join(format!("orx-agy-own-{}", uuid::Uuid::new_v4()));
-        let mut ctx = TurnCtx::test_capture(dir.clone(), "antigravity");
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        let mut state = TurnState::default();
-        for event in [
-            json!({"event": "init", "conversation_id": "conv"}),
-            json!({"event": "step_update", "step_update": {"conversation_id": "child", "step_index": 1, "step_type": "agent_response", "state": "DONE", "usage": {"input_tokens": 9, "output_tokens": 1}}}),
-        ] {
-            apply_event(&mut ctx, &mut state, &event);
-        }
-        assert_eq!(state.conversation_id.as_deref(), Some("conv"));
-        assert_eq!(state.planner, Some(("child".into(), 1)));
-        let ids: Vec<String> = store
-            .conn_for_tests()
-            .prepare("SELECT sample_id FROM chat_usage_samples")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(ids, ["antigravity:child:step:1"]);
-        let hook = |name: &str, rows: &[(i64, &str)], model: &str| {
-            let path = dir.join(name);
-            let text: Vec<String> = rows
-                .iter()
-                .map(|(step, kind)| json!({"step_index": step, "type": kind}).to_string())
-                .collect();
-            std::fs::write(&path, text.join("\n")).unwrap();
-            json!({"transcriptPath": path, "modelName": model})
-        };
-        // The failed invocation at n = 6 produced no planner; the next one at n = 6 did.
-        let failed = hook("failed.jsonl", &[(4, "PLANNER_RESPONSE")], "model-a");
-        crate::commands::mcp_gate::record_invocation(
-            &store,
-            &failed,
-            "conv",
-            6,
-            "test-session",
-            Some("test-execution"),
-        )
-        .unwrap();
-        let next = hook(
-            "next.jsonl",
-            &[(4, "PLANNER_RESPONSE"), (6, "PLANNER_RESPONSE")],
-            "model-b",
-        );
-        crate::commands::mcp_gate::record_invocation(
-            &store,
-            &next,
-            "conv",
-            6,
-            "test-session",
-            Some("test-execution"),
-        )
-        .unwrap();
-        let model = |key: &str| {
-            store
-                .native_invocation_identity("antigravity", key)
-                .unwrap()
-                .map(|identity| identity.model)
-        };
-        assert_eq!(model("antigravity:conv:step:6").as_deref(), Some("model-b"));
-        assert_eq!(
-            model("antigravity:conv:invocation:6").as_deref(),
-            Some("model-a")
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

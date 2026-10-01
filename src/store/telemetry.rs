@@ -47,107 +47,6 @@ impl InvocationIdentity {
     }
 }
 
-/// Why a report has no exact model. The report's harness plus this reason names the missing capture path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Missing {
-    IdentityNotReported,
-    /// A sub-agent the harness never identified; never inherits the parent's model.
-    ChildModelUnknown,
-    /// The native label is a path, URL, or ARN rather than a model identifier.
-    InvalidLabel,
-    /// Claude's locally generated `<synthetic>` error message.
-    SyntheticModel,
-    NoUsageReported,
-    InvokerNotLinked,
-    InvokerAmbiguous,
-    /// A native agent CLI outside OpenResearch chat launched the run; it reports no model.
-    ExternalAgent,
-}
-
-impl Missing {
-    pub(crate) fn unidentified(child: bool) -> Self {
-        if child {
-            Self::ChildModelUnknown
-        } else {
-            Self::IdentityNotReported
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "attribution", rename_all = "snake_case")]
-pub(crate) enum Attribution {
-    Exact {
-        model: String,
-        provider: Option<String>,
-    },
-    AutoRouting,
-    NotExecuted,
-    Manual,
-    Unresolved {
-        reason: Missing,
-    },
-}
-
-impl Attribution {
-    /// Exact only from a label the harness reported natively; never pass a selected or configured model.
-    pub(crate) fn native(
-        harness: &str,
-        model: Option<&str>,
-        provider: Option<&str>,
-        missing: Missing,
-    ) -> Self {
-        match model {
-            None => Self::Unresolved { reason: missing },
-            Some("<synthetic>") if harness == "claude-code" => Self::Unresolved {
-                reason: Missing::SyntheticModel,
-            },
-            Some(model) if harness == "cursor" && model.eq_ignore_ascii_case("auto") => {
-                Self::AutoRouting
-            }
-            Some(model) if !valid_model_label(model) => Self::Unresolved {
-                reason: Missing::InvalidLabel,
-            },
-            Some(model) => Self::Exact {
-                model: model.to_string(),
-                provider: provider
-                    .filter(|label| valid_model_label(label))
-                    .map(str::to_string),
-            },
-        }
-    }
-
-    fn of(identity: &InvocationIdentity) -> Self {
-        Self::native(
-            &identity.harness,
-            Some(&identity.model),
-            identity.provider.as_deref(),
-            Missing::IdentityNotReported,
-        )
-    }
-
-    fn model(&self) -> (Option<&str>, Option<&str>) {
-        match self {
-            Self::Exact { model, provider } => (Some(model), provider.as_deref()),
-            _ => (None, None),
-        }
-    }
-
-    /// Writes model, provider, attribution, and attributionReason into report properties.
-    fn apply(&self, properties: &mut serde_json::Value) -> Result<()> {
-        let (model, provider) = self.model();
-        properties["model"] = serde_json::json!(model);
-        properties["provider"] = serde_json::json!(provider);
-        properties["attribution"] = serde_json::to_value(self)?["attribution"].take();
-        properties["attributionReason"] = match self {
-            Self::Unresolved { reason } => serde_json::to_value(reason)?,
-            _ => serde_json::Value::Null,
-        };
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TokenUsage {
@@ -167,11 +66,14 @@ struct CumulativeBaseline {
 impl TokenUsage {
     pub fn validate(&self) -> Result<()> {
         const MAX: u64 = 9_007_199_254_740_991;
-        if self
-            .counters()
-            .into_iter()
-            .flatten()
-            .any(|value| value > MAX)
+        let counters = [
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+            self.reasoning_tokens,
+        ];
+        if counters.into_iter().flatten().any(|value| value > MAX)
             || self.total().is_some_and(|total| total > MAX)
             || self.input_tokens.is_some_and(|input| {
                 self.cache_read_tokens.unwrap_or(0) + self.cache_write_tokens.unwrap_or(0) > input
@@ -188,55 +90,25 @@ impl TokenUsage {
     pub fn total(&self) -> Option<u64> {
         self.input_tokens?.checked_add(self.output_tokens?)
     }
-
-    fn counters(&self) -> [Option<u64>; 5] {
-        [
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_tokens,
-            self.cache_write_tokens,
-            self.reasoning_tokens,
-        ]
-    }
 }
 
-/// One launcher's attribution, `invoker_ambiguous` when launchers disagree, `None` without any.
-fn agreed(mut found: std::collections::BTreeSet<Attribution>) -> Option<Attribution> {
-    match found.len() {
-        0 => None,
-        1 => found.pop_first(),
-        _ => Some(Attribution::Unresolved {
-            reason: Missing::InvokerAmbiguous,
-        }),
-    }
-}
-
-/// Launch tool parts (`… exp run …`) whose native output names `run_id`; nested parts are sub-agents'.
-fn printed_launches(
-    parts: &[serde_json::Value],
-    run_id: &str,
-    nested: bool,
-    out: &mut Vec<(String, bool)>,
-) {
-    for part in parts {
-        if let Some(children) = part.get("children").and_then(serde_json::Value::as_array) {
-            printed_launches(children, run_id, true, out);
+/// A chat report's explicit attribution from the native model label alone: `(attribution, reason)`.
+/// The model is reported only when exact; configured or selected models never reach here.
+fn chat_attribution(
+    harness: &str,
+    model: Option<&str>,
+    sampled: bool,
+    delivery: Option<&str>,
+) -> (&'static str, Option<&'static str>) {
+    match model {
+        Some("<synthetic>") if harness == "claude-code" => ("unresolved", Some("synthetic_model")),
+        Some(model) if harness == "cursor" && model.eq_ignore_ascii_case("auto") => {
+            ("auto_routing", None)
         }
-        let (Some(id), Some(input)) = (
-            part.get("id").and_then(serde_json::Value::as_str),
-            part.pointer("/state/input")
-                .and_then(serde_json::Value::as_object),
-        ) else {
-            continue;
-        };
-        let printed = ["/state/output", "/state/error"].iter().any(|pointer| {
-            part.pointer(pointer)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| text.to_ascii_lowercase().contains(run_id))
-        });
-        if printed && crate::local::chat::tool_command(input).contains("exp run") {
-            out.push((id.to_string(), nested));
-        }
+        Some(_) => ("exact", None),
+        None if sampled => ("unresolved", Some("identity_not_reported")),
+        None if matches!(delivery, Some("not_sent" | "rejected")) => ("not_executed", None),
+        None => ("unresolved", Some("no_usage_reported")),
     }
 }
 
@@ -272,65 +144,16 @@ impl Store {
         Ok(())
     }
 
-    /// Call inside the transaction that inserts the run. A chat-launched run without a forwarded
-    /// native identity binds at its terminal transition to the tool part whose output printed it.
     pub(crate) fn reserve_run_telemetry(
         &self,
         run_id: &str,
         identity: Option<&InvocationIdentity>,
-        launching_session: Option<&str>,
-        agent_origin: Option<&str>,
         report: Option<&(String, serde_json::Value)>,
     ) -> Result<()> {
         if let Some(identity) = identity {
             identity.validate()?;
         }
-        // A context inherited from another agent (a host CLI around the app) never overrides the
-        // launching chat's own harness.
-        let chat_harness: Option<String> = launching_session
-            .map(|session| {
-                self.conn
-                    .query_row(
-                        "SELECT harness FROM chat_sessions WHERE id = ?1",
-                        [session],
-                        |row| row.get(0),
-                    )
-                    .optional()
-            })
-            .transpose()?
-            .flatten();
-        let identity = identity.filter(|identity| {
-            chat_harness
-                .as_deref()
-                .is_none_or(|harness| harness == identity.harness)
-        });
-        let mut report = report.map(|(_, payload)| payload.clone());
-        if let Some(payload) = report.as_mut() {
-            let (harness, attribution) = match (identity, launching_session) {
-                (Some(identity), _) => (Some(identity.harness.clone()), Attribution::of(identity)),
-                (None, Some(_)) => (
-                    chat_harness.clone(),
-                    Attribution::Unresolved {
-                        reason: Missing::InvokerNotLinked,
-                    },
-                ),
-                (None, None) => match agent_origin {
-                    Some(origin) => (
-                        ["claude-code", "codex", "opencode", "cursor", "antigravity"]
-                            .contains(&origin)
-                            .then(|| origin.to_string()),
-                        Attribution::Unresolved {
-                            reason: Missing::ExternalAgent,
-                        },
-                    ),
-                    None => (None, Attribution::Manual),
-                },
-            };
-            let properties = &mut payload["events"][0]["properties"];
-            properties["harness"] = serde_json::json!(harness);
-            attribution.apply(properties)?;
-        }
-        self.conn.execute("INSERT INTO run_telemetry (run_id, identity_json, report_json) VALUES (?1, ?2, ?3) ON CONFLICT(run_id) DO NOTHING", params![run_id, identity.map(serde_json::to_string).transpose()?, report.as_ref().map(serde_json::to_string).transpose()?])?;
+        self.conn.execute("INSERT INTO run_telemetry (run_id, identity_json, report_json) VALUES (?1, ?2, ?3) ON CONFLICT(run_id) DO NOTHING", params![run_id, identity.map(serde_json::to_string).transpose()?, report.map(|(_, payload)| serde_json::to_string(payload)).transpose()?])?;
         Ok(())
     }
 
@@ -349,197 +172,13 @@ impl Store {
             payload["events"][0]["properties"]["status"] = serde_json::json!(status.as_str());
             payload["events"][0]["occurredAt"] =
                 serde_json::json!(crate::telemetry::iso8601_utc(now_ms()));
-            self.conn.execute(
-                "UPDATE run_telemetry SET report_json = ?2, pending_since = ?3 WHERE run_id = ?1",
-                params![run_id, serde_json::to_string(&payload)?, now_ms()],
-            )?;
-            self.settle_run(run_id)?;
+            let id = payload["events"][0]["eventId"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing run telemetry event ID"))?
+                .to_string();
+            self.stage_telemetry(&id, &payload)?;
         }
         Ok(())
-    }
-
-    /// Terminal runs whose launching chat may still persist the tool output that printed them.
-    /// Called after each turn's final flush and at startup; safe to repeat.
-    pub(crate) fn settle_pending_runs(&self) -> Result<()> {
-        let pending = self
-            .conn
-            .prepare("SELECT run_id FROM run_telemetry WHERE pending_since IS NOT NULL")?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for run_id in pending {
-            let tx = self.begin_immediate()?;
-            self.settle_run(&run_id)?;
-            tx.commit()?;
-        }
-        Ok(())
-    }
-
-    /// Caller holds a write transaction. Stages a terminal run's report exactly once: bound to the
-    /// launch part that printed it, or as it stands once no turn of its chat is still running.
-    fn settle_run(&self, run_id: &str) -> Result<()> {
-        let Some(report) = self
-            .conn
-            .query_row(
-                "SELECT report_json FROM run_telemetry WHERE run_id = ?1 AND pending_since IS NOT NULL AND report_json IS NOT NULL",
-                [run_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        else {
-            return Ok(());
-        };
-        let mut payload: serde_json::Value = serde_json::from_str(&report)?;
-        let properties = &mut payload["events"][0]["properties"];
-        if properties["attributionReason"] == "invoker_not_linked" {
-            let (attribution, active) = match self.printed_run_invoker(run_id)? {
-                Some(exact @ Attribution::Exact { .. }) => (Some(exact), false),
-                // A printed part with no captured identity (its hook ran before the planner row
-                // flushed) defers to native records, which name each planner's own model.
-                printed => {
-                    let (native, active) = self.native_run_invoker(run_id)?;
-                    (native.or(printed), active)
-                }
-            };
-            match attribution {
-                Some(attribution) => attribution.apply(properties)?,
-                None if active || self.launching_turn_running(run_id)? => return Ok(()),
-                None => {}
-            }
-        }
-        let id = payload["events"][0]["eventId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing run telemetry event ID"))?
-            .to_string();
-        self.stage_telemetry(&id, &payload)?;
-        self.conn.execute(
-            "UPDATE run_telemetry SET report_json = ?2, pending_since = NULL WHERE run_id = ?1",
-            params![run_id, serde_json::to_string(&payload)?],
-        )?;
-        Ok(())
-    }
-
-    /// The run's launcher from its harness's native records, and whether that session still writes.
-    fn native_run_invoker(&self, run_id: &str) -> Result<(Option<Attribution>, bool)> {
-        let Some((harness, session, native_id)) = self
-            .conn
-            .query_row(
-                "SELECT s.harness, s.id, s.native_session_id FROM runs r JOIN chat_sessions s ON s.id = r.chat_session_id WHERE r.id = ?1 AND s.native_session_id IS NOT NULL",
-                [run_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-            )
-            .optional()?
-        else {
-            return Ok((None, false));
-        };
-        let (found, active) = crate::local::harness::native_run_invokers(
-            self, &harness, &session, &native_id, run_id,
-        );
-        Ok((agreed(found.into_iter().collect()), active))
-    }
-
-    /// Records the native server process now serving `session` (since `now`): an earlier step's
-    /// owner is the latest one started before it, and survives an ORX restart.
-    pub(crate) fn record_native_owner(&self, session: &str, pid: u32, port: u16) -> Result<()> {
-        let mut owners = self.native_owners(session)?;
-        owners.push((pid, port, now_ms()));
-        // ponytail: keeps the last 8 servers; older steps' owners read as gone.
-        let owners = &owners[owners.len().saturating_sub(8)..];
-        self.conn.execute(
-            "UPDATE chat_sessions SET native_owners_json = ?2 WHERE id = ?1",
-            params![session, serde_json::to_string(owners)?],
-        )?;
-        Ok(())
-    }
-
-    /// (pid, port, started) of the native servers recorded for `session`, oldest first.
-    pub(crate) fn native_owners(&self, session: &str) -> Result<Vec<(u32, u16, i64)>> {
-        let json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT native_owners_json FROM chat_sessions WHERE id = ?1",
-                [session],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?
-            .unwrap_or_default())
-    }
-
-    /// The chat session's native conversations its hooks recorded identities for.
-    pub(crate) fn invocation_conversations(
-        &self,
-        harness: &str,
-        session: &str,
-    ) -> Result<std::collections::BTreeSet<String>> {
-        let keys = self
-            .conn
-            .prepare("SELECT call_id FROM native_invocation_identities WHERE harness = ?1 AND session_id = ?2")?
-            .query_map([harness, session], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(keys
-            .iter()
-            .filter_map(|key| {
-                let key = key.strip_prefix(&format!("{harness}:"))?;
-                key.split_once(":step:")
-                    .or_else(|| key.split_once(":invocation:"))
-            })
-            .map(|(conversation, _)| conversation.to_string())
-            .collect())
-    }
-
-    fn launching_turn_running(&self, run_id: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM runs r JOIN chat_turns t ON t.session_id = r.chat_session_id WHERE r.id = ?1 AND t.state IN ('preparing', 'retrying', 'running'))",
-            [run_id],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// The native invoker of the launch tool part whose output printed `run_id` in its chat.
-    /// `None` when no part printed it (for example a run that ended before its tool output persisted).
-    fn printed_run_invoker(&self, run_id: &str) -> Result<Option<Attribution>> {
-        let Some((harness, created_at, session)) = self
-            .conn
-            .query_row(
-                "SELECT s.harness, r.created_at, s.id FROM runs r JOIN chat_sessions s ON s.id = r.chat_session_id WHERE r.id = ?1",
-                [run_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
-            )
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        // The launching turn started before the run; a few recent replies cover it.
-        let messages = self
-            .conn
-            .prepare("SELECT parts_json FROM chat_messages WHERE session_id = ?1 AND role = 'assistant' AND created_at <= ?2 ORDER BY created_at DESC LIMIT 5")?
-            .query_map(params![session, created_at], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut launches = Vec::new();
-        for json in messages {
-            let parts: Vec<serde_json::Value> = serde_json::from_str(&json)?;
-            printed_launches(&parts, &run_id.to_ascii_lowercase(), false, &mut launches);
-        }
-        let mut found = std::collections::BTreeSet::new();
-        for (part_id, nested) in &launches {
-            // Harnesses whose part ids repeat across chats scope them by session.
-            let identity = match self.native_invocation_identity(&harness, part_id)? {
-                Some(identity) => Some(identity),
-                None => {
-                    self.native_invocation_identity(&harness, &format!("{session}:{part_id}"))?
-                }
-            };
-            found.insert(match identity {
-                Some(identity) => Attribution::of(&identity),
-                None => Attribution::Unresolved {
-                    reason: Missing::unidentified(*nested),
-                },
-            });
-        }
-        Ok(agreed(found))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -549,7 +188,7 @@ impl Store {
         harness: &str,
         native_scope: &str,
         native_turn: &str,
-        attribution: &Attribution,
+        model: Option<&str>,
         total: &TokenUsage,
         last: &TokenUsage,
     ) -> Result<()> {
@@ -597,15 +236,7 @@ impl Store {
                 "{native_scope}:{native_turn}:{generation}:{}",
                 serde_json::to_string(total)?
             );
-            self.record_attributed_sample(
-                execution_id,
-                &sample_id,
-                harness,
-                attribution,
-                &delta,
-                true,
-                false,
-            )?;
+            self.record_usage_sample(execution_id, &sample_id, harness, model, None, &delta)?;
         }
         let baseline = CumulativeBaseline {
             usage: total.clone(),
@@ -664,10 +295,10 @@ impl Store {
                     tx.execute("UPDATE native_usage_baselines SET totals_json = NULL WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, prefix])?;
                     tx.execute("UPDATE chat_usage_samples SET complete = 0 WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2", params![execution_id, prefix])?;
                 } else {
-                    // The aggregate counts every request's tokens, so listed models are replaced
-                    // and any other identity keeps only its model.
+                    // The aggregate counts every request: its models replace their messages, and any
+                    // other model keeps only its identity.
                     let models: Vec<_> = samples.iter().map(|(model, _, _)| model).collect();
-                    tx.execute("DELETE FROM chat_usage_samples WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2 AND (substr(sample_id, 1, length(?3)) = ?3 OR model IN (SELECT value FROM json_each(?4)))", params![execution_id, prefix, format!("{prefix}aggregate:"), serde_json::to_string(&models)?])?;
+                    tx.execute("DELETE FROM chat_usage_samples WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2 AND (model IS NULL OR model IN (SELECT value FROM json_each(?3)))", params![execution_id, prefix, serde_json::to_string(&models)?])?;
                     tx.execute("UPDATE chat_usage_samples SET usage_json = ?3, complete = 0 WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2", params![execution_id, prefix, serde_json::to_string(&TokenUsage::default())?])?;
                     for (model, provider, usage) in samples {
                         let zero = TokenUsage {
@@ -699,20 +330,15 @@ impl Store {
                                 .and_then(|n| n.checked_sub(previous.reasoning_tokens?)),
                         };
                         let sample_id = format!("{prefix}aggregate:{model}");
-                        self.record_attributed_sample(
+                        self.record_usage_sample(
                             execution_id,
                             &sample_id,
                             harness,
-                            &Attribution::native(
-                                harness,
-                                Some(model),
-                                provider.as_deref(),
-                                Missing::IdentityNotReported,
-                            ),
+                            Some(model),
+                            provider.as_deref(),
                             &delta,
-                            delta.input_tokens.is_some() && delta.output_tokens.is_some(),
-                            false,
                         )?;
+                        tx.execute("UPDATE chat_usage_samples SET complete = ?3 WHERE execution_id = ?1 AND sample_id = ?2", params![execution_id, sample_id, delta.input_tokens.is_some() && delta.output_tokens.is_some()])?;
                     }
                 }
             }
@@ -732,89 +358,16 @@ impl Store {
         Ok(())
     }
 
-    /// Opens an execution for native work outside any chat turn (a sub-agent that outlives its
-    /// parent's turn), owned by the session's latest turn. Its id starts with `native:`, so the
-    /// turn's own finalization leaves it open; it closes on its native end or startup recovery.
-    pub(crate) fn begin_native_execution(
-        &self,
-        execution_id: &str,
-        session_id: &str,
-        harness: &str,
-    ) -> Result<bool> {
-        debug_assert!(execution_id.starts_with("native:"));
-        let inserted = self.conn.execute("INSERT INTO chat_usage_executions (execution_id, turn_id, harness, report_id, suppressed) SELECT ?1, t.id, ?3, ?4, ?5 FROM chat_turns t WHERE t.session_id = ?2 ORDER BY t.created_at DESC LIMIT 1 ON CONFLICT(execution_id) DO NOTHING", params![execution_id, session_id, harness, uuid::Uuid::new_v4().to_string(), !crate::telemetry::accounting_reports_enabled()])?;
-        Ok(inserted > 0
-            || self.conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL)",
-                [execution_id],
-                |row| row.get(0),
-            )?)
-    }
-
-    /// The open chat execution of `turn_id` on `harness`, with its native session and start time.
-    pub(crate) fn open_turn_execution(
-        &self,
-        turn_id: &str,
-        harness: &str,
-    ) -> Result<Option<(String, String, i64)>> {
-        Ok(self.conn.query_row("SELECT u.execution_id, s.native_session_id, t.created_at FROM chat_usage_executions u JOIN chat_turns t ON t.id = u.turn_id JOIN chat_sessions s ON s.id = t.session_id WHERE u.turn_id = ?1 AND u.harness = ?2 AND u.outcome IS NULL AND substr(u.execution_id, 1, 7) <> 'native:' AND s.native_session_id IS NOT NULL", params![turn_id, harness], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?)
-    }
-
-    /// Samples under `prefix` that carry no native model and no hook identity.
-    pub(crate) fn unidentified_samples(
-        &self,
-        execution_id: &str,
-        prefix: &str,
-    ) -> Result<Vec<String>> {
-        Ok(self
-            .conn
-            .prepare("SELECT s.sample_id FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 AND s.model IS NULL AND n.call_id IS NULL AND substr(s.sample_id, 1, length(?2)) = ?2")?
-            .query_map(params![execution_id, prefix], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?)
-    }
-
-    /// Turns whose chat execution is still open.
-    pub(crate) fn open_execution_turns(&self) -> Result<Vec<String>> {
-        Ok(self
-            .conn
-            .prepare("SELECT turn_id FROM chat_usage_executions WHERE outcome IS NULL AND substr(execution_id, 1, 7) <> 'native:'")?
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?)
-    }
-
-    /// (session, native session, first accounted turn start) on `harness` with no turn still
-    /// running. Native history before ORX's first turn (an imported session) is never accounted.
-    pub(crate) fn idle_native_sessions(&self, harness: &str) -> Result<Vec<(String, String, i64)>> {
-        Ok(self
-            .conn
-            .prepare("SELECT s.id, s.native_session_id, MIN(t.created_at) FROM chat_sessions s JOIN chat_turns t ON t.session_id = s.id JOIN chat_usage_executions u ON u.turn_id = t.id WHERE s.harness = ?1 AND s.native_session_id IS NOT NULL GROUP BY s.id HAVING SUM(u.outcome IS NULL AND substr(u.execution_id, 1, 7) <> 'native:') = 0")?
-            .query_map([harness], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<std::result::Result<_, _>>()?)
-    }
-
-    /// Whether any execution holds native sample `sample_id` (measured, when `measured`).
-    pub(crate) fn native_sample_exists(
-        &self,
-        harness: &str,
-        sample_id: &str,
-        measured: bool,
-    ) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM chat_usage_samples WHERE harness = ?1 AND sample_id = ?2 AND (NOT ?3 OR usage_json <> ?4))",
-            params![harness, sample_id, measured, serde_json::to_string(&TokenUsage::default())?],
-            |row| row.get(0),
-        )?)
-    }
-
     pub(crate) fn recover_terminal_usage(&self) -> Result<()> {
-        let rows = self.conn.prepare("SELECT u.execution_id, t.state FROM chat_usage_executions u JOIN chat_turns t ON t.id = u.turn_id WHERE u.outcome IS NULL AND t.state IN ('completed', 'failed', 'interrupted') AND NOT EXISTS (SELECT 1 FROM chat_turn_leases l WHERE l.chat_session_id = t.session_id)")?
+        let mut stmt = self.conn.prepare("SELECT DISTINCT t.id, t.state FROM chat_usage_executions u JOIN chat_turns t ON t.id = u.turn_id WHERE u.outcome IS NULL AND t.state IN ('completed', 'failed', 'interrupted') AND NOT EXISTS (SELECT 1 FROM chat_turn_leases l WHERE l.chat_session_id = t.session_id)")?;
+        let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (execution_id, state) in rows {
-            self.finalize_usage_execution(
-                &execution_id,
+        for (turn_id, state) in rows {
+            self.finalize_turn_usage(
+                &turn_id,
                 match state.as_str() {
                     "completed" => "done",
                     "interrupted" => "cancelled",
@@ -826,206 +379,159 @@ impl Store {
     }
 
     pub(crate) fn finalize_turn_usage(&self, turn_id: &str, outcome: &str) -> Result<()> {
-        let executions = self
-            .conn
-            .prepare("SELECT execution_id FROM chat_usage_executions WHERE turn_id = ?1 AND outcome IS NULL AND substr(execution_id, 1, 7) <> 'native:'")?
-            .query_map([turn_id], |row| row.get::<_, String>(0))?
+        let mut stmt = self.conn.prepare("SELECT execution_id, harness, report_id, suppressed FROM chat_usage_executions WHERE turn_id = ?1 AND outcome IS NULL")?;
+        let rows = stmt
+            .query_map([turn_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for execution_id in executions {
-            self.finalize_usage_execution(&execution_id, outcome)?;
+        for (execution_id, harness, report_id, suppressed) in rows {
+            let mut samples = self.conn.prepare("SELECT s.model, s.provider, s.usage_json, s.complete, n.identity_json FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 ORDER BY s.sample_id")?;
+            let mut grouped = std::collections::BTreeMap::<
+                (Option<String>, Option<String>, [bool; 5]),
+                Vec<(TokenUsage, bool)>,
+            >::new();
+            for row in samples.query_map([&execution_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })? {
+                let (model, provider, json, complete, identity) = row?;
+                let identity: Option<InvocationIdentity> = identity
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?;
+                let model =
+                    model.or_else(|| identity.as_ref().map(|identity| identity.model.clone()));
+                let provider = provider.or_else(|| identity.and_then(|identity| identity.provider));
+                let usage: TokenUsage = serde_json::from_str(&json)?;
+                let measured = [
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.reasoning_tokens,
+                ]
+                .map(|counter| counter.is_some());
+                grouped
+                    .entry((model, provider, measured))
+                    .or_default()
+                    .push((usage, complete));
+            }
+            // A model seen without tokens joins that model and provider's measured requests, if any.
+            let measured: Vec<(Option<String>, Option<String>)> = grouped
+                .keys()
+                .filter(|(_, _, mask)| mask.contains(&true))
+                .map(|(model, provider, _)| (model.clone(), provider.clone()))
+                .collect();
+            grouped.retain(|(model, provider, mask), _| {
+                mask.contains(&true)
+                    || model.is_none()
+                    || !measured.contains(&(model.clone(), provider.clone()))
+            });
+            if grouped.is_empty() {
+                grouped.insert((None, None, [false; 5]), Vec::new());
+            }
+            let delivery: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT delivery_state FROM chat_turns WHERE id = ?1",
+                    [turn_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut reports = Vec::new();
+            if !suppressed {
+                for ((model, provider, _), samples) in grouped {
+                    let sum = |field: fn(&TokenUsage) -> Option<u64>| -> Option<u64> {
+                        if samples.is_empty() {
+                            return None;
+                        }
+                        let measured: Vec<_> = samples
+                            .iter()
+                            .filter_map(|(usage, _)| field(usage))
+                            .collect();
+                        if measured.is_empty() {
+                            return None;
+                        }
+                        measured
+                            .into_iter()
+                            .try_fold(0u64, |total, value| total.checked_add(value))
+                    };
+                    let usage = TokenUsage {
+                        input_tokens: sum(|u| u.input_tokens),
+                        output_tokens: sum(|u| u.output_tokens),
+                        cache_read_tokens: sum(|u| u.cache_read_tokens),
+                        cache_write_tokens: sum(|u| u.cache_write_tokens),
+                        reasoning_tokens: sum(|u| u.reasoning_tokens),
+                    };
+                    usage.validate()?;
+                    let mut properties = serde_json::to_value(&usage)?;
+                    properties["reportId"] = serde_json::json!(report_id);
+                    properties["harness"] = serde_json::json!(harness);
+                    let (attribution, reason) = chat_attribution(
+                        &harness,
+                        model.as_deref(),
+                        !samples.is_empty(),
+                        delivery.as_deref(),
+                    );
+                    let exact = attribution == "exact";
+                    properties["model"] = serde_json::json!(model.filter(|_| exact));
+                    properties["provider"] = serde_json::json!(provider.filter(|_| exact));
+                    properties["attribution"] = serde_json::json!(attribution);
+                    properties["attributionReason"] = serde_json::json!(reason);
+                    properties["totalTokens"] = serde_json::json!(usage.total());
+                    properties["outcome"] = serde_json::json!(outcome);
+                    properties["coverage"] = serde_json::json!(if [
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens,
+                        usage.reasoning_tokens
+                    ]
+                    .iter()
+                    .all(Option::is_none)
+                    {
+                        "missing"
+                    } else if samples.iter().all(|(usage, complete)| *complete
+                        && usage.input_tokens.is_some()
+                        && usage.output_tokens.is_some())
+                    {
+                        "complete"
+                    } else {
+                        "partial"
+                    });
+                    if let Some(report) =
+                        crate::telemetry::pending_event_payload("chat_model_usage", properties)
+                    {
+                        reports.push(report);
+                    }
+                }
+            }
+            self.finalize_usage_execution(&execution_id, outcome, reports)?;
         }
         Ok(())
     }
 
-    /// One report per (attribution, measured counters) group of an execution's samples.
-    fn usage_report_properties(
+    fn finalize_usage_execution(
         &self,
         execution_id: &str,
-        harness: &str,
-        report_id: &str,
         outcome: &str,
-        delivery: Option<&str>,
-    ) -> Result<Vec<serde_json::Value>> {
-        type Key = (Attribution, [bool; 5]);
-        let mut grouped = std::collections::BTreeMap::<Key, Vec<(TokenUsage, bool)>>::new();
-        let mut samples = self.conn.prepare("SELECT s.model, s.provider, s.usage_json, s.complete, n.identity_json, s.attribution_json FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 ORDER BY s.sample_id")?;
-        for row in samples.query_map([execution_id], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, bool>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })? {
-            let (model, provider, json, complete, identity, attribution) = row?;
-            let identity: Option<InvocationIdentity> = identity
-                .map(|json| serde_json::from_str(&json))
-                .transpose()?;
-            // Rows from before attribution existed carry only the model.
-            let attribution = match attribution {
-                Some(json) => serde_json::from_str(&json)?,
-                None => Attribution::native(
-                    harness,
-                    model.as_deref(),
-                    provider.as_deref(),
-                    Missing::IdentityNotReported,
-                ),
-            };
-            // A native identity recorded under the same sample id (a hook) resolves it.
-            let attribution = match (attribution, identity) {
-                (
-                    Attribution::Unresolved {
-                        reason: Missing::IdentityNotReported | Missing::ChildModelUnknown,
-                    },
-                    Some(identity),
-                ) => Attribution::of(&identity),
-                (attribution, _) => attribution,
-            };
-            let usage: TokenUsage = serde_json::from_str(&json)?;
-            let measured = usage.counters().map(|counter| counter.is_some());
-            grouped
-                .entry((attribution, measured))
-                .or_default()
-                .push((usage, complete));
-        }
-        // An identity seen without counters joins its model's measured requests when there are any.
-        let measured: std::collections::BTreeSet<Attribution> = grouped
-            .keys()
-            .filter(|(_, mask)| mask.contains(&true))
-            .map(|(attribution, _)| attribution.clone())
-            .collect();
-        grouped.retain(|(attribution, mask), _| {
-            mask.contains(&true) || !measured.contains(attribution)
-        });
-        // A zero-usage synthetic error only reports when nothing else ran.
-        let only_group = grouped.len() == 1;
-        grouped.retain(|(attribution, _), samples| {
-            *attribution
-                != Attribution::Unresolved {
-                    reason: Missing::SyntheticModel,
-                }
-                || only_group
-                || samples
-                    .iter()
-                    .any(|(usage, _)| usage.counters().iter().any(|n| n.unwrap_or(0) > 0))
-        });
-        if grouped.is_empty() {
-            let attribution = if matches!(delivery, Some("not_sent" | "rejected")) {
-                Attribution::NotExecuted
-            } else {
-                Attribution::Unresolved {
-                    reason: Missing::NoUsageReported,
-                }
-            };
-            grouped.insert((attribution, [false; 5]), Vec::new());
-        }
-        let mut reports = Vec::new();
-        for ((attribution, _), samples) in grouped {
-            let sum = |field: fn(&TokenUsage) -> Option<u64>| -> Option<u64> {
-                let measured: Vec<_> = samples
-                    .iter()
-                    .filter_map(|(usage, _)| field(usage))
-                    .collect();
-                if measured.is_empty() {
-                    return None;
-                }
-                measured
-                    .into_iter()
-                    .try_fold(0u64, |total, value| total.checked_add(value))
-            };
-            let usage = TokenUsage {
-                input_tokens: sum(|u| u.input_tokens),
-                output_tokens: sum(|u| u.output_tokens),
-                cache_read_tokens: sum(|u| u.cache_read_tokens),
-                cache_write_tokens: sum(|u| u.cache_write_tokens),
-                reasoning_tokens: sum(|u| u.reasoning_tokens),
-            };
-            usage.validate()?;
-            let mut properties = serde_json::to_value(&usage)?;
-            properties["reportId"] = serde_json::json!(report_id);
-            properties["harness"] = serde_json::json!(harness);
-            attribution.apply(&mut properties)?;
-            properties["totalTokens"] = serde_json::json!(usage.total());
-            properties["outcome"] = serde_json::json!(outcome);
-            properties["coverage"] =
-                serde_json::json!(if usage.counters().iter().all(Option::is_none) {
-                    "missing"
-                } else if samples.iter().all(|(usage, complete)| {
-                    *complete && usage.input_tokens.is_some() && usage.output_tokens.is_some()
-                }) {
-                    "complete"
-                } else {
-                    "partial"
-                });
-            reports.push(properties);
-        }
-        Ok(reports)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn conn_for_tests(&self) -> &rusqlite::Connection {
-        &self.conn
-    }
-
-    /// Every execution's report properties at `outcome`, without closing or staging.
-    #[cfg(test)]
-    pub(crate) fn test_usage_reports(&self, outcome: &str) -> Result<Vec<serde_json::Value>> {
-        let executions = self
-            .conn
-            .prepare("SELECT u.execution_id, u.harness, u.report_id, t.delivery_state FROM chat_usage_executions u LEFT JOIN chat_turns t ON t.id = u.turn_id ORDER BY u.execution_id")?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut reports = Vec::new();
-        for (execution, harness, report_id, delivery) in executions {
-            reports.extend(self.usage_report_properties(
-                &execution,
-                &harness,
-                &report_id,
-                outcome,
-                delivery.as_deref(),
-            )?);
-        }
-        Ok(reports)
-    }
-
-    /// Closes and stages under one write lock, so a sample committed by another process is either
-    /// in the report or rejected as late; never accepted and unreported.
-    pub(crate) fn finalize_usage_execution(&self, execution_id: &str, outcome: &str) -> Result<()> {
+        reports: Vec<(String, serde_json::Value)>,
+    ) -> Result<()> {
         let tx = self.begin_immediate()?;
-        let Some((turn_id, harness, report_id, suppressed)) = tx
-            .query_row(
-                "UPDATE chat_usage_executions SET outcome = ?2 WHERE execution_id = ?1 AND outcome IS NULL RETURNING turn_id, harness, report_id, suppressed",
-                params![execution_id, outcome],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?)),
-            )
-            .optional()?
-        else {
-            return Ok(());
-        };
-        if !suppressed {
-            let delivery: Option<String> = tx
-                .query_row(
-                    "SELECT delivery_state FROM chat_turns WHERE id = ?1",
-                    [&turn_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            for properties in self.usage_report_properties(
-                execution_id,
-                &harness,
-                &report_id,
-                outcome,
-                delivery
-                    .as_deref()
-                    .filter(|_| !execution_id.starts_with("native:")),
-            )? {
-                if let Some((id, payload)) =
-                    crate::telemetry::pending_event_payload("chat_model_usage", properties)
-                {
-                    self.stage_telemetry(&id, &payload)?;
-                }
+        let suppressed: Option<bool> = tx.query_row("UPDATE chat_usage_executions SET outcome = ?2 WHERE execution_id = ?1 AND outcome IS NULL RETURNING suppressed", params![execution_id, outcome], |row| row.get(0)).optional()?;
+        if suppressed == Some(false) {
+            for (id, payload) in reports {
+                self.stage_telemetry(&id, &payload)?;
             }
         }
         tx.commit()?;
@@ -1066,10 +572,7 @@ impl Store {
     pub(crate) fn purge_pending_telemetry(&self) -> Result<()> {
         let tx = self.begin()?;
         tx.execute("DELETE FROM telemetry_pending_events", [])?;
-        tx.execute(
-            "UPDATE run_telemetry SET report_json = NULL, pending_since = NULL",
-            [],
-        )?;
+        tx.execute("UPDATE run_telemetry SET report_json = NULL", [])?;
         tx.execute(
             "UPDATE chat_usage_executions SET suppressed = 1 WHERE outcome IS NULL",
             [],
@@ -1078,25 +581,19 @@ impl Store {
         Ok(())
     }
 
-    /// Upserts one native sample: an identity-only write keeps measured counters, and a measured
-    /// write replaces them (snapshots, not deltas). `exclusive` skips a sample already measured
-    /// by another execution, so re-read native records count once.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_attributed_sample(
+    pub(crate) fn record_usage_sample(
         &self,
         execution_id: &str,
         sample_id: &str,
         harness: &str,
-        attribution: &Attribution,
+        model: Option<&str>,
+        provider: Option<&str>,
         usage: &TokenUsage,
-        complete: bool,
-        exclusive: bool,
     ) -> Result<()> {
         usage.validate()?;
-        let (model, provider) = attribution.model();
-        let unmeasured = serde_json::to_string(&TokenUsage::default())?;
-        let measured = usage != &TokenUsage::default();
-        self.conn.execute("INSERT INTO chat_usage_samples (execution_id, sample_id, harness, model, provider, usage_json, complete, attribution_json) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL) AND NOT (?10 AND EXISTS (SELECT 1 FROM chat_usage_samples o WHERE o.sample_id = ?2 AND o.harness = ?3 AND o.execution_id <> ?1 AND o.usage_json <> ?11)) ON CONFLICT(execution_id, sample_id) DO UPDATE SET usage_json = CASE WHEN ?9 THEN excluded.usage_json ELSE usage_json END, complete = CASE WHEN ?9 THEN excluded.complete ELSE complete END, model = COALESCE(excluded.model, model), provider = CASE WHEN excluded.model IS NULL AND model IS NOT NULL THEN provider ELSE excluded.provider END, attribution_json = CASE WHEN excluded.model IS NULL AND model IS NOT NULL THEN attribution_json ELSE excluded.attribution_json END", params![execution_id, sample_id, harness, model, provider, serde_json::to_string(usage)?, complete, serde_json::to_string(attribution)?, measured, exclusive, unmeasured])?;
+        let model = model.filter(|label| valid_model_label(label));
+        let provider = provider.filter(|label| valid_model_label(label));
+        self.conn.execute("INSERT INTO chat_usage_samples (execution_id, sample_id, harness, model, provider, usage_json) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL) ON CONFLICT(execution_id, sample_id) DO UPDATE SET model = COALESCE(excluded.model, model), provider = COALESCE(excluded.provider, provider), usage_json = CASE WHEN ?7 THEN excluded.usage_json ELSE usage_json END", params![execution_id, sample_id, harness, model, provider, serde_json::to_string(usage)?, usage != &TokenUsage::default()])?;
         Ok(())
     }
 }
@@ -1104,28 +601,6 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    impl Store {
-        fn record_usage_sample(
-            &self,
-            execution_id: &str,
-            sample_id: &str,
-            harness: &str,
-            model: Option<&str>,
-            provider: Option<&str>,
-            usage: &TokenUsage,
-        ) -> Result<()> {
-            self.record_attributed_sample(
-                execution_id,
-                sample_id,
-                harness,
-                &Attribution::native(harness, model, provider, Missing::IdentityNotReported),
-                usage,
-                false,
-                false,
-            )
-        }
-    }
 
     #[test]
     fn prepared_chat_report_cannot_escape_opt_out_or_duplicate_finalization() {
@@ -1138,25 +613,18 @@ mod tests {
             .conn
             .execute("UPDATE chat_usage_executions SET suppressed = 0", [])
             .unwrap();
-        store
-            .record_usage_sample(
-                "execution",
-                "sample",
-                "claude-code",
-                Some("claude-opus-5-5"),
-                None,
-                &TokenUsage::default(),
-            )
-            .unwrap();
+        let prepared = vec![("prepared".into(), serde_json::json!({"usage": 12}))];
         store.purge_pending_telemetry().unwrap();
-        store.finalize_usage_execution("execution", "done").unwrap();
+        store
+            .finalize_usage_execution("execution", "done", prepared.clone())
+            .unwrap();
         assert!(store.pending_telemetry().unwrap().is_empty());
         store
             .conn
             .execute("UPDATE chat_usage_executions SET suppressed = 0", [])
             .unwrap();
         store
-            .finalize_usage_execution("execution", "failed")
+            .finalize_usage_execution("execution", "done", prepared)
             .unwrap();
         assert!(store.pending_telemetry().unwrap().is_empty());
         let outcome: String = store
@@ -1372,7 +840,7 @@ mod tests {
         );
         let tx = store.begin().unwrap();
         store
-            .reserve_run_telemetry(&run.id, Some(&identity), None, None, Some(&report))
+            .reserve_run_telemetry(&run.id, Some(&identity), Some(&report))
             .unwrap();
         store.upsert_run(&run).unwrap();
         tx.commit().unwrap();
@@ -1560,9 +1028,7 @@ mod tests {
                     "codex",
                     "thread",
                     "native-turn",
-                    &Attribution::Unresolved {
-                        reason: Missing::IdentityNotReported,
-                    },
+                    None,
                     &usage(1100, 110),
                     &usage(100, 10),
                 )
@@ -1574,9 +1040,7 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
-                &Attribution::Unresolved {
-                    reason: Missing::IdentityNotReported,
-                },
+                None,
                 &usage(1200, 120),
                 &usage(100, 10),
             )
@@ -1587,9 +1051,7 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
-                &Attribution::Unresolved {
-                    reason: Missing::IdentityNotReported,
-                },
+                None,
                 &usage(1000, 100),
                 &usage(0, 0),
             )
@@ -1600,9 +1062,7 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
-                &Attribution::Unresolved {
-                    reason: Missing::IdentityNotReported,
-                },
+                None,
                 &usage(1100, 110),
                 &usage(100, 10),
             )
@@ -1778,476 +1238,84 @@ mod tests {
         .is_err());
     }
 
-    fn exact(model: &str) -> Attribution {
-        Attribution::Exact {
-            model: model.into(),
-            provider: None,
-        }
-    }
-
-    fn measured(input: u64, output: u64) -> TokenUsage {
-        TokenUsage {
-            input_tokens: Some(input),
-            output_tokens: Some(output),
-            ..Default::default()
-        }
-    }
-
-    /// Report rows as (attribution, model, reason, coverage, input).
-    type Row = (String, Option<String>, Option<String>, String, Option<u64>);
-
-    fn rows(store: &Store) -> Vec<Row> {
-        store
-            .test_usage_reports("done")
-            .unwrap()
-            .iter()
-            .map(|r| {
-                (
-                    r["attribution"].as_str().unwrap().into(),
-                    r["model"].as_str().map(Into::into),
-                    r["attributionReason"].as_str().map(Into::into),
-                    r["coverage"].as_str().unwrap().into(),
-                    r["inputTokens"].as_u64(),
-                )
-            })
-            .collect()
-    }
-
-    fn row(
-        attribution: &str,
-        model: Option<&str>,
-        reason: Option<&str>,
-        coverage: &str,
-        input: Option<u64>,
-    ) -> Row {
-        (
-            attribution.into(),
-            model.map(Into::into),
-            reason.map(Into::into),
-            coverage.into(),
-            input,
-        )
-    }
-
-    /// Native samples → reports: identity survives without tokens, children and exceptions stay
-    /// explicit, and nothing executed is never a model.
+    /// Only a native label is exact; reserved labels and missing evidence stay explicit, and a
+    /// model seen without tokens never erases measured usage (or the reverse).
     #[test]
-    fn usage_reports_keep_identities_tokens_and_exceptions_separate() {
-        type Sample = (&'static str, Attribution, TokenUsage, bool);
-        let unknown_child = Attribution::Unresolved {
-            reason: Missing::ChildModelUnknown,
-        };
-        let synthetic = Attribution::Unresolved {
-            reason: Missing::SyntheticModel,
-        };
-        let cases: Vec<(&str, Vec<Sample>, Vec<_>)> =
-            vec![
+    fn native_labels_attribute_and_identity_writes_keep_usage() {
+        for (harness, model, sampled, delivery, expected) in [
+            ("codex", Some("gpt-6-sol"), true, None, ("exact", None)),
+            ("cursor", Some("Auto"), true, None, ("auto_routing", None)),
             (
-                "identity joins its measured requests; another model's identity alone is missing",
-                vec![
-                    ("a", exact("m1"), measured(10, 2), true),
-                    ("a-id", exact("m1"), TokenUsage::default(), false),
-                    ("b", exact("m2"), TokenUsage::default(), false),
-                ],
-                vec![
-                    row("exact", Some("m1"), None, "complete", Some(10)),
-                    row("exact", Some("m2"), None, "missing", None),
-                ],
-            ),
-            (
-                "an unidentified child never takes the parent's model",
-                vec![
-                    ("p", exact("m1"), measured(5, 1), true),
-                    ("c", unknown_child.clone(), measured(3, 1), true),
-                ],
-                vec![
-                    row("exact", Some("m1"), None, "complete", Some(5)),
-                    row("unresolved", None, Some("child_model_unknown"), "complete", Some(3)),
-                ],
-            ),
-            (
-                "a zero-usage synthetic error only reports alone",
-                vec![
-                    ("p", exact("m1"), measured(5, 1), true),
-                    ("s", synthetic.clone(), measured(0, 0), true),
-                ],
-                vec![row("exact", Some("m1"), None, "complete", Some(5))],
-            ),
-            (
-                "a synthetic error alone is explicit",
-                vec![("s", synthetic, measured(0, 0), true)],
-                vec![row("unresolved", None, Some("synthetic_model"), "complete", Some(0))],
-            ),
-            (
-                "a delivered turn with no native evidence is unresolved",
-                vec![],
-                vec![row("unresolved", None, Some("no_usage_reported"), "missing", None)],
-            ),
-        ];
-        for (name, samples, expected) in cases {
-            let dir = std::env::temp_dir().join(format!("orx-reports-{}", uuid::Uuid::new_v4()));
-            let store = Store::open_at(dir.clone()).unwrap();
-            store.begin_usage_execution("e", "t", "codex").unwrap();
-            for (id, attribution, usage, complete) in samples {
-                store
-                    .record_attributed_sample(
-                        "e",
-                        id,
-                        "codex",
-                        &attribution,
-                        &usage,
-                        complete,
-                        false,
-                    )
-                    .unwrap();
-            }
-            assert_eq!(rows(&store), expected, "{name}");
-            drop(store);
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-        // Never delivered: not executed, not a model.
-        let dir = std::env::temp_dir().join(format!("orx-reports-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store.conn.execute_batch("INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{}', 'failed', 'rejected', 1, 1)").unwrap();
-        store.begin_usage_execution("e", "t", "codex").unwrap();
-        assert_eq!(
-            rows(&store),
-            vec![row("not_executed", None, None, "missing", None)]
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Re-read native records count once across executions, and a sub-agent's own execution
-    /// outlives its parent turn's finalization until it closes natively or at recovery.
-    #[test]
-    fn native_records_count_once_and_late_children_close_independently() {
-        let dir = std::env::temp_dir().join(format!("orx-native-exec-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store.conn.execute_batch("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'opencode', 1, 1);
-            INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{}', 'running', 'accepted', 1, 1);").unwrap();
-        store
-            .begin_usage_execution("turn", "t", "opencode")
-            .unwrap();
-        let record = |execution: &str, id: &str, usage: TokenUsage| {
-            store
-                .record_attributed_sample(
-                    execution,
-                    id,
-                    "opencode",
-                    &exact("m"),
-                    &usage,
-                    true,
-                    true,
-                )
-                .unwrap()
-        };
-        record("turn", "step-1", measured(10, 1));
-        record("turn", "step-2", TokenUsage::default());
-        assert!(store
-            .begin_native_execution("native:late", "s", "opencode")
-            .unwrap());
-        record("native:late", "step-1", measured(10, 1));
-        record("native:late", "step-2", measured(20, 2));
-        store.finalize_turn_usage("t", "done").unwrap();
-        assert!(store
-            .native_sample_exists("opencode", "step-2", true)
-            .unwrap());
-        let open: Vec<String> = store
-            .conn
-            .prepare("SELECT execution_id FROM chat_usage_executions WHERE outcome IS NULL")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(open, ["native:late"]);
-        let late: Vec<String> = store
-            .conn
-            .prepare("SELECT sample_id FROM chat_usage_samples WHERE execution_id = 'native:late'")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(late, ["step-2"]);
-        store
-            .conn
-            .execute_batch("UPDATE chat_turns SET state = 'completed'")
-            .unwrap();
-        store.recover_terminal_usage().unwrap();
-        let open: i64 = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM chat_usage_executions WHERE outcome IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(open, 0);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A chat-launched run without forwarded identity binds at its terminal transition to the
-    /// launch part whose native output printed it, never to the chat's other models.
-    #[test]
-    fn runs_bind_to_their_printed_launch_part_or_stay_explicit() {
-        let launch = |id: &str, run: &str| {
-            serde_json::json!({"id": id, "type": "tool", "state": {"status": "completed",
-                "input": {"command": "orx exp run e"}, "output": format!("Run {run} started")}})
-        };
-        let cases = [
-            // (parts, invokers, expected attribution, reason)
-            (
-                vec![launch("p1", "7f3a-run")],
-                vec![("p1", "m1")],
-                "exact",
+                "claude-code",
+                Some("<synthetic>"),
+                true,
                 None,
+                ("unresolved", Some("synthetic_model")),
             ),
             (
-                vec![serde_json::json!({"id": "task", "children": [launch("c1", "7f3a-run")]})],
-                vec![("task", "m1")],
-                "unresolved",
-                Some("child_model_unknown"),
+                "codex",
+                None,
+                true,
+                None,
+                ("unresolved", Some("identity_not_reported")),
             ),
             (
-                vec![launch("p1", "7f3a-run"), launch("p2", "7f3a-run")],
-                vec![("p1", "m1"), ("p2", "m2")],
-                "unresolved",
-                Some("invoker_ambiguous"),
+                "codex",
+                None,
+                false,
+                Some("rejected"),
+                ("not_executed", None),
             ),
             (
-                vec![launch("p1", "9c1b-run")],
-                vec![("p1", "m1")],
-                "unresolved",
-                Some("invoker_not_linked"),
+                "codex",
+                None,
+                false,
+                Some("accepted"),
+                ("unresolved", Some("no_usage_reported")),
             ),
-        ];
-        for (parts, invokers, attribution, reason) in cases {
-            let dir = std::env::temp_dir().join(format!("orx-run-bind-{}", uuid::Uuid::new_v4()));
-            let store = Store::open_at(dir.clone()).unwrap();
-            store.conn.execute("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'cursor', 1, 1)", []).unwrap();
-            store.conn.execute("INSERT INTO chat_messages (id, session_id, role, parts_json, created_at) VALUES ('m', 's', 'assistant', ?1, 1)", [serde_json::to_string(&parts).unwrap()]).unwrap();
-            for (part, model) in invokers {
-                let identity = InvocationIdentity {
-                    harness: "cursor".into(),
-                    model: model.into(),
-                    provider: None,
-                };
-                store
-                    .record_native_invocation(part, &identity, Some("s"))
-                    .unwrap();
-            }
-            let event = serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
-            let tx = store.begin().unwrap();
-            store
-                .reserve_run_telemetry(
-                    "7f3a-run",
-                    None,
-                    Some("s"),
-                    None,
-                    Some(&("ev".into(), event)),
-                )
-                .unwrap();
-            store
-                .upsert_run(&StoredRun {
-                    id: "7f3a-run".into(),
-                    experiment_id: "e".into(),
-                    project_id: "p".into(),
-                    status: "starting".into(),
-                    backend_json: "{}".into(),
-                    command: String::new(),
-                    created_at: 2,
-                    updated_at: 2,
-                    ended_at: None,
-                    exit_code: None,
-                    commit_sha: None,
-                    result_markdown: None,
-                    cancel_requested: false,
-                    chat_session_id: Some("s".into()),
-                })
-                .unwrap();
-            tx.commit().unwrap();
-            assert!(store
-                .update_status("7f3a-run", RunStatus::Done, Some(3), Some(0))
-                .unwrap());
-            let staged = store.pending_telemetry().unwrap();
-            let properties = &staged[0].1["events"][0]["properties"];
-            assert_eq!(properties["harness"], "cursor");
-            assert_eq!(properties["status"], "done");
-            assert_eq!(properties["attribution"], attribution, "{parts:?}");
-            assert_eq!(
-                properties["attributionReason"].as_str(),
-                reason,
-                "{parts:?}"
-            );
-            assert_eq!(
-                properties["model"].as_str(),
-                (attribution == "exact").then_some("m1")
-            );
-            drop(store);
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-        // Outside chat: an agent CLI marker is external, nothing is manual.
-        for (origin, harness, attribution) in [
-            (Some("codex"), Some("codex"), "unresolved"),
-            (Some("unknown"), None, "unresolved"),
-            (None, None, "manual"),
         ] {
-            let dir = std::env::temp_dir().join(format!("orx-run-origin-{}", uuid::Uuid::new_v4()));
-            let store = Store::open_at(dir.clone()).unwrap();
-            let event = serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
-            store
-                .reserve_run_telemetry("run", None, None, origin, Some(&("ev".into(), event)))
-                .unwrap();
-            let report: String = store
-                .conn
-                .query_row("SELECT report_json FROM run_telemetry", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            let report: serde_json::Value = serde_json::from_str(&report).unwrap();
-            let properties = &report["events"][0]["properties"];
-            assert_eq!(properties["harness"].as_str(), harness);
-            assert_eq!(properties["attribution"], attribution);
-            drop(store);
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    /// A fast run can end before its launch tool's output persists: the report waits (durably,
-    /// across a restart) while the launching turn runs, then emits once — exact once the printed
-    /// part appears, or invoker_not_linked once the turn settles without it.
-    #[test]
-    fn terminal_runs_wait_for_their_launch_output_and_emit_once() {
-        for (evidence, restart) in [(true, false), (true, true), (false, true)] {
-            let dir =
-                std::env::temp_dir().join(format!("orx-run-pending-{}", uuid::Uuid::new_v4()));
-            let mut store = Store::open_at(dir.clone()).unwrap();
-            store.conn.execute_batch("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'opencode', 1, 1);
-                INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{}', 'running', 'accepted', 1, 1);
-                INSERT INTO chat_messages (id, session_id, role, parts_json, created_at) VALUES ('m', 's', 'assistant', '[]', 1);").unwrap();
-            let event = serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
-            let tx = store.begin().unwrap();
-            store
-                .reserve_run_telemetry(
-                    "7f3a-run",
-                    None,
-                    Some("s"),
-                    None,
-                    Some(&("ev".into(), event)),
-                )
-                .unwrap();
-            store
-                .upsert_run(&StoredRun {
-                    id: "7f3a-run".into(),
-                    experiment_id: "e".into(),
-                    project_id: "p".into(),
-                    status: "starting".into(),
-                    backend_json: "{}".into(),
-                    command: String::new(),
-                    created_at: 2,
-                    updated_at: 2,
-                    ended_at: None,
-                    exit_code: None,
-                    commit_sha: None,
-                    result_markdown: None,
-                    cancel_requested: false,
-                    chat_session_id: Some("s".into()),
-                })
-                .unwrap();
-            tx.commit().unwrap();
-            assert!(store
-                .update_status("7f3a-run", RunStatus::Done, Some(3), Some(0))
-                .unwrap());
-            store.settle_pending_runs().unwrap();
-            assert!(
-                store.pending_telemetry().unwrap().is_empty(),
-                "waits for the turn"
+            assert_eq!(
+                chat_attribution(harness, model, sampled, delivery),
+                expected
             );
-            if restart {
-                drop(store);
-                store = Store::open_at(dir.clone()).unwrap();
-            }
-            if evidence {
-                let parts = serde_json::json!([{"id": "call_1", "type": "tool", "state": {"status": "completed",
-                    "input": {"command": "orx exp run e"}, "output": "Run 7f3a-run done"}}]);
-                store
-                    .conn
-                    .execute(
-                        "UPDATE chat_messages SET parts_json = ?1",
-                        [parts.to_string()],
-                    )
-                    .unwrap();
-                let identity = InvocationIdentity {
-                    harness: "opencode".into(),
-                    model: "big-pickle".into(),
-                    provider: Some("opencode".into()),
-                };
-                store
-                    .record_native_invocation("call_1", &identity, Some("s"))
-                    .unwrap();
-            } else {
-                store
-                    .conn
-                    .execute("UPDATE chat_turns SET state = 'completed'", [])
-                    .unwrap();
-            }
-            store.settle_pending_runs().unwrap();
-            store.settle_pending_runs().unwrap();
-            let staged = store.pending_telemetry().unwrap();
-            assert_eq!(staged.len(), 1);
-            let properties = &staged[0].1["events"][0]["properties"];
-            assert_eq!(properties["status"], "done");
-            if evidence {
-                assert_eq!(properties["attribution"], "exact");
-                assert_eq!(properties["model"], "big-pickle");
-            } else {
-                assert_eq!(properties["attributionReason"], "invoker_not_linked");
-            }
-            drop(store);
-            std::fs::remove_dir_all(dir).unwrap();
         }
-    }
-
-    /// A run launched from an OpenCode chat inside a host Codex inherits the host's context: it
-    /// must not report the host's model, and the chat's own native binding takes over.
-    #[test]
-    fn inherited_foreign_context_never_overrides_the_launching_chats_harness() {
-        let dir = std::env::temp_dir().join(format!("orx-run-foreign-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("orx-identity-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
-        store.conn.execute("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'opencode', 1, 1)", []).unwrap();
-        let host = InvocationIdentity {
-            harness: "codex".into(),
-            model: "gpt-6-astra".into(),
-            provider: None,
+        store.begin_usage_execution("e", "t", "codex").unwrap();
+        let measured = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Default::default()
         };
-        let event =
-            serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
         store
-            .reserve_run_telemetry(
-                "run",
-                Some(&host),
-                Some("s"),
+            .record_usage_sample("e", "a", "codex", None, None, &measured)
+            .unwrap();
+        store
+            .record_usage_sample(
+                "e",
+                "a",
+                "codex",
+                Some("gpt-6-sol"),
                 None,
-                Some(&("ev".into(), event)),
+                &TokenUsage::default(),
             )
             .unwrap();
-        let (identity, report): (Option<String>, String) = store
+        store
+            .record_usage_sample("e", "a", "codex", None, None, &measured)
+            .unwrap();
+        let (model, usage): (Option<String>, String) = store
             .conn
             .query_row(
-                "SELECT identity_json, report_json FROM run_telemetry",
+                "SELECT model, usage_json FROM chat_usage_samples",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
-        let properties = &report["events"][0]["properties"];
-        assert!(identity.is_none());
-        assert_eq!(properties["harness"], "opencode");
-        assert_eq!(properties["model"], serde_json::Value::Null);
-        assert_eq!(properties["attributionReason"], "invoker_not_linked");
+        assert_eq!(model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(
+            serde_json::from_str::<TokenUsage>(&usage).unwrap(),
+            measured
+        );
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

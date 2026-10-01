@@ -72,286 +72,67 @@ fn codex_native_usage(usage: &Value) -> crate::store::TokenUsage {
     }
 }
 
-/// A native usage or model-output record for one (thread, turn): `(thread, turn, usage)`, with
-/// `usage` `None` for output that proves the turn's model ran.
-type NativeRecord = (
-    String,
-    String,
-    Option<(crate::store::TokenUsage, crate::store::TokenUsage)>,
-);
-
-fn native_record(method: &str, params: &Value) -> Option<NativeRecord> {
-    let thread = params.get("threadId").and_then(Value::as_str)?;
-    let turn = event_turn_id(params)?;
-    let usage = match method {
-        "thread/tokenUsage/updated" => Some((
-            codex_native_usage(params.pointer("/tokenUsage/total")?),
-            codex_native_usage(params.pointer("/tokenUsage/last")?),
-        )),
-        "item/completed" if item_to_part(params.get("item")?, false, &[]).is_some() => None,
-        _ => return None,
-    };
-    Some((thread.to_string(), turn.to_string(), usage))
-}
-
-/// Per app-server connection: the model each native (thread, turn) ran, and the sub-agent turns
-/// reported as their own executions because no parent turn was listening.
-#[derive(Default)]
-pub(crate) struct NativeTurns {
-    session_id: String,
-    models: std::sync::Mutex<HashMap<(String, String), String>>,
-    late: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
-}
-
-impl NativeTurns {
-    pub(crate) fn new(session_id: &str) -> Self {
-        Self {
-            session_id: session_id.to_string(),
-            ..Self::default()
-        }
-    }
-
-    /// The model (thread, turn) natively ran: `model/rerouted` first, else its rollout record.
-    fn model(&self, thread: &str, turn: &str) -> Option<String> {
-        let key = (thread.to_string(), turn.to_string());
-        if let Some(model) = self.models.lock().unwrap().get(&key) {
-            return Some(model.clone());
-        }
-        // ponytail: rereads the rollout once per (thread, turn); index it if rollouts grow huge.
-        let model = rollout_turns(&rollout_text(thread)).0.remove(turn)?;
-        self.models.lock().unwrap().insert(key, model.clone());
-        Some(model)
-    }
-
-    fn is_late(&self, thread: &str, turn: &str) -> bool {
-        self.late
-            .lock()
-            .unwrap()
-            .contains(&(thread.to_string(), turn.to_string()))
-    }
-
-    /// Every notification, from the connection's read loop. Keeps `model/rerouted` authoritative
-    /// (durably, for `thread_invoker`) and reports sub-agent work no parent turn listens to as its
-    /// own execution, closed by the sub-agent's native `turn/completed`.
-    pub(crate) fn observe(
-        &self,
-        open: impl Fn() -> Result<Store>,
-        main_thread: Option<&str>,
-        method: &str,
-        params: &Value,
-        listening: bool,
-    ) -> Result<()> {
-        let (Some(thread), Some(turn)) = (
-            params.get("threadId").and_then(Value::as_str),
-            event_turn_id(params),
-        ) else {
-            return Ok(());
-        };
-        let key = (thread.to_string(), turn.to_string());
-        if method == "model/rerouted" {
-            let Some(model) = params.get("toModel").and_then(Value::as_str) else {
-                return Ok(());
-            };
-            self.models.lock().unwrap().insert(key, model.to_string());
-            let identity = crate::store::InvocationIdentity {
-                harness: "codex".into(),
-                model: model.to_string(),
-                provider: None,
-            };
-            return open()?.record_native_invocation(
-                &format!("codex-reroute:{thread}:{turn}"),
-                &identity,
-                Some(&self.session_id),
-            );
-        }
-        let late = self.is_late(thread, turn);
-        if main_thread == Some(thread) || (listening && !late) {
-            return Ok(());
-        }
-        let execution = format!("native:codex:{thread}:{turn}");
-        if method == "turn/completed" {
-            if late {
-                self.late.lock().unwrap().remove(&key);
-                let outcome = match params.pointer("/turn/status").and_then(Value::as_str) {
-                    Some("completed") => "done",
-                    Some("interrupted") => "cancelled",
-                    _ => "failed",
-                };
-                open()?.finalize_usage_execution(&execution, outcome)?;
-            }
-            return Ok(());
-        }
-        let Some((_, _, usage)) = native_record(method, params) else {
-            return Ok(());
-        };
-        let store = open()?;
-        // Resuming replays the root's earlier usage before `resumed_thread` is set: the chat's
-        // stored root is never a sub-agent.
-        let root = store
-            .get_chat_session(&self.session_id)?
-            .and_then(|chat| chat.native_session_id);
-        if root.as_deref() == Some(thread)
-            || !store.begin_native_execution(&execution, &self.session_id, "codex")?
-        {
-            return Ok(());
-        }
-        self.late.lock().unwrap().insert(key);
-        let attribution = crate::store::Attribution::native(
-            "codex",
-            self.model(thread, turn).as_deref(),
-            None,
-            crate::store::Missing::ChildModelUnknown,
-        );
-        match usage {
-            Some((total, last)) => store.record_cumulative_usage(
-                &execution,
-                "codex",
-                thread,
-                turn,
-                &attribution,
-                &total,
-                &last,
-            ),
-            None => store.record_attributed_sample(
-                &execution,
-                &format!("{thread}:{turn}:identity"),
-                "codex",
-                &attribution,
-                &Default::default(),
-                false,
-                false,
-            ),
-        }
-    }
-
-    /// The connection died: its sub-agents stopped with it.
-    pub(crate) fn close(&self, store: &Store) -> Result<()> {
-        let late: Vec<_> = self.late.lock().unwrap().drain().collect();
-        for (thread, turn) in late {
-            store
-                .finalize_usage_execution(&format!("native:codex:{thread}:{turn}"), "cancelled")?;
-        }
-        Ok(())
-    }
-}
-
-fn rollout_text(thread: &str) -> String {
-    native_store::codex_session(thread)
-        .ok()
-        .flatten()
-        .and_then(|session| std::fs::read_to_string(session.path).ok())
-        .unwrap_or_default()
-}
-
-/// Each native turn's model in a rollout (`turn_context`, then any recorded `model_reroute`), and
-/// the turn still running when it was read.
-fn rollout_turns(text: &str) -> (HashMap<String, String>, Option<String>) {
-    let mut models = HashMap::new();
-    let (mut current, mut running) = (None::<String>, None::<String>);
-    for line in text.lines() {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let payload = &record["payload"];
-        let turn = payload["turn_id"].as_str().map(str::to_string);
-        match (record["type"].as_str(), payload["type"].as_str()) {
-            (Some("turn_context"), _) => {
-                if let (Some(turn), Some(model)) = (&turn, payload["model"].as_str()) {
-                    models.insert(turn.clone(), model.to_string());
-                }
-                current = turn;
-            }
-            (Some("event_msg"), Some("model_reroute")) => {
-                if let (Some(turn), Some(model)) = (&current, payload["to_model"].as_str()) {
-                    models.insert(turn.clone(), model.to_string());
-                }
-            }
-            (Some("event_msg"), Some("task_started")) => running = turn,
-            (Some("event_msg"), Some("task_complete" | "turn_aborted")) => running = None,
-            _ => {}
-        }
-    }
-    (models, running)
-}
-
-/// The invoking identity of a shell tool running in `thread` (its `CODEX_THREAD_ID`): the thread's
-/// running turn, whose model a live `model/rerouted` overrides. `None` once no turn is running.
-/// Only for a stored Codex chat whose native thread is `thread` or its sub-agents' root: a
-/// `CODEX_THREAD_ID` inherited from a host Codex outside this chat names a different agent.
-pub(crate) fn chat_thread_invoker(
-    session: &str,
-    thread: &str,
-) -> Option<crate::store::InvocationIdentity> {
-    chat_invoker(&Store::open().ok()?, session, thread, &rollout_text(thread))
-}
-
-fn chat_invoker(
-    store: &Store,
-    session: &str,
-    thread: &str,
-    rollout: &str,
-) -> Option<crate::store::InvocationIdentity> {
-    let chat = store.get_chat_session(session).ok()??;
-    let root = chat.native_session_id.filter(|_| chat.harness == "codex")?;
-    // A sub-agent rollout names its root session in `session_meta`.
-    let meta = rollout
-        .lines()
-        .next()
-        .and_then(|line| serde_json::from_str::<Value>(line).ok())
-        .unwrap_or_default();
-    let ours = thread == root
-        || ["/payload/session_id", "/payload/parent_thread_id"]
-            .iter()
-            .any(|pointer| meta.pointer(pointer).and_then(Value::as_str) == Some(root.as_str()));
-    ours.then(|| invoker_of(store, thread, rollout)).flatten()
-}
-
-fn invoker_of(
-    store: &Store,
-    thread: &str,
-    rollout: &str,
-) -> Option<crate::store::InvocationIdentity> {
-    let (mut models, running) = rollout_turns(rollout);
-    let turn = running?;
-    let rerouted = store
-        .native_invocation_identity("codex", &format!("codex-reroute:{thread}:{turn}"))
-        .ok()
-        .flatten();
-    rerouted.or_else(|| {
-        Some(crate::store::InvocationIdentity {
-            harness: "codex".into(),
-            model: models.remove(&turn)?,
-            provider: None,
-        })
-    })
-}
-
-/// Records one turn-scoped notification into the turn's execution.
-fn capture_native(ctx: &TurnCtx, client: &CodexClient, method: &str, params: &Value, child: bool) {
-    let Some((thread, turn, usage)) = native_record(method, params) else {
+/// Records token usage under the model that (thread, turn) natively ran: `model/rerouted` wins,
+/// else the thread's own rollout `turn_context` (notifications carry only configuration).
+fn capture_token_notification(
+    ctx: &mut TurnCtx,
+    models: &mut HashMap<(String, String), String>,
+    method: &str,
+    params: &Value,
+) {
+    let (Some(thread), Some(turn)) = (
+        params.get("threadId").and_then(Value::as_str),
+        event_turn_id(params),
+    ) else {
         return;
     };
-    // A sub-agent turn that started with no parent listening stays its own execution.
-    if child && client.native.is_late(&thread, &turn) {
+    let key = (thread.to_string(), turn.to_string());
+    if method == "model/rerouted" {
+        if let Some(model) = params.get("toModel").and_then(Value::as_str) {
+            models.insert(key, model.to_string());
+        }
         return;
     }
-    let model = client.native.model(&thread, &turn);
-    let attribution = ctx.native_attribution(
-        model.as_deref(),
-        None,
-        crate::store::Missing::unidentified(child),
+    let (true, Some(total), Some(last)) = (
+        method == "thread/tokenUsage/updated",
+        params.pointer("/tokenUsage/total"),
+        params.pointer("/tokenUsage/last"),
+    ) else {
+        return;
+    };
+    if !models.contains_key(&key) {
+        if let Some(model) = rollout_turn_model(thread, turn) {
+            models.insert(key.clone(), model);
+        }
+    }
+    ctx.record_cumulative_usage(
+        thread,
+        turn,
+        models.get(&key).map(String::as_str),
+        codex_native_usage(total),
+        codex_native_usage(last),
     );
-    match usage {
-        Some((total, last)) => {
-            ctx.record_cumulative_usage(&thread, &turn, &attribution, total, last)
-        }
-        None => ctx.record_attributed_usage(
-            &format!("{thread}:{turn}:identity"),
-            attribution,
-            Default::default(),
-            false,
-        ),
-    }
+}
+
+/// The model in `turn`'s `turn_context` record of `thread`'s rollout.
+fn rollout_turn_model(thread: &str, turn: &str) -> Option<String> {
+    // ponytail: one blocking rollout read per (thread, turn); index it if rollouts grow huge.
+    let rollout = std::fs::read_to_string(native_store::codex_session(thread).ok()??.path).ok()?;
+    turn_context_model(&rollout, turn)
+}
+
+fn turn_context_model(rollout: &str, turn: &str) -> Option<String> {
+    rollout.lines().find_map(|line| {
+        let record: Value = serde_json::from_str(line).ok()?;
+        (record["type"] == "turn_context" && record.pointer("/payload/turn_id")? == turn)
+            .then(|| {
+                record
+                    .pointer("/payload/model")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .flatten()
+    })
 }
 
 /// Codex usage occupying the context window: `input_tokens + output_tokens`
@@ -2837,6 +2618,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     // stream on this same connection with a foreign turnId; we route them into
     // the spawning part's `children` instead of dropping them.
     let mut sub_threads: HashMap<String, SubThread> = HashMap::new();
+    let mut turn_models = HashMap::new();
     // The parent turn's `turn/completed` arrived while sub-agent threads were
     // still live — we're draining their tails before ending the turn (bounded
     // by DRAIN_QUIET_SETTLE, see the deadline below).
@@ -2921,21 +2703,9 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         match event {
             TurnEvent::Notification { method, params } => {
                 match classify_event_thread(turn_id.as_deref(), &sub_threads, &params) {
-                    EventScope::Stale => {
-                        // Not routed to this turn: an earlier turn's sub-agent reports on its own.
-                        if let Err(error) = client.native.observe(
-                            Store::open,
-                            Some(&thread_id),
-                            &method,
-                            &params,
-                            false,
-                        ) {
-                            eprintln!("orx up: could not record codex sub-agent usage: {error}");
-                        }
-                        continue;
-                    }
+                    EventScope::Stale => continue,
                     EventScope::SubAgent(tid) => {
-                        capture_native(ctx, &client, &method, &params, true);
+                        capture_token_notification(ctx, &mut turn_models, &method, &params);
                         route_sub_event(ctx, &mut sub_threads, &thread_id, &tid, &method, &params);
                         ctx.maybe_flush();
                         // Draining after the parent's turn/completed: the last
@@ -2956,7 +2726,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                     }
                     EventScope::Parent => {}
                 }
-                capture_native(ctx, &client, &method, &params, false);
+                capture_token_notification(ctx, &mut turn_models, &method, &params);
                 // Codex settled a request itself (its approval deadline hit,
                 // or our reply raced this notification): the card must not
                 // stay live. Part ids are a pure function of the request id;
@@ -3004,9 +2774,6 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                     }
                     Some(TurnEnd::Failed(message)) => {
                         sweep_open_requests(ctx, &client, &mut open_requests).await;
-                        if refused_before_execution(ctx, params.pointer("/turn/error")) {
-                            ctx.mark_delivery(DeliveryState::Rejected);
-                        }
                         settle_running_subagents(&mut ctx.assistant.parts);
                         // A terminal `error` notification may have already
                         // pushed this exact message — don't render it twice.
@@ -3402,26 +3169,6 @@ fn has_error_part(ctx: &TurnCtx, message: &str) -> bool {
             .as_ref()
             .is_some_and(|s| s.status == "error" && s.error.as_deref() == Some(message))
     })
-}
-
-/// The provider refused the turn's model itself (codex 0.156: 400 `invalid_request_error`, "model is
-/// not supported") before any output, so nothing executed.
-fn refused_before_execution(ctx: &TurnCtx, error: Option<&Value>) -> bool {
-    let body = error
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .and_then(|message| serde_json::from_str::<Value>(message).ok())
-        .unwrap_or_default();
-    body["status"] == 400
-        && body["error"]["type"] == "invalid_request_error"
-        && body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("model is not supported"))
-        && ctx
-            .assistant
-            .parts
-            .iter()
-            .all(|part| part.tool.as_deref() == Some("error"))
 }
 
 fn retry_after(error: &JsonRpcError) -> Option<Duration> {
@@ -6151,271 +5898,20 @@ requires_openai_auth = false
         );
     }
 
-    /// Rollout `turn_context` names each turn's model, a recorded reroute replaces it, and only a
-    /// running turn can be a shell tool's invoker; a live `model/rerouted` outranks the rollout.
+    /// Each turn's model is its own native `turn_context`, never the thread's configuration.
     #[test]
-    fn rollout_and_reroute_name_the_invoking_turns_model() {
-        let line =
-            |kind: &str, payload: Value| json!({"type": kind, "payload": payload}).to_string();
+    fn turn_context_names_each_turns_model() {
         let rollout = [
-            line("event_msg", json!({"type": "task_started", "turn_id": "t1"})),
-            line("turn_context", json!({"turn_id": "t1", "model": "gpt-6-sol"})),
-            line("event_msg", json!({"type": "task_complete", "turn_id": "t1"})),
-            line("event_msg", json!({"type": "task_started", "turn_id": "t2"})),
-            line("turn_context", json!({"turn_id": "t2", "model": "gpt-6-sol"})),
-            line("event_msg", json!({"type": "model_reroute", "from_model": "gpt-6-sol", "to_model": "gpt-6-luna"})),
+            json!({"type": "session_meta", "payload": {"id": "th"}}),
+            json!({"type": "turn_context", "payload": {"turn_id": "t1", "model": "gpt-6-sol"}}),
+            json!({"type": "turn_context", "payload": {"turn_id": "t2", "model": "gpt-6-luna"}}),
         ]
+        .map(|record| record.to_string())
         .join("\n");
-        let (models, running) = rollout_turns(&rollout);
-        assert_eq!(models["t1"], "gpt-6-sol");
-        assert_eq!(models["t2"], "gpt-6-luna");
-        assert_eq!(running.as_deref(), Some("t2"));
-        let dir = std::env::temp_dir().join(format!("orx-codex-invoker-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
         assert_eq!(
-            invoker_of(&store, "th", &rollout).unwrap().model,
-            "gpt-6-luna"
+            turn_context_model(&rollout, "t2").as_deref(),
+            Some("gpt-6-luna")
         );
-        let native = NativeTurns::new("s");
-        let open = || Store::open_at(dir.clone());
-        native
-            .observe(
-                open,
-                None,
-                "model/rerouted",
-                &json!({"threadId": "th", "turnId": "t2", "toModel": "gpt-6-astra"}),
-                true,
-            )
-            .unwrap();
-        assert_eq!(
-            invoker_of(&store, "th", &rollout).unwrap().model,
-            "gpt-6-astra"
-        );
-        // Only a Codex chat's own thread tree; a host Codex's inherited thread id names another agent.
-        let child = format!(
-            "{}\n{rollout}",
-            json!({"type": "session_meta", "payload": {"id": "th", "session_id": "root", "parent_thread_id": "root"}})
-        );
-        store
-            .conn_for_tests()
-            .execute_batch("INSERT INTO chat_sessions (id, project_id, harness, native_session_id, created_at, updated_at) VALUES ('codex-chat', 'p', 'codex', 'root', 1, 1), ('other-chat', 'p', 'opencode', 'root', 1, 1);")
-            .unwrap();
-        assert_eq!(
-            chat_invoker(&store, "codex-chat", "th", &child)
-                .unwrap()
-                .model,
-            "gpt-6-astra"
-        );
-        assert!(chat_invoker(&store, "codex-chat", "th", &rollout).is_none());
-        assert!(chat_invoker(&store, "other-chat", "th", &child).is_none());
-        let done = format!(
-            "{rollout}\n{}",
-            line(
-                "event_msg",
-                json!({"type": "task_complete", "turn_id": "t2"})
-            )
-        );
-        assert!(invoker_of(&store, "th", &done).is_none());
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Sub-agent turns no parent turn listens to are their own executions with their own model,
-    /// closed by their native end, the connection's death, or restart recovery — never dropped.
-    #[test]
-    fn unlistened_sub_agent_turns_report_independently_until_they_end() {
-        let tokens = |thread: &str, turn: &str, total: u64, last: u64| {
-            json!({"threadId": thread, "turnId": turn, "tokenUsage": {
-                "total": {"inputTokens": total, "outputTokens": 1},
-                "last": {"inputTokens": last, "outputTokens": 1}}})
-        };
-        let completed = |thread: &str, turn: &str, status: &str| json!({"threadId": thread, "turn": {"id": turn, "status": status}});
-        let dir = std::env::temp_dir().join(format!("orx-codex-late-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .conn_for_tests()
-            .execute_batch("INSERT INTO chat_sessions (id, project_id, harness, native_session_id, created_at, updated_at) VALUES ('s', 'p', 'codex', 'main', 1, 1);
-                INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{}', 'completed', 'accepted', 1, 1);")
-            .unwrap();
-        let native = NativeTurns::new("s");
-        let open = || Store::open_at(dir.clone());
-        let observe = |method: &str, params: Value, listening: bool| {
-            native
-                .observe(open, Some("main"), method, &params, listening)
-                .unwrap()
-        };
-        // Resume replays the root's previous turn before the connection knows its root: never a
-        // sub-agent, so already reported usage is not reported again.
-        native
-            .observe(
-                open,
-                None,
-                "thread/tokenUsage/updated",
-                &tokens("main", "told", 71650, 71650),
-                false,
-            )
-            .unwrap();
-        // Natively rerouted child, running with no parent listener; a later parent turn's
-        // listener does not take it over, and its native end closes it.
-        observe(
-            "model/rerouted",
-            json!({"threadId": "a", "turnId": "ta", "toModel": "gpt-6-luna"}),
-            false,
-        );
-        observe(
-            "thread/tokenUsage/updated",
-            tokens("a", "ta", 100, 100),
-            false,
-        );
-        observe(
-            "thread/tokenUsage/updated",
-            tokens("a", "ta", 150, 50),
-            true,
-        );
-        observe("turn/completed", completed("a", "ta", "completed"), true);
-        // An unidentified child, cut off by the connection's death.
-        observe(
-            "thread/tokenUsage/updated",
-            tokens("b", "tb", 30, 30),
-            false,
-        );
-        // A child first seen while the parent listened keeps that usage in the parent's turn; only
-        // its later requests are its own, and the parent's model change never becomes its model.
-        store
-            .begin_usage_execution("turn-exec", "t", "codex")
-            .unwrap();
-        let unknown = crate::store::Attribution::Unresolved {
-            reason: crate::store::Missing::ChildModelUnknown,
-        };
-        let usage = |input: u64| crate::store::TokenUsage {
-            input_tokens: Some(input),
-            output_tokens: Some(1),
-            ..Default::default()
-        };
-        store
-            .record_cumulative_usage(
-                "turn-exec",
-                "codex",
-                "e",
-                "te",
-                &unknown,
-                &usage(100),
-                &usage(100),
-            )
-            .unwrap();
-        observe(
-            "model/rerouted",
-            json!({"threadId": "main", "turnId": "tm", "toModel": "gpt-6-astra"}),
-            false,
-        );
-        observe(
-            "thread/tokenUsage/updated",
-            tokens("e", "te", 160, 60),
-            false,
-        );
-        // An earlier turn's child while a new parent turn listens: the read loop leaves it to the
-        // turn, which finds it unrouted (Stale) and hands it back once.
-        observe("thread/tokenUsage/updated", tokens("f", "tf", 40, 40), true);
-        observe(
-            "thread/tokenUsage/updated",
-            tokens("f", "tf", 40, 40),
-            false,
-        );
-        observe("thread/tokenUsage/updated", tokens("f", "tf", 40, 40), true);
-        observe("turn/completed", completed("f", "tf", "completed"), true);
-        observe("turn/completed", completed("f", "tf", "completed"), false);
-        // Parent-thread and listened-to work belongs to the chat turn, not here.
-        observe(
-            "thread/tokenUsage/updated",
-            tokens("main", "tm", 9, 9),
-            false,
-        );
-        observe("thread/tokenUsage/updated", tokens("c", "tc", 9, 9), true);
-        native.close(&store).unwrap();
-        // One still open across a restart is closed by recovery.
-        let restarted = NativeTurns::new("s");
-        restarted
-            .observe(
-                open,
-                Some("main"),
-                "thread/tokenUsage/updated",
-                &tokens("d", "td", 7, 7),
-                false,
-            )
-            .unwrap();
-        drop(store);
-        let store = Store::open_at(dir.clone()).unwrap();
-        store.recover_terminal_usage().unwrap();
-        let outcomes: Vec<(String, String)> = store
-            .conn_for_tests()
-            .prepare(
-                "SELECT execution_id, outcome FROM chat_usage_executions ORDER BY execution_id",
-            )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(
-            outcomes,
-            [
-                ("native:codex:a:ta".to_string(), "done".to_string()),
-                ("native:codex:b:tb".into(), "cancelled".into()),
-                ("native:codex:d:td".into(), "done".into()),
-                ("native:codex:e:te".into(), "cancelled".into()),
-                ("native:codex:f:tf".into(), "done".into()),
-                ("turn-exec".into(), "done".into()),
-            ]
-        );
-        let reports = store.test_usage_reports("done").unwrap();
-        let summary: Vec<_> = reports
-            .iter()
-            .map(|r| {
-                (
-                    r["attribution"].clone(),
-                    r["model"].clone(),
-                    r["attributionReason"].clone(),
-                    r["inputTokens"].clone(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                (json!("exact"), json!("gpt-6-luna"), Value::Null, json!(150)),
-                (
-                    json!("unresolved"),
-                    Value::Null,
-                    json!("child_model_unknown"),
-                    json!(30)
-                ),
-                (
-                    json!("unresolved"),
-                    Value::Null,
-                    json!("child_model_unknown"),
-                    json!(7)
-                ),
-                (
-                    json!("unresolved"),
-                    Value::Null,
-                    json!("child_model_unknown"),
-                    json!(60)
-                ),
-                (
-                    json!("unresolved"),
-                    Value::Null,
-                    json!("child_model_unknown"),
-                    json!(40)
-                ),
-                (
-                    json!("unresolved"),
-                    Value::Null,
-                    json!("child_model_unknown"),
-                    json!(100)
-                ),
-            ]
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(turn_context_model(&rollout, "t3"), None);
     }
 }

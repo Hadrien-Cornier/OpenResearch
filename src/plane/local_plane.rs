@@ -259,6 +259,7 @@ impl LocalPlane {
             args.backend = Some("local".to_string());
         }
         crate::compute::validate_run_args(&args)?;
+        args.agent_origin = crate::agent_origin();
         // Coarse backend label for analytics; the backend name is already an
         // enum, never user data. Recorded before the (borrowing) dispatch below.
         let backend_label = args.backend.clone();

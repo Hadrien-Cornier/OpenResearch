@@ -810,17 +810,20 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         cancel_requested: false,
         chat_session_id: args.launching_chat_session(),
     };
+    let chat_harness = match &pending.chat_session_id {
+        Some(session) => store.get_chat_session(session)?.map(|chat| chat.harness),
+        None => None,
+    };
     let identity = args.invocation_identity()?;
     let report = (!args.telemetry_suppressed)
         .then(|| {
             crate::telemetry::pending_event_payload(
                 "experiment_finished",
-                serde_json::json!({
-                    "harness": identity.as_ref().map(|identity| &identity.harness),
-                    "model": identity.as_ref().map(|identity| &identity.model),
-                    "provider": identity.as_ref().and_then(|identity| identity.provider.as_ref()),
-                    "status": "failed",
-                }),
+                run_attribution(
+                    identity.as_ref(),
+                    chat_harness,
+                    args.agent_origin.as_deref(),
+                ),
             )
         })
         .flatten();
@@ -829,7 +832,6 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         &pending,
         args.force,
         identity.as_ref(),
-        args.launching_agent_origin().as_deref(),
         report.as_ref(),
     )?;
     let pending_backend_json = descriptor.to_json();
@@ -870,12 +872,62 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     }
 }
 
+/// The run report's invoker: the forwarded native identity, else an explicit exception. A context
+/// inherited from another agent around the app never stands in for the launching chat's own.
+fn run_attribution(
+    identity: Option<&crate::store::InvocationIdentity>,
+    chat_harness: Option<String>,
+    agent_origin: Option<&str>,
+) -> serde_json::Value {
+    let identity = identity.filter(|identity| {
+        chat_harness
+            .as_ref()
+            .is_none_or(|harness| *harness == identity.harness)
+    });
+    let (harness, model, provider, attribution, reason) = match (identity, chat_harness) {
+        (Some(identity), _) => (
+            Some(identity.harness.clone()),
+            Some(identity.model.clone()),
+            identity.provider.clone(),
+            "exact",
+            None,
+        ),
+        (None, Some(harness)) => (
+            Some(harness),
+            None,
+            None,
+            "unresolved",
+            Some("invoker_not_linked"),
+        ),
+        // The origin can arrive over HTTP: only the known marker labels reach telemetry.
+        (None, None) => match agent_origin.filter(|origin| {
+            ["claude-code", "codex", "opencode", "cursor", "unknown"].contains(origin)
+        }) {
+            Some(origin) => (
+                Some(origin.to_string()).filter(|origin| origin != "unknown"),
+                None,
+                None,
+                "unresolved",
+                Some("external_agent"),
+            ),
+            None => (None, None, None, "manual", None),
+        },
+    };
+    serde_json::json!({
+        "harness": harness,
+        "model": model,
+        "provider": provider,
+        "attribution": attribution,
+        "attributionReason": reason,
+        "status": "failed",
+    })
+}
+
 fn reserve_run(
     store: &Store,
     pending: &StoredRun,
     force: bool,
     identity: Option<&crate::store::InvocationIdentity>,
-    agent_origin: Option<&str>,
     report: Option<&(String, serde_json::Value)>,
 ) -> Result<()> {
     let dir = crate::store::data_dir().join("submission-locks");
@@ -904,13 +956,7 @@ fn reserve_run(
         }
     }
     let tx = store.begin()?;
-    store.reserve_run_telemetry(
-        &pending.id,
-        identity,
-        pending.chat_session_id.as_deref(),
-        agent_origin,
-        report,
-    )?;
+    store.reserve_run_telemetry(&pending.id, identity, report)?;
     store.upsert_run(pending)?;
     tx.commit()?;
     Ok(())
@@ -972,26 +1018,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launch_origin_comes_from_native_markers_and_never_from_a_forwarding_server() {
-        let env = |keys: &'static [&'static str]| {
-            move |key: &str| keys.contains(&key).then(|| "1".to_string())
+    fn run_reports_name_the_native_invoker_or_an_explicit_exception() {
+        let identity = |harness: &str| crate::store::InvocationIdentity {
+            harness: harness.into(),
+            model: "m".into(),
+            provider: None,
         };
-        assert_eq!(
-            crate::agent_origin(env(&["CODEX_THREAD_ID"])).as_deref(),
-            Some("codex")
-        );
-        assert_eq!(
-            crate::agent_origin(env(&["CLAUDECODE", "CURSOR_AGENT"])).as_deref(),
-            Some("unknown")
-        );
-        assert_eq!(crate::agent_origin(env(&[])), None);
-        let forwarded = crate::ExpRunArgs {
-            forwarded: true,
-            ..tinker_args()
+        let row = |value: serde_json::Value| {
+            (
+                value["harness"].clone(),
+                value["model"].clone(),
+                value["attribution"].clone(),
+                value["attributionReason"].clone(),
+            )
         };
-        assert_eq!(forwarded.launching_agent_origin(), None);
-        assert_eq!(forwarded.launching_chat_session(), None);
-        assert!(forwarded.invocation_identity().unwrap().is_none());
+        let cases = [
+            (
+                Some(identity("claude-code")),
+                Some("claude-code"),
+                None,
+                ("claude-code", "m", "exact", None),
+            ),
+            // A host Codex's context inside an OpenCode chat is not this chat's invoker.
+            (
+                Some(identity("codex")),
+                Some("opencode"),
+                Some("codex"),
+                ("opencode", "", "unresolved", Some("invoker_not_linked")),
+            ),
+            (
+                None,
+                None,
+                Some("cursor"),
+                ("cursor", "", "unresolved", Some("external_agent")),
+            ),
+            (
+                None,
+                None,
+                Some("unknown"),
+                ("", "", "unresolved", Some("external_agent")),
+            ),
+            (None, None, None, ("", "", "manual", None)),
+            (None, None, Some("<script>"), ("", "", "manual", None)),
+        ];
+        for (identity, chat, origin, (harness, model, attribution, reason)) in cases {
+            let opt = |text: &str| {
+                if text.is_empty() {
+                    serde_json::json!(null)
+                } else {
+                    serde_json::json!(text)
+                }
+            };
+            assert_eq!(
+                row(run_attribution(
+                    identity.as_ref(),
+                    chat.map(str::to_string),
+                    origin
+                )),
+                (
+                    opt(harness),
+                    opt(model),
+                    serde_json::json!(attribution),
+                    serde_json::json!(reason)
+                )
+            );
+        }
     }
 
     fn tinker_args() -> crate::ExpRunArgs {
@@ -1012,7 +1103,6 @@ mod tests {
             chat_session_id: None,
             invocation_context: None,
             agent_origin: None,
-            forwarded: false,
             telemetry_suppressed: false,
         }
     }

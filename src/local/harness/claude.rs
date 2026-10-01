@@ -1499,9 +1499,9 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             let inner = event.get("event").unwrap_or(&Value::Null);
             match inner.get("type").and_then(Value::as_str) {
                 Some("message_start") => {
-                    // An interrupt kills the child before `assistant`, so the model is captured here.
+                    // An interrupt kills the child before `assistant`; the model is known here.
                     if let Some(message) = inner.get("message") {
-                        record_message(ctx, message, parent.is_some());
+                        record_message(ctx, message);
                     }
                     // Sub-agent streams have their own message ids; namespace the
                     // stream mid per parent so a concurrent sub-agent's deltas
@@ -1643,7 +1643,9 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         Some("assistant") => {
             if let Some(message) = event.get("message") {
                 ctx.record_native_invocations(message);
-                record_message(ctx, message, subagent_parent(event).is_some());
+            }
+            if let Some(message) = event.get("message") {
+                record_message(ctx, message);
             }
             if event
                 .get("error")
@@ -1931,18 +1933,27 @@ fn mark_stream_final(ctx: &mut TurnCtx, state: &TurnState) {
     }
 }
 
-/// One native message's identity and usage snapshot; an unidentified sub-agent never takes the parent's model.
-fn record_message(ctx: &TurnCtx, message: &Value, child: bool) {
-    let Some(id) = message.get("id").and_then(Value::as_str) else {
+/// One native message's model and usage snapshot, recorded even when only one is reported.
+fn record_message(ctx: &TurnCtx, message: &Value) {
+    let (Some(id), model, usage) = (
+        message.get("id").and_then(Value::as_str),
+        message.get("model").and_then(Value::as_str),
+        message.get("usage"),
+    ) else {
         return;
     };
-    let model = message.get("model").and_then(Value::as_str);
-    let usage = message.get("usage");
     if model.is_none() && usage.is_none() {
         return;
     }
-    let usage = usage.map_or_else(Default::default, |usage| {
-        let field = |key| usage.get(key).and_then(Value::as_u64);
+    let field = |key| {
+        usage
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_u64)
+    };
+    ctx.record_native_usage(
+        &format!("claude-{}:{id}", ctx.attempt_count_for_usage()),
+        model,
+        None,
         crate::store::TokenUsage {
             input_tokens: field("input_tokens")
                 .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
@@ -1952,13 +1963,7 @@ fn record_message(ctx: &TurnCtx, message: &Value, child: bool) {
             cache_read_tokens: field("cache_read_input_tokens"),
             cache_write_tokens: field("cache_creation_input_tokens"),
             reasoning_tokens: None,
-        }
-    });
-    ctx.record_attributed_usage(
-        &format!("claude-{}:{id}", ctx.attempt_count_for_usage()),
-        ctx.native_attribution(model, None, crate::store::Missing::unidentified(child)),
-        usage,
-        false,
+        },
     );
 }
 
@@ -3573,100 +3578,5 @@ mod tests {
         });
         assert!(apply_event(&mut ctx, &mut state, &result));
         assert!(ctx.assistant.parts.is_empty());
-    }
-
-    /// Native stream-json shapes → the reports the service receives.
-    #[test]
-    fn native_messages_report_identity_independently_of_usage() {
-        let usage = |output: u64| serde_json::json!({"input_tokens":3,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"output_tokens":output});
-        let start = |id: &str, model: &str| {
-            serde_json::json!({"type":"stream_event","session_id":"s1","parent_tool_use_id":null,
-                "event":{"type":"message_start","message":{"id":id,"model":model,"content":[],"usage":usage(1)}}})
-        };
-        let assistant = |id: &str, model: Value, parent: Value| {
-            serde_json::json!({"type":"assistant","session_id":"s1","parent_tool_use_id":parent,
-                "message":{"id":id,"model":model,"content":[{"type":"text","text":"Done."}],"usage":usage(20)}})
-        };
-        let result = serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"s1","result":"Done.",
-            "modelUsage":{"claude-sonnet-5-5":{"inputTokens":3,"outputTokens":20,"cacheReadInputTokens":0,"cacheCreationInputTokens":100}}});
-        let synthetic = serde_json::json!({"type":"assistant","session_id":"s1","parent_tool_use_id":null,
-            "message":{"id":"e9","model":"<synthetic>","role":"assistant",
-            "usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},
-            "content":[{"type":"text","text":"Failed to authenticate"}]}});
-        type Row = (
-            &'static str,
-            Option<&'static str>,
-            Option<&'static str>,
-            &'static str,
-        );
-        let cases: [(Vec<Value>, Vec<Row>); 4] = [
-            // Interrupted after message_start: the model ran; tokens are a partial snapshot.
-            (
-                vec![start("msg_a", "claude-opus-5-5")],
-                vec![("exact", Some("claude-opus-5-5"), None, "partial")],
-            ),
-            // An abandoned request, then a retry on another model: the aggregate replaces only its
-            // own model, and the abandoned model stays an identity without tokens.
-            (
-                vec![
-                    start("msg_a", "claude-opus-5-5"),
-                    start("msg_b", "claude-sonnet-5-5"),
-                    assistant("msg_b", "claude-sonnet-5-5".into(), Value::Null),
-                    result,
-                ],
-                vec![
-                    ("exact", Some("claude-opus-5-5"), None, "missing"),
-                    ("exact", Some("claude-sonnet-5-5"), None, "complete"),
-                ],
-            ),
-            // A sub-agent message without a model is unknown, never its parent's.
-            (
-                vec![
-                    assistant("msg_p", "claude-opus-5-5".into(), Value::Null),
-                    assistant("msg_c", Value::Null, "toolu_task".into()),
-                ],
-                vec![
-                    ("exact", Some("claude-opus-5-5"), None, "partial"),
-                    ("unresolved", None, Some("child_model_unknown"), "partial"),
-                ],
-            ),
-            (
-                vec![synthetic],
-                vec![("unresolved", None, Some("synthetic_model"), "partial")],
-            ),
-        ];
-        for (events, expected) in cases {
-            let dir = std::env::temp_dir().join(format!("orx-claude-{}", uuid::Uuid::new_v4()));
-            let mut ctx = TurnCtx::test_capture(dir.clone(), "claude-code");
-            ctx.begin_native_usage_attempt("claude-1:").unwrap();
-            let mut state = TurnState::default();
-            for event in &events {
-                apply_event(&mut ctx, &mut state, event);
-            }
-            let reports: Vec<_> = TurnCtx::test_reports(&dir, "done")
-                .into_iter()
-                .map(|r| {
-                    (
-                        r["attribution"].as_str().unwrap().to_string(),
-                        r["model"].as_str().map(str::to_string),
-                        r["attributionReason"].as_str().map(str::to_string),
-                        r["coverage"].as_str().unwrap().to_string(),
-                    )
-                })
-                .collect();
-            let expected: Vec<_> = expected
-                .into_iter()
-                .map(|(a, m, r, c)| {
-                    (
-                        a.to_string(),
-                        m.map(str::to_string),
-                        r.map(str::to_string),
-                        c.to_string(),
-                    )
-                })
-                .collect();
-            assert_eq!(reports, expected, "{events:?}");
-            std::fs::remove_dir_all(dir).unwrap();
-        }
     }
 }

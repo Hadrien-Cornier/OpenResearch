@@ -9,7 +9,7 @@
 //! `~/.local/share/openresearch`.
 
 mod telemetry;
-pub(crate) use telemetry::{Attribution, InvocationIdentity, Missing, TokenUsage};
+pub(crate) use telemetry::{InvocationIdentity, TokenUsage};
 
 use std::path::{Path, PathBuf};
 
@@ -463,8 +463,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS run_telemetry (
                 run_id TEXT PRIMARY KEY,
                 identity_json TEXT,
-                report_json TEXT,
-                pending_since INTEGER
+                report_json TEXT
             );
             CREATE TABLE IF NOT EXISTS telemetry_pending_events (
                 event_id TEXT PRIMARY KEY,
@@ -498,7 +497,6 @@ impl Store {
                 provider TEXT,
                 usage_json TEXT NOT NULL,
                 complete INTEGER NOT NULL DEFAULT 0,
-                attribution_json TEXT,
                 PRIMARY KEY (execution_id, sample_id)
             );
             CREATE TABLE IF NOT EXISTS local_projects (
@@ -671,9 +669,6 @@ impl Store {
             "ALTER TABLE native_invocation_identities ADD COLUMN session_id TEXT",
             "ALTER TABLE native_invocation_identities ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_usage_samples ADD COLUMN complete INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE chat_usage_samples ADD COLUMN attribution_json TEXT",
-            "ALTER TABLE run_telemetry ADD COLUMN pending_since INTEGER",
-            "ALTER TABLE chat_sessions ADD COLUMN native_owners_json TEXT",
             "ALTER TABLE runs ADD COLUMN commit_sha TEXT",
             "ALTER TABLE runs ADD COLUMN result_markdown TEXT",
             "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
@@ -716,7 +711,6 @@ impl Store {
         ] {
             let _ = conn.execute(ddl, []);
         }
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS chat_usage_samples_sample ON chat_usage_samples (sample_id);")?;
         conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
         conn.execute(
             "DELETE FROM native_invocation_identities WHERE session_id IS NULL AND created_at < ?1",

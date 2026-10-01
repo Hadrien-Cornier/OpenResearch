@@ -72,13 +72,14 @@ fn inspect_connection(connection: &Connection) -> Result<DatabaseState> {
                 "Unsupported or incomplete OpenCode V2 database schema"
             ));
         }
-        let applied = |id: &str| -> Result<bool> {
-            Ok(connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM migration WHERE id = ?1 AND time_completed IS NOT NULL)",
-                [id],
-                |row| row.get(0),
-            )?)
-        };
+        let schema_applied: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM migration WHERE id = '20260910120000_clear_v1_session_permission' AND time_completed IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !schema_applied {
+            return Ok(DatabaseState::V2Pending);
+        }
         let has_legacy = has_columns(connection, "session", &["id"])?;
         let marker: Option<String> = connection
             .query_row(
@@ -87,18 +88,6 @@ fn inspect_connection(connection: &Connection) -> Result<DatabaseState> {
                 |row| row.get(0),
             )
             .optional()?;
-        if !applied("20260910120000_clear_v1_session_permission")? {
-            // Beta 19271 ends at this migration and bootstraps fresh stores atomically;
-            // its V1 upgrade is unverified, so any legacy history stays pending.
-            let fresh_beta = !has_legacy
-                && marker.is_none()
-                && applied("20260823191254_nullable_workspace_binding")?;
-            return Ok(if fresh_beta {
-                DatabaseState::V2Ready
-            } else {
-                DatabaseState::V2Pending
-            });
-        }
         return match marker {
             None if !has_legacy => Ok(DatabaseState::V2Ready),
             None => Ok(DatabaseState::V2Pending),
@@ -144,126 +133,6 @@ fn table_has_session(connection: &Connection, table: &str, id: &str) -> Result<b
         [id],
         |row| row.get(0),
     )?)
-}
-
-/// One executed native model step in a session tree: `tokens` is the native counter object, absent
-/// while the step only proves its model ran.
-#[derive(Debug, PartialEq)]
-pub(crate) struct NativeStep {
-    pub id: String,
-    pub child: bool,
-    pub model: Option<String>,
-    pub provider: Option<String>,
-    pub tokens: Option<serde_json::Value>,
-    /// Natively finished: nothing about it changes any more.
-    pub done: bool,
-}
-
-/// Executed assistant steps created since `since` and changed since `updated` (ms) in `root`'s
-/// session tree. V1 reports each `step-finish` part, plus an identity for a finished message that
-/// produced output without one; V2 reports each assistant message, measured once it completes.
-pub(crate) fn native_steps(
-    path: &Path,
-    root: &str,
-    since: i64,
-    updated: i64,
-) -> Result<Vec<NativeStep>> {
-    let connection = open_readonly(path)?;
-    let v2 = has_columns(&connection, "session_v2", &["parent_id"])?
-        && table_has_session(&connection, "session_v2", root)?;
-    let sql = if v2 {
-        "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT s.id FROM session_v2 s JOIN tree ON s.parent_id = tree.id)
-         SELECT m.id, m.session_id, json_extract(m.data, '$.model.id'), json_extract(m.data, '$.model.providerID'),
-                CASE WHEN json_extract(m.data, '$.time.completed') IS NOT NULL THEN json_extract(m.data, '$.tokens') END,
-                json_extract(m.data, '$.time.streamed') IS NOT NULL OR json_array_length(m.data, '$.content') > 0,
-                json_extract(m.data, '$.time.completed') IS NOT NULL OR json_extract(m.data, '$.error') IS NOT NULL
-         FROM session_message m JOIN tree ON m.session_id = tree.id
-         WHERE m.type = 'assistant' AND m.time_created >= ?2 AND m.time_updated >= ?3 ORDER BY m.time_created, m.id"
-    } else {
-        "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT s.id FROM session s JOIN tree ON s.parent_id = tree.id)
-         SELECT COALESCE(p.id, m.id), m.session_id, json_extract(m.data, '$.modelID'), json_extract(m.data, '$.providerID'),
-                json_extract(p.data, '$.tokens'),
-                p.id IS NOT NULL OR ((json_extract(m.data, '$.time.completed') IS NOT NULL OR json_extract(m.data, '$.error') IS NOT NULL)
-                    AND EXISTS (SELECT 1 FROM part o WHERE o.message_id = m.id AND json_extract(o.data, '$.type') IN ('text', 'reasoning', 'tool'))),
-                1
-         FROM message m JOIN tree ON m.session_id = tree.id
-         LEFT JOIN part p ON p.message_id = m.id AND json_extract(p.data, '$.type') = 'step-finish'
-         WHERE json_extract(m.data, '$.role') = 'assistant' AND m.time_created >= ?2
-           AND MAX(m.time_updated, COALESCE(p.time_updated, 0)) >= ?3
-           AND (p.id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM part f WHERE f.message_id = m.id AND json_extract(f.data, '$.type') = 'step-finish'))
-         ORDER BY m.time_created, m.id"
-    };
-    let mut query = connection.prepare(sql)?;
-    let rows = query.query_map(rusqlite::params![root, since, updated], |row| {
-        Ok((
-            NativeStep {
-                id: row.get(0)?,
-                child: row.get::<_, String>(1)? != root,
-                model: row.get(2)?,
-                provider: row.get(3)?,
-                tokens: row
-                    .get::<_, Option<String>>(4)?
-                    .and_then(|json| serde_json::from_str(&json).ok()),
-                done: row.get(6)?,
-            },
-            row.get::<_, bool>(5)?,
-        ))
-    })?;
-    let mut steps = Vec::new();
-    for row in rows {
-        let (step, executed) = row?;
-        if executed {
-            steps.push(step);
-        }
-    }
-    Ok(steps)
-}
-
-/// (model, provider, child) of each tool call in `root`'s tree whose command launched a run
-/// (`exp run`) and whose native output names `run_id`, and the start times of assistant steps
-/// there still unfinished natively (V2: their session has not gone idle since they began).
-#[allow(clippy::type_complexity)]
-pub(crate) fn run_launchers(
-    path: &Path,
-    root: &str,
-    run_id: &str,
-) -> Result<(Vec<(Option<String>, Option<String>, bool)>, Vec<i64>)> {
-    let connection = open_readonly(path)?;
-    let v2 = has_columns(&connection, "session_v2", &["parent_id"])?
-        && table_has_session(&connection, "session_v2", root)?;
-    let (launchers, unfinished) = if v2 {
-        ("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT s.id FROM session_v2 s JOIN tree ON s.parent_id = tree.id)
-          SELECT json_extract(m.data, '$.model.id'), json_extract(m.data, '$.model.providerID'), m.session_id
-          FROM session_message m JOIN tree ON m.session_id = tree.id, json_each(m.data, '$.content') c
-          WHERE m.type = 'assistant' AND json_extract(c.value, '$.type') = 'tool'
-            AND instr(lower(json_extract(c.value, '$.state.input.command')), 'exp run') > 0
-            AND instr(lower(json_extract(c.value, '$.state.content')), lower(?2)) > 0",
-         "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT s.id FROM session_v2 s JOIN tree ON s.parent_id = tree.id)
-          SELECT m.time_created FROM session_message m JOIN tree ON m.session_id = tree.id JOIN session_v2 s ON s.id = m.session_id
-            WHERE m.type = 'assistant' AND json_extract(m.data, '$.time.completed') IS NULL AND json_extract(m.data, '$.error') IS NULL
-              AND (s.time_idle IS NULL OR s.time_idle < m.time_created)")
-    } else {
-        ("WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT s.id FROM session s JOIN tree ON s.parent_id = tree.id)
-          SELECT json_extract(m.data, '$.modelID'), json_extract(m.data, '$.providerID'), p.session_id
-          FROM part p JOIN tree ON p.session_id = tree.id JOIN message m ON m.id = p.message_id
-          WHERE json_extract(p.data, '$.type') = 'tool'
-            AND instr(lower(json_extract(p.data, '$.state.input.command')), 'exp run') > 0
-            AND instr(lower(json_extract(p.data, '$.state.output')), lower(?2)) > 0",
-         "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT s.id FROM session s JOIN tree ON s.parent_id = tree.id)
-          SELECT m.time_created FROM message m JOIN tree ON m.session_id = tree.id WHERE json_extract(m.data, '$.role') = 'assistant'
-            AND json_extract(m.data, '$.time.completed') IS NULL AND json_extract(m.data, '$.error') IS NULL")
-    };
-    let found = connection
-        .prepare(launchers)?
-        .query_map(rusqlite::params![root, run_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)? != root))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-    let unfinished = connection
-        .prepare(unfinished)?
-        .query_map([root], |row| row.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    Ok((found, unfinished))
 }
 
 pub(super) fn has_session(path: &Path, id: &str) -> Result<bool> {
@@ -504,10 +373,6 @@ impl DatabaseLease {
 
     pub fn requires_migration(&self) -> bool {
         self.migration
-    }
-
-    pub fn state(&self) -> DatabaseState {
-        self.state
     }
 
     pub fn prepare_migration(&self) -> Result<Option<PathBuf>> {
@@ -766,11 +631,6 @@ mod tests {
         CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER);
         INSERT INTO migration VALUES ('20260910120000_clear_v1_session_permission', 1);";
-    const BETA: &str = "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT);
-        CREATE TABLE session_message (id TEXT, session_id TEXT, data TEXT);
-        CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER);
-        INSERT INTO migration VALUES ('20260823191254_nullable_workspace_binding', 1);";
 
     struct Fixture(crate::local::git::TemporaryDirectory);
 
@@ -970,47 +830,6 @@ mod tests {
         assert!(DatabaseLease::acquire(&path, 1).is_err());
         let unsupported = DatabaseLease::acquire(&path, 2).err().unwrap();
         assert!(unsupported.downcast_ref::<DatabaseBusy>().is_none());
-    }
-
-    #[test]
-    fn official_beta_is_ready_only_for_fresh_v2_stores() {
-        let fixture = Fixture::new();
-        let path = fixture.path();
-        let mut lease = DatabaseLease::acquire(&path, 2).unwrap();
-        assert!(lease
-            .prepare_with_sessions(BTreeSet::new())
-            .unwrap()
-            .is_none());
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(BETA).unwrap();
-        connection.execute_batch("DELETE FROM migration;").unwrap();
-        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Pending);
-        assert!(lease.complete_migration().is_err());
-        connection
-            .execute_batch(
-                "INSERT INTO migration VALUES ('20260823191254_nullable_workspace_binding', 1);",
-            )
-            .unwrap();
-        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Ready);
-        lease.complete_migration().unwrap();
-        assert!(!lease.requires_migration());
-        drop(lease);
-        assert!(DatabaseLease::acquire(&path, 1).is_err());
-
-        connection
-            .execute_batch(
-                "INSERT INTO kv VALUES ('migration.v1-v2', '{\"phase\":\"completed\"}');",
-            )
-            .unwrap();
-        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Pending);
-        connection
-            .execute_batch("DELETE FROM kv; CREATE TABLE session (id TEXT PRIMARY KEY);")
-            .unwrap();
-        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Pending);
-        connection
-            .execute_batch("INSERT INTO kv VALUES ('migration.v1-v2', '{\"phase\":\"completed\"}'); INSERT INTO migration VALUES ('20260910120000_clear_v1_session_permission', 1);")
-            .unwrap();
-        assert_eq!(inspect(&path).unwrap(), DatabaseState::V2Ready);
     }
 
     #[test]

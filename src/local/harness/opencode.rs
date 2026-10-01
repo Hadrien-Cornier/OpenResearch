@@ -1768,177 +1768,6 @@ fn opencode_native_usage(tokens: &Value) -> crate::store::TokenUsage {
     }
 }
 
-fn record_step(
-    store: &crate::store::Store,
-    execution: &str,
-    step: &crate::local::native_store::opencode_database::NativeStep,
-) -> Result<()> {
-    let usage = step.tokens.as_ref().map(opencode_native_usage);
-    store.record_attributed_sample(
-        execution,
-        &step.id,
-        "opencode",
-        &crate::store::Attribution::native(
-            "opencode",
-            step.model.as_deref(),
-            step.provider.as_deref(),
-            crate::store::Missing::unidentified(step.child),
-        ),
-        &usage.clone().unwrap_or_default(),
-        usage.is_some(),
-        true,
-    )
-}
-
-/// The database holding a native OpenCode session.
-fn native_database(native_id: &str) -> Result<Option<std::path::PathBuf>> {
-    Ok(native_store::opencode_session(native_id)?.map(|session| session.path))
-}
-
-/// Records the turn's native steps (its session tree, from the OpenCode database) just before its
-/// execution closes; completion, failure, interrupt and restart recovery all pass through here.
-pub(crate) fn record_turn_steps(store: &crate::store::Store, turn_id: &str) {
-    if let Err(error) = record_turn_steps_in(store, turn_id, native_database) {
-        eprintln!("orx up: could not record OpenCode native steps: {error}");
-    }
-}
-
-fn record_turn_steps_in(
-    store: &crate::store::Store,
-    turn_id: &str,
-    database: impl Fn(&str) -> Result<Option<std::path::PathBuf>>,
-) -> Result<()> {
-    let Some((execution, native_id, since)) = store.open_turn_execution(turn_id, "opencode")?
-    else {
-        return Ok(());
-    };
-    let Some(path) = database(&native_id)? else {
-        return Ok(());
-    };
-    for step in native_store::opencode_database::native_steps(&path, &native_id, since, 0)? {
-        record_step(store, &execution, &step)?;
-    }
-    Ok(())
-}
-
-/// The native invokers of the tool calls that launched `run_id` in a session tree (sub-agents with
-/// their own model), and whether a still-unfinished step's native server is alive to finish it.
-pub(crate) fn native_run_invokers(
-    store: &crate::store::Store,
-    session: &str,
-    native_id: &str,
-    run_id: &str,
-) -> Result<(Vec<crate::store::Attribution>, bool)> {
-    let Some(path) = native_database(native_id)? else {
-        return Ok((Vec::new(), false));
-    };
-    native_run_invokers_in(store, session, &path, native_id, run_id)
-}
-
-fn native_run_invokers_in(
-    store: &crate::store::Store,
-    session: &str,
-    path: &std::path::Path,
-    native_id: &str,
-    run_id: &str,
-) -> Result<(Vec<crate::store::Attribution>, bool)> {
-    let (launchers, unfinished) =
-        native_store::opencode_database::run_launchers(path, native_id, run_id)?;
-    let owners = store.native_owners(session)?;
-    // A step's owner is the latest server started before it; one never recorded is gone.
-    let live = unfinished.iter().any(|started| {
-        owners
-            .iter()
-            .rev()
-            .find(|(_, _, since)| since <= started)
-            .is_some_and(|(pid, port, _)| server_alive(*pid, *port))
-    });
-    let invokers = launchers
-        .into_iter()
-        .map(|(model, provider, child)| {
-            crate::store::Attribution::native(
-                "opencode",
-                model.as_deref(),
-                provider.as_deref(),
-                crate::store::Missing::unidentified(child),
-            )
-        })
-        .collect();
-    Ok((invokers, live))
-}
-
-/// The recorded server still runs: its process exists and still accepts on its port, so a
-/// replacement server or a reused pid alone does not count.
-fn server_alive(pid: u32, port: u16) -> bool {
-    #[cfg(unix)]
-    {
-        let Ok(pid) = i32::try_from(pid) else {
-            return false;
-        };
-        // SAFETY: signal 0 only checks that the process exists.
-        if unsafe { libc::kill(pid, 0) } != 0 {
-            return false;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
-    std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        std::time::Duration::from_millis(300),
-    )
-    .is_ok()
-}
-
-/// Native steps no execution holds yet — sub-agents that finished after their turn, natively woken
-/// continuations, work finished while ORX was down — each idle session's finished batch reported
-/// as its own execution. Runs at startup (everything since each session's first accounted turn)
-/// and then every minute over what changed since the previous pass; native step ids make it
-/// idempotent.
-pub(crate) fn reconcile_native_usage(store: &crate::store::Store) -> Result<()> {
-    static CHANGED_SINCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-    let started = crate::store::now_ms();
-    let changed = CHANGED_SINCE.load(std::sync::atomic::Ordering::Relaxed);
-    reconcile_native_usage_in(store, native_database, changed)?;
-    // A minute of overlap covers writes that landed while the previous pass read.
-    CHANGED_SINCE.store(started - 60_000, std::sync::atomic::Ordering::Relaxed);
-    Ok(())
-}
-
-fn reconcile_native_usage_in(
-    store: &crate::store::Store,
-    database: impl Fn(&str) -> Result<Option<std::path::PathBuf>>,
-    changed: i64,
-) -> Result<()> {
-    for (session, native_id, accounted) in store.idle_native_sessions("opencode")? {
-        let Some(path) = database(&native_id)? else {
-            continue;
-        };
-        let mut steps = Vec::new();
-        for step in
-            native_store::opencode_database::native_steps(&path, &native_id, accounted, changed)?
-        {
-            // An unfinished step waits for its native completion, so its batch closes once.
-            if step.done
-                && !store.native_sample_exists("opencode", &step.id, step.tokens.is_some())?
-            {
-                steps.push(step);
-            }
-        }
-        let Some(first) = steps.first() else {
-            continue;
-        };
-        let execution = format!("native:opencode:{}", first.id);
-        if !store.begin_native_execution(&execution, &session, "opencode")? {
-            continue;
-        }
-        for step in &steps {
-            record_step(store, &execution, step)?;
-        }
-        store.finalize_usage_execution(&execution, "done")?;
-    }
-    Ok(())
-}
-
 fn opencode_used_tokens(tokens: Option<&Value>) -> Option<u64> {
     let tokens = tokens?;
     let field = |v: &Value, name: &str| v.get(name).and_then(Value::as_u64).unwrap_or(0);
@@ -2009,6 +1838,17 @@ fn handle_event(
         // events stream into that row's `children`.
         Some("session.created") => {
             let info = props.get("info").unwrap_or(&Value::Null);
+            if info
+                .get("parentID")
+                .and_then(Value::as_str)
+                .is_some_and(|parent| {
+                    parent == native_id || ctx.native_usage_scopes.contains(parent)
+                })
+            {
+                if let Some(child) = info.get("id").and_then(Value::as_str) {
+                    ctx.native_usage_scopes.insert(child.to_string());
+                }
+            }
             if info.get("parentID").and_then(Value::as_str) == Some(native_id) {
                 if let Some(child_id) = info.get("id").and_then(Value::as_str) {
                     if let Some(spawn) = newest_task_part_id(&ctx.assistant.parts, sub_sessions) {
@@ -2037,6 +1877,33 @@ fn handle_event(
                     assistant_msgs.insert(id.to_string());
                 }
             }
+            let accountable = session == Some(native_id)
+                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session));
+            if accountable && info.get("role").and_then(Value::as_str) == Some("assistant") {
+                if let (Some(id), Some(model), Some(provider)) = (
+                    info.get("id").and_then(Value::as_str),
+                    info.get("modelID").and_then(Value::as_str),
+                    info.get("providerID").and_then(Value::as_str),
+                ) {
+                    // The model ran even if no step-finish (with tokens) follows.
+                    if !ctx.native_message_models.contains_key(id) {
+                        ctx.record_native_usage(
+                            id,
+                            Some(model),
+                            Some(provider),
+                            crate::store::TokenUsage::default(),
+                        );
+                    }
+                    ctx.native_message_models.insert(
+                        id.to_string(),
+                        crate::store::InvocationIdentity {
+                            harness: "opencode".into(),
+                            model: model.to_string(),
+                            provider: Some(provider.to_string()),
+                        },
+                    );
+                }
+            }
             // Only the MAIN session's tokens drive the context meter; a
             // sub-agent's smaller counts must not overwrite it.
             if session == Some(native_id) && is_assistant {
@@ -2059,6 +1926,25 @@ fn handle_event(
                 .get("messageID")
                 .and_then(Value::as_str)
                 .is_some_and(|mid| assistant_msgs.contains(mid));
+            if (session == Some(native_id)
+                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session)))
+                && part.get("type").and_then(Value::as_str) == Some("step-finish")
+            {
+                if let (Some(id), Some(tokens)) =
+                    (part.get("id").and_then(Value::as_str), part.get("tokens"))
+                {
+                    let identity = part
+                        .get("messageID")
+                        .and_then(Value::as_str)
+                        .and_then(|id| ctx.native_message_models.get(id));
+                    ctx.record_native_usage(
+                        id,
+                        identity.map(|i| i.model.as_str()),
+                        identity.and_then(|i| i.provider.as_deref()),
+                        opencode_native_usage(tokens),
+                    );
+                }
+            }
             // A sub-agent's part (foreign sessionID we've registered) streams
             // into its owning `task` row's children, with a namespaced id — but
             // only assistant-owned parts (skip the child's user prompt echo).
@@ -2863,6 +2749,25 @@ opencode/unknown
             &mut subs,
         );
         assert_eq!(subs.get("ses_child").map(String::as_str), Some("prt_task"));
+        handle_event(
+            &mut ctx,
+            "ses_main",
+            &json!({"type":"session.created","properties":{"info":{"id":"ses_grandchild","parentID":"ses_child"}}}),
+            &mut msgs,
+            &mut subs,
+        );
+        handle_event(
+            &mut ctx,
+            "ses_main",
+            &json!({"type":"message.updated","properties":{"info":{"id":"msg_grandchild","sessionID":"ses_grandchild","role":"assistant","modelID":"child-model","providerID":"fixture"}}}),
+            &mut msgs,
+            &mut subs,
+        );
+        assert!(ctx.native_usage_scopes.contains("ses_grandchild"));
+        assert_eq!(
+            ctx.native_message_models["msg_grandchild"].model,
+            "child-model"
+        );
         // The child session's assistant message + a tool part → nests under task.
         handle_event(
             &mut ctx,
@@ -2976,223 +2881,5 @@ opencode/unknown
         );
 
         std::fs::remove_dir_all(script.parent().unwrap()).ok();
-    }
-
-    /// Native OpenCode database shapes (V1 message + step-finish parts, V2 session_message) →
-    /// reports: the turn gets its session tree's steps with each step's own model, and a child
-    /// step that completes after the turn is reported once on its own by reconciliation.
-    #[test]
-    fn native_database_steps_report_once_including_late_children() {
-        let now = crate::store::now_ms();
-        let tokens = json!({"total": 1300, "input": 1000, "output": 300, "reasoning": 0, "cache": {"read": 0, "write": 0}});
-        for v2 in [false, true] {
-            let dir = std::env::temp_dir().join(format!("orx-oc-steps-{}", uuid::Uuid::new_v4()));
-            let store = crate::store::Store::open_at(dir.clone()).unwrap();
-            store.conn_for_tests().execute_batch(&format!(
-                "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, created_at, updated_at) VALUES ('s', 'p', 'opencode', 'ses_root', 1, 1);
-                 INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{{}}', 'running', 'accepted', {}, 1);",
-                now - 1000
-            )).unwrap();
-            store
-                .begin_usage_execution("turn", "t", "opencode")
-                .unwrap();
-            let db = dir.join("opencode.db");
-            let native = rusqlite::Connection::open(&db).unwrap();
-            let step = |id: &str, session: &str, model: &str, done: bool| {
-                if v2 {
-                    let data = json!({"time": {"created": now, "streamed": now, "completed": done.then_some(now)},
-                        "model": {"id": model, "providerID": "opencode", "variant": "default"},
-                        "content": [{"type": "text", "text": "ok"}], "tokens": tokens});
-                    native.execute("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?1, ?2, 'assistant', ?3, ?4, ?4, ?5)",
-                        rusqlite::params![id, session, now % 1000 + id.len() as i64, now, data.to_string()]).unwrap();
-                } else {
-                    let data = json!({"role": "assistant", "modelID": model, "providerID": "opencode",
-                        "time": {"created": now, "completed": done.then_some(now)}});
-                    native.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?3, ?4)",
-                        rusqlite::params![id, session, now, data.to_string()]).unwrap();
-                    native.execute("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
-                        rusqlite::params![format!("{id}-text"), id, session, now, json!({"type": "text", "text": "ok"}).to_string()]).unwrap();
-                    if done {
-                        native.execute("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
-                            rusqlite::params![format!("{id}-step"), id, session, now, json!({"type": "step-finish", "tokens": tokens}).to_string()]).unwrap();
-                    }
-                }
-            };
-            native.execute_batch(if v2 {
-                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, time_idle INTEGER);
-                 CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
-                 INSERT INTO session_v2 VALUES ('ses_root', NULL, NULL), ('ses_child', 'ses_root', NULL), ('ses_grandchild', 'ses_child', NULL);"
-            } else {
-                "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT);
-                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
-                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
-                 INSERT INTO session VALUES ('ses_root', NULL), ('ses_child', 'ses_root'), ('ses_grandchild', 'ses_child');"
-            }).unwrap();
-            // Imported native history before ORX's first turn is never accounted.
-            step("msg_imported", "ses_root", "old-model", true);
-            native
-                .execute_batch(&format!(
-                    "UPDATE {} SET time_created = {} WHERE id = 'msg_imported'",
-                    if v2 { "session_message" } else { "message" },
-                    now - 5000
-                ))
-                .unwrap();
-            step("msg_parent", "ses_root", "big-pickle", true);
-            step("msg_child", "ses_child", "child-model", true);
-            // Still running when the turn ends (V2 already streamed, so its model ran).
-            step("msg_late", "ses_grandchild", "late-model", false);
-            let database = |_: &str| Ok(Some(db.clone()));
-            record_turn_steps_in(&store, "t", database).unwrap();
-            store
-                .conn_for_tests()
-                .execute("UPDATE chat_turns SET state = 'completed'", [])
-                .unwrap();
-            store.finalize_turn_usage("t", "done").unwrap();
-            // Still unfinished: reconciliation leaves it for its native completion.
-            reconcile_native_usage_in(&store, database, 0).unwrap();
-            // The grandchild finishes natively after its turn, with no later turn or restart.
-            if v2 {
-                native.execute("UPDATE session_message SET data = json_set(data, '$.time.completed', ?1) WHERE id = 'msg_late'", [now]).unwrap();
-            } else {
-                native.execute("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('msg_late-step', 'msg_late', 'ses_grandchild', ?1, ?1, ?2)",
-                    rusqlite::params![now, json!({"type": "step-finish", "tokens": tokens}).to_string()]).unwrap();
-                native.execute("UPDATE message SET data = json_set(data, '$.time.completed', ?1) WHERE id = 'msg_late'", [now]).unwrap();
-            }
-            reconcile_native_usage_in(&store, database, 0).unwrap();
-            reconcile_native_usage_in(&store, database, now).unwrap();
-            // A natively woken child launches a run: unfinished and recent, it keeps the run
-            // pending; its completed native tool output then names the child's own model.
-            let launchers = |db: &std::path::Path| {
-                let (found, unfinished) =
-                    native_store::opencode_database::run_launchers(db, "ses_root", "7F3A-run")
-                        .unwrap();
-                (found, !unfinished.is_empty())
-            };
-            step("msg_wake", "ses_child", "child-model", false);
-            assert_eq!(launchers(&db), (vec![], true));
-            if v2 {
-                // Native idle after the step began: abandoned, however recent; running, however old.
-                native
-                    .execute(
-                        "UPDATE session_v2 SET time_idle = ?1 WHERE id = 'ses_child'",
-                        [now + 1],
-                    )
-                    .unwrap();
-                assert_eq!(launchers(&db), (vec![], false));
-                native
-                    .execute(
-                        "UPDATE session_v2 SET time_idle = ?1 WHERE id = 'ses_child'",
-                        [now - 1],
-                    )
-                    .unwrap();
-                assert_eq!(launchers(&db), (vec![], true));
-            }
-            let output = "Run 7f3a-run started";
-            if v2 {
-                let tool = json!({"type": "tool", "id": "call_1", "name": "shell", "state": {"status": "completed",
-                    "input": {"command": "orx exp run e"}, "content": [{"type": "text", "text": output}]}});
-                native.execute("UPDATE session_message SET data = json_set(data, '$.content', json_array(json(?1)), '$.time.completed', ?2) WHERE id = 'msg_wake'",
-                    rusqlite::params![tool.to_string(), now]).unwrap();
-            } else {
-                native.execute("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_tool', 'msg_wake', 'ses_child', ?1, ?1, ?2)",
-                    rusqlite::params![now, json!({"type": "tool", "callID": "call_1", "state": {"status": "completed",
-                        "input": {"command": "orx exp run e"}, "output": output}}).to_string()]).unwrap();
-                native.execute("UPDATE message SET data = json_set(data, '$.time.completed', ?1) WHERE id = 'msg_wake'", [now]).unwrap();
-            }
-            assert_eq!(
-                launchers(&db),
-                (
-                    vec![(Some("child-model".into()), Some("opencode".into()), true)],
-                    false
-                )
-            );
-            native.execute_batch(if v2 { "DELETE FROM session_message WHERE id = 'msg_wake'" } else { "DELETE FROM message WHERE id = 'msg_wake'; DELETE FROM part WHERE message_id = 'msg_wake'" }).unwrap();
-            let reports: Vec<_> = store
-                .test_usage_reports("done")
-                .unwrap()
-                .iter()
-                .map(|r| {
-                    (
-                        r["model"].clone(),
-                        r["coverage"].clone(),
-                        r["inputTokens"].clone(),
-                    )
-                })
-                .collect();
-            let late_identity = v2.then(|| (json!("late-model"), json!("missing"), Value::Null));
-            let expected: Vec<_> = [
-                Some((json!("late-model"), json!("complete"), json!(1000))),
-                Some((json!("big-pickle"), json!("complete"), json!(1000))),
-                Some((json!("child-model"), json!("complete"), json!(1000))),
-                late_identity,
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            assert_eq!(reports, expected, "v2={v2}");
-            drop((native, store));
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    /// A pending run waits on native liveness, not age: a days-old step whose recorded server still
-    /// runs keeps it pending; once that server is gone (or only a later replacement runs), the
-    /// report can finish.
-    #[cfg(unix)]
-    #[test]
-    fn pending_runs_wait_only_while_the_steps_native_server_lives() {
-        let dir = std::env::temp_dir().join(format!("orx-oc-owner-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.conn_for_tests().execute_batch("INSERT INTO chat_sessions (id, project_id, harness, native_session_id, created_at, updated_at) VALUES ('s', 'p', 'opencode', 'ses_root', 1, 1);").unwrap();
-        let db = dir.join("opencode.db");
-        let started = crate::store::now_ms() - 2 * 24 * 60 * 60 * 1000;
-        rusqlite::Connection::open(&db).unwrap().execute_batch(&format!(
-            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT);
-             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
-             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
-             INSERT INTO session VALUES ('ses_root', NULL);
-             INSERT INTO message VALUES ('msg_long', 'ses_root', {started}, {started}, '{{\"role\":\"assistant\",\"modelID\":\"big-pickle\",\"time\":{{\"created\":{started}}}}}');"
-        )).unwrap();
-        let live = |store: &crate::store::Store| {
-            native_run_invokers_in(store, "s", &db, "ses_root", "7f3a-run")
-                .unwrap()
-                .1
-        };
-        let set_owners = |owners: serde_json::Value| {
-            store
-                .conn_for_tests()
-                .execute(
-                    "UPDATE chat_sessions SET native_owners_json = ?1",
-                    [owners.to_string()],
-                )
-                .unwrap();
-        };
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let mut gone = std::process::Command::new("true").spawn().unwrap();
-        let dead = gone.id();
-        gone.wait().unwrap();
-        // Alive for two days: still waiting.
-        set_owners(json!([[std::process::id(), port, started - 1]]));
-        assert!(live(&store));
-        // Its owner died; a replacement started after the step is not its owner.
-        set_owners(json!([
-            [dead, port, started - 1],
-            [std::process::id(), port, started + 1]
-        ]));
-        assert!(!live(&store));
-        // The process lives but no longer serves its port; never recorded at all.
-        set_owners(json!([[std::process::id(), port, started - 1]]));
-        drop(listener);
-        assert!(!live(&store));
-        set_owners(json!([]));
-        assert!(!live(&store));
-        // Recording appends and survives reopening the store.
-        store.record_native_owner("s", 7, 8).unwrap();
-        drop(store);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        assert_eq!(store.native_owners("s").unwrap().len(), 1);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }
