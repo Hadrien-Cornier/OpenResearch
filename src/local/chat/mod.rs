@@ -1187,6 +1187,7 @@ pub fn import_native_chat(
         autonomy: None,
         active_leaf_id: None,
         parent_session_id: None,
+        side_parent_session_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -1242,6 +1243,7 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         "contextUsage": context_usage,
         "activeLeafId": s.active_leaf_id,
         "parentSessionId": s.parent_session_id,
+        "sideParentSessionId": s.side_parent_session_id,
         "goal": s.goal,
         "autonomy": Autonomy::from_stored(s.autonomy.as_deref()).id(),
     })
@@ -6341,6 +6343,25 @@ impl ChatHost {
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
+    /// Branch a side chat off `parent`, seeded with a snapshot of the parent's
+    /// live branch as it is right now.
+    pub async fn open_side_chat(&self, parent: &StoredChatSession) -> Result<StoredChatSession> {
+        let store = Store::open()?;
+        let messages = store.list_chat_messages(&parent.id)?;
+        let session = side_chat_session(parent, &messages);
+        store.create_chat_session(&session)?;
+        // Checked after the insert: a parent delete that began earlier has
+        // already listed its side chats and would miss this one.
+        if self.deleting_sessions.lock().unwrap().contains(&parent.id)
+            || store.get_chat_session(&parent.id)?.is_none()
+        {
+            store.delete_chat_session(&session.id)?;
+            return Err(anyhow!("chat session is gone"));
+        }
+        self.emit_session(Some(session.clone())).await;
+        Ok(session)
+    }
+
     /// Set (or, with `None`, clear) the goal every turn is reminded of.
     pub async fn set_goal(
         &self,
@@ -6489,6 +6510,9 @@ impl ChatHost {
         let _deleting = self
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
+        for side_chat in Store::open()?.side_chats_of(session_id)? {
+            let _ = Box::pin(self.delete_session(&side_chat)).await;
+        }
         self.clear_queue(session_id)?;
         let _ = self.interrupt(session_id).await;
         // A live opencode serve child would keep running in (and lock) the
@@ -6521,12 +6545,16 @@ impl ChatHost {
             .retain(|(queued_session_id, _), _| queued_session_id != session_id);
         let store = Store::open()?;
         let session = store.get_chat_session(session_id)?;
+        let worktree_owner = store.chat_worktree_owner(session_id)?;
         store.delete_chat_session(session_id)?;
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
             cleanup_session_transcript_artifacts(&session.id);
-            if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
-                cleanup_session_worktree(&project, session_id);
+            // A side chat runs in its parent's worktree, which outlives it.
+            if worktree_owner == session_id {
+                if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
+                    cleanup_session_worktree(&project, session_id);
+                }
             }
         }
         Ok(())
@@ -7888,6 +7916,50 @@ fn active_path<'a>(
     path
 }
 
+fn side_chat_session(
+    parent: &StoredChatSession,
+    messages: &[StoredChatMessage],
+) -> StoredChatSession {
+    let snapshot = crate::local::harness::transcript_snapshot(active_path(
+        messages,
+        parent.active_leaf_id.as_deref(),
+    ));
+    let bootstrap_context = (!snapshot.is_empty()).then(|| {
+        format!(
+            "<orx-side-chat-context>\nThis is a side chat branched from another chat, which may still be running in this same worktree. Use this snapshot of that chat, taken when the side chat opened, to answer questions about its work. Do not modify files unless the user asks.\n{snapshot}\n</orx-side-chat-context>"
+        )
+    });
+    let now = now_ms();
+    StoredChatSession {
+        id: format!("chat_{}", uuid::Uuid::new_v4()),
+        project_id: parent.project_id.clone(),
+        harness: parent.harness.clone(),
+        native_session_id: None,
+        title: None,
+        title_source: None,
+        model: parent.model.clone(),
+        service_tier: parent.service_tier.clone(),
+        // Claude keeps Plan in its permission mode; a side chat starts outside Plan.
+        permission_mode: parent.permission_mode.clone().filter(|mode| {
+            crate::local::harness::permission_mode_for(&parent.harness, mode)
+                != Some(crate::local::harness::PermissionMode::Plan)
+        }),
+        plan_mode: false,
+        plan_reset_pending: false,
+        reasoning_level: parent.reasoning_level.clone(),
+        archived: false,
+        context_usage_json: None,
+        bootstrap_context,
+        goal: None,
+        autonomy: parent.autonomy.clone(),
+        active_leaf_id: None,
+        parent_session_id: None,
+        side_parent_session_id: Some(parent.id.clone()),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Attachments of a turn being re-sampled. The files are already on disk from
 /// the original send, so a fork points at them instead of rewriting the bytes.
 fn replayed_attachments(parts: &[WirePart]) -> Result<Vec<SavedAttachment>> {
@@ -8508,6 +8580,14 @@ async fn deliver_wake_up(
         ));
     }
     Ok(store)
+}
+
+/// Side chats last only as long as the app run that opened them.
+pub async fn delete_side_chats(chat: &Arc<ChatHost>) -> Result<()> {
+    for session_id in Store::open()?.side_chat_ids()? {
+        chat.delete_session(&session_id).await?;
+    }
+    Ok(())
 }
 
 /// Resume explicitly subscribed agent sessions after a run finishes. Busy and
@@ -9155,6 +9235,7 @@ mod cap_tests {
                 autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
+                side_parent_session_id: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -9263,6 +9344,7 @@ mod cap_tests {
             autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -9320,6 +9402,7 @@ mod cap_tests {
             autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -10094,6 +10177,7 @@ mod bridge_tests {
             autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -10250,6 +10334,7 @@ mod run_wakeup_tests {
                 autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
+                side_parent_session_id: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -11007,6 +11092,74 @@ mod transcript_tree_tests {
         assert_eq!(ids(active_path(&messages, Some("a2"))), ["u1", "a2"]);
     }
 
+    fn said(id: &str, role: &str, parent: Option<&str>, text: &str) -> StoredChatMessage {
+        StoredChatMessage {
+            parts_json: json!([{ "id": "p", "type": "text", "text": text }]).to_string(),
+            ..msg(id, role, parent)
+        }
+    }
+
+    fn parent_session(harness: &str) -> StoredChatSession {
+        StoredChatSession {
+            id: "chat_parent".into(),
+            project_id: "proj_1".into(),
+            harness: harness.into(),
+            native_session_id: Some("native-parent".into()),
+            title: Some("Parent".into()),
+            title_source: Some("user".into()),
+            model: Some("model-x".into()),
+            service_tier: None,
+            permission_mode: Some("bypass".into()),
+            plan_mode: false,
+            plan_reset_pending: false,
+            reasoning_level: Some("high".into()),
+            archived: false,
+            context_usage_json: None,
+            bootstrap_context: None,
+            goal: Some("keep training".into()),
+            autonomy: None,
+            active_leaf_id: Some("a3".into()),
+            parent_session_id: None,
+            side_parent_session_id: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_side_chat_is_seeded_from_the_parents_live_branch_only() {
+        let messages = vec![
+            said("u1", "user", None, "train the model"),
+            said("a1", "assistant", Some("u1"), "kept branch"),
+            said("a2", "assistant", Some("u1"), "abandoned retry"),
+            said("u2", "user", Some("a1"), "how is it going"),
+            said("a3", "assistant", Some("u2"), "loss is falling"),
+        ];
+        let side = side_chat_session(&parent_session("codex"), &messages);
+        let context = side.bootstrap_context.unwrap();
+        assert!(context.contains("kept branch") && context.contains("loss is falling"));
+        assert!(!context.contains("abandoned retry"));
+        assert_eq!(side.side_parent_session_id.as_deref(), Some("chat_parent"));
+        assert_eq!(side.native_session_id, None);
+        assert_eq!(side.goal, None);
+        assert_eq!(side.model.as_deref(), Some("model-x"));
+        assert_eq!(side.permission_mode.as_deref(), Some("bypass"));
+        assert!(!side.plan_mode);
+    }
+
+    #[test]
+    fn a_side_chat_leaves_claudes_plan_permission_behind() {
+        let mut parent = parent_session("claude-code");
+        parent.permission_mode = Some("plan".into());
+        assert_eq!(side_chat_session(&parent, &[]).permission_mode, None);
+    }
+
+    #[test]
+    fn a_side_chat_of_an_empty_chat_has_no_seed_context() {
+        let side = side_chat_session(&parent_session("claude-code"), &[]);
+        assert_eq!(side.bootstrap_context, None);
+    }
+
     #[test]
     fn active_path_without_a_leaf_keeps_the_whole_transcript() {
         let messages = forked();
@@ -11104,6 +11257,7 @@ mod steering_tests {
                 autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
+                side_parent_session_id: None,
                 created_at: 1,
                 updated_at: 1,
             })

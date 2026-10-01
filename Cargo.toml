@@ -119,3 +119,11 @@ embed-resource = "3"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Full debuginfo bloats target/ by gigabytes; file:line backtraces are all we use.
+[profile.dev]
+debug = "line-tables-only"
+
+# Third-party crates need no line info; saves another ~0.2 GiB per build.
+[profile.dev.package."*"]
+debug = false

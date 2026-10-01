@@ -1922,6 +1922,9 @@ export interface ChatSession {
   /** Session whose agent spawned this one with `orx agent spawn`; null for
    * sessions the user started themselves. */
   parentSessionId?: string | null;
+  /** Chat this side chat branched from. Side chats share its worktree and
+   * stay out of history; closing the tab deletes one. */
+  sideParentSessionId?: string | null;
   createdAt: number;
   updatedAt: number;
   busy: boolean;
@@ -1998,6 +2001,12 @@ export const renameChatSession = (sessionId: string, title: string) =>
 /** Enter/leave the session-specific Plan axis used by Codex/OpenCode/Cursor. */
 export const setChatSessionPlanMode = (sessionId: string, planMode: boolean) =>
   patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { planMode }).then(
+    (r) => r.session,
+  );
+
+/** Branch a temporary side chat off a snapshot of `sessionId`'s transcript. */
+export const openSideChat = (sessionId: string) =>
+  post<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}/side`, {}).then(
     (r) => r.session,
   );
 
