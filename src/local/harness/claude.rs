@@ -1499,9 +1499,9 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             let inner = event.get("event").unwrap_or(&Value::Null);
             match inner.get("type").and_then(Value::as_str) {
                 Some("message_start") => {
-                    // An interrupt kills the child before `result`, so the model is captured here.
+                    // An interrupt kills the child before `assistant`, so the model is captured here.
                     if let Some(message) = inner.get("message") {
-                        record_message(ctx, message, parent);
+                        record_message(ctx, message, parent.is_some());
                     }
                     // Sub-agent streams have their own message ids; namespace the
                     // stream mid per parent so a concurrent sub-agent's deltas
@@ -1642,7 +1642,8 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         },
         Some("assistant") => {
             if let Some(message) = event.get("message") {
-                record_message(ctx, message, subagent_parent(event));
+                ctx.record_native_invocations(message);
+                record_message(ctx, message, subagent_parent(event).is_some());
             }
             if event
                 .get("error")
@@ -1930,24 +1931,16 @@ fn mark_stream_final(ctx: &mut TurnCtx, state: &TurnState) {
     }
 }
 
-/// One native message's (id, attribution, usage snapshot, issued tool part ids). A sub-agent's
-/// tool is recorded under its bare id (the invocation gate's key) and its namespaced part id.
-fn message_sample(
-    message: &Value,
-    parent: Option<&str>,
-) -> Option<(
-    String,
-    crate::store::Attribution,
-    crate::store::TokenUsage,
-    Vec<String>,
-)> {
-    let id = message.get("id").and_then(Value::as_str)?;
+/// One native message's identity and usage snapshot; an unidentified sub-agent never takes the parent's model.
+fn record_message(ctx: &TurnCtx, message: &Value, child: bool) {
+    let Some(id) = message.get("id").and_then(Value::as_str) else {
+        return;
+    };
     let model = message.get("model").and_then(Value::as_str);
     let usage = message.get("usage");
     if model.is_none() && usage.is_none() {
-        return None;
+        return;
     }
-    let missing = crate::store::Missing::unidentified(parent.is_some());
     let usage = usage.map_or_else(Default::default, |usage| {
         let field = |key| usage.get(key).and_then(Value::as_u64);
         crate::store::TokenUsage {
@@ -1961,36 +1954,12 @@ fn message_sample(
             reasoning_tokens: None,
         }
     });
-    let tools = message
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-        .filter_map(|block| block.get("id").and_then(Value::as_str))
-        .flat_map(|id| std::iter::once(id.to_string()).chain(parent.map(|p| format!("{p}:{id}"))))
-        .collect();
-    Some((
-        id.to_string(),
-        crate::store::Attribution::native("claude-code", model, None, missing),
+    ctx.record_attributed_usage(
+        &format!("claude-{}:{id}", ctx.attempt_count_for_usage()),
+        ctx.native_attribution(model, None, crate::store::Missing::unidentified(child)),
         usage,
-        tools,
-    ))
-}
-
-fn record_message(ctx: &TurnCtx, message: &Value, parent: Option<&str>) {
-    let Some((id, attribution, usage, tools)) = message_sample(message, parent) else {
-        return;
-    };
-    let attempt = ctx.attempt_count_for_usage();
-    // Tool identity first: the invocation gate is already polling for it.
-    if let crate::store::Attribution::Exact { model, provider } = &attribution {
-        for tool in &tools {
-            ctx.record_tool_invoker(tool, model, provider.as_deref());
-        }
-    }
-    // Result modelUsage replaces the listed models' messages and keeps any other one's identity.
-    ctx.record_attributed_usage(&format!("claude-{attempt}:{id}"), attribution, usage, false);
+        false,
+    );
 }
 
 fn claude_result_usage_samples(
@@ -2832,66 +2801,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn native_messages_keep_identity_independent_of_usage_and_children() {
-        use crate::store::{Attribution, Missing};
-        let exact = |model: &str| Attribution::Exact {
-            model: model.into(),
-            provider: None,
-        };
-        // Stream `message_start` before any block: identity and input are captured pre-interrupt.
-        let (id, attribution, usage, tools) = message_sample(
-            &serde_json::json!({"id":"msg_011Cfa7Sv51tpWpeffp9gfru","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":31825,"cache_read_input_tokens":11903,"output_tokens":8}}),
-            None,
-        )
-        .unwrap();
-        assert_eq!(id, "msg_011Cfa7Sv51tpWpeffp9gfru");
-        assert_eq!(attribution, exact("claude-opus-5-5"));
-        assert_eq!(usage.input_tokens, Some(43730));
-        assert!(tools.is_empty());
-        // A model without usage is still an identity (identity-only write).
-        let (_, attribution, usage, _) = message_sample(
-            &serde_json::json!({"id":"msg_a","model":"claude-opus-5-5","content":[]}),
-            None,
-        )
-        .unwrap();
-        assert_eq!(attribution, exact("claude-opus-5-5"));
-        assert_eq!(usage, Default::default());
-        // A sub-agent keeps its own model; its tool is keyed bare (gate) and namespaced (part).
-        let (_, attribution, _, tools) = message_sample(
-            &serde_json::json!({"id":"msg_011CfZDfRwPUCRQJdvdor3Ju","model":"claude-haiku-4-5-20251001","content":[{"type":"tool_use","id":"toolu_child","name":"Bash","input":{"command":"orx exp run e"}}]}),
-            Some("toolu_task"),
-        )
-        .unwrap();
-        assert_eq!(attribution, exact("claude-haiku-4-5-20251001"));
-        assert_eq!(tools, ["toolu_child", "toolu_task:toolu_child"]);
-        // An unidentified child never inherits the parent's model.
-        let (_, attribution, _, _) = message_sample(
-            &serde_json::json!({"id":"msg_b","usage":{"output_tokens":4}}),
-            Some("toolu_task"),
-        )
-        .unwrap();
-        assert_eq!(
-            attribution,
-            Attribution::Unresolved {
-                reason: Missing::ChildModelUnknown
-            }
-        );
-        // Claude's local error message is an explicit exception, never a tool invoker.
-        let (_, attribution, _, _) = message_sample(
-            &serde_json::json!({"id":"e9adb23a-3a90-4edc-93e6-1f0d5e23afd0","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Failed to authenticate: OAuth session expired and could not be refreshed"}]}),
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            attribution,
-            Attribution::Unresolved {
-                reason: Missing::SyntheticModel
-            }
-        );
-        assert!(message_sample(&serde_json::json!({"id":"msg_c","content":[]}), None).is_none());
-    }
-
     /// Fold a hand-written stream-json transcript through `apply_event` against a
     /// bare `TurnCtx::test_stub()` — the store-free property. Returns the final
     /// state; asserts the fold stops on the `result` event and no earlier.
@@ -3666,290 +3575,98 @@ mod tests {
         assert!(ctx.assistant.parts.is_empty());
     }
 
-    /// A capturing ctx once `run_attempt` has opened attempt 1's native usage baseline.
-    fn capturing(dir: &std::path::Path) -> TurnCtx {
-        let ctx = TurnCtx::test_capture(dir.to_path_buf(), "claude-code");
-        ctx.begin_native_usage_attempt(&format!("claude-{}:", ctx.attempt_count_for_usage()))
-            .unwrap();
-        ctx
-    }
-
-    fn feed(ctx: &mut TurnCtx, events: &[Value]) -> TurnState {
-        let mut state = TurnState::default();
-        for event in events {
-            if apply_event(ctx, &mut state, event) {
-                break;
-            }
-        }
-        state
-    }
-
-    fn exact(model: &str) -> crate::store::Attribution {
-        crate::store::Attribution::Exact {
-            model: model.into(),
-            provider: None,
-        }
-    }
-
-    fn message_start(id: &str, model: &str, output: u64) -> Value {
-        serde_json::json!({"type":"stream_event","session_id":"s1","parent_tool_use_id":null,
-            "event":{"type":"message_start","message":{"id":id,"type":"message","role":"assistant","model":model,"content":[],
-            "usage":{"input_tokens":3,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"output_tokens":output}}}})
-    }
-
-    fn assistant(id: &str, model: &str, content: Value, output: u64) -> Value {
-        serde_json::json!({"type":"assistant","session_id":"s1","parent_tool_use_id":null,
-            "message":{"id":id,"type":"message","role":"assistant","model":model,"content":content,
-            "usage":{"input_tokens":3,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"output_tokens":output}}})
-    }
-
-    /// Claude's local error message, in the captured `<synthetic>` shape.
-    fn synthetic(id: &str, text: &str) -> Value {
-        serde_json::json!({"type":"assistant","session_id":"s1","parent_tool_use_id":null,
-            "message":{"id":id,"model":"<synthetic>","role":"assistant",
+    /// Native stream-json shapes → the reports the service receives.
+    #[test]
+    fn native_messages_report_identity_independently_of_usage() {
+        let usage = |output: u64| serde_json::json!({"input_tokens":3,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"output_tokens":output});
+        let start = |id: &str, model: &str| {
+            serde_json::json!({"type":"stream_event","session_id":"s1","parent_tool_use_id":null,
+                "event":{"type":"message_start","message":{"id":id,"model":model,"content":[],"usage":usage(1)}}})
+        };
+        let assistant = |id: &str, model: Value, parent: Value| {
+            serde_json::json!({"type":"assistant","session_id":"s1","parent_tool_use_id":parent,
+                "message":{"id":id,"model":model,"content":[{"type":"text","text":"Done."}],"usage":usage(20)}})
+        };
+        let result = serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"s1","result":"Done.",
+            "modelUsage":{"claude-sonnet-5-5":{"inputTokens":3,"outputTokens":20,"cacheReadInputTokens":0,"cacheCreationInputTokens":100}}});
+        let synthetic = serde_json::json!({"type":"assistant","session_id":"s1","parent_tool_use_id":null,
+            "message":{"id":"e9","model":"<synthetic>","role":"assistant",
             "usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},
-            "content":[{"type":"text","text":text}]}})
-    }
-
-    fn measured(output: u64) -> crate::store::TokenUsage {
-        crate::store::TokenUsage {
-            input_tokens: Some(103),
-            output_tokens: Some(output),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(100),
-            reasoning_tokens: None,
+            "content":[{"type":"text","text":"Failed to authenticate"}]}});
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            &'static str,
+        );
+        let cases: [(Vec<Value>, Vec<Row>); 4] = [
+            // Interrupted after message_start: the model ran; tokens are a partial snapshot.
+            (
+                vec![start("msg_a", "claude-opus-5-5")],
+                vec![("exact", Some("claude-opus-5-5"), None, "partial")],
+            ),
+            // An abandoned request, then a retry on another model: the aggregate replaces only its
+            // own model, and the abandoned model stays an identity without tokens.
+            (
+                vec![
+                    start("msg_a", "claude-opus-5-5"),
+                    start("msg_b", "claude-sonnet-5-5"),
+                    assistant("msg_b", "claude-sonnet-5-5".into(), Value::Null),
+                    result,
+                ],
+                vec![
+                    ("exact", Some("claude-opus-5-5"), None, "missing"),
+                    ("exact", Some("claude-sonnet-5-5"), None, "complete"),
+                ],
+            ),
+            // A sub-agent message without a model is unknown, never its parent's.
+            (
+                vec![
+                    assistant("msg_p", "claude-opus-5-5".into(), Value::Null),
+                    assistant("msg_c", Value::Null, "toolu_task".into()),
+                ],
+                vec![
+                    ("exact", Some("claude-opus-5-5"), None, "partial"),
+                    ("unresolved", None, Some("child_model_unknown"), "partial"),
+                ],
+            ),
+            (
+                vec![synthetic],
+                vec![("unresolved", None, Some("synthetic_model"), "partial")],
+            ),
+        ];
+        for (events, expected) in cases {
+            let dir = std::env::temp_dir().join(format!("orx-claude-{}", uuid::Uuid::new_v4()));
+            let mut ctx = TurnCtx::test_capture(dir.clone(), "claude-code");
+            ctx.begin_native_usage_attempt("claude-1:").unwrap();
+            let mut state = TurnState::default();
+            for event in &events {
+                apply_event(&mut ctx, &mut state, event);
+            }
+            let reports: Vec<_> = TurnCtx::test_reports(&dir, "done")
+                .into_iter()
+                .map(|r| {
+                    (
+                        r["attribution"].as_str().unwrap().to_string(),
+                        r["model"].as_str().map(str::to_string),
+                        r["attributionReason"].as_str().map(str::to_string),
+                        r["coverage"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(a, m, r, c)| {
+                    (
+                        a.to_string(),
+                        m.map(str::to_string),
+                        r.map(str::to_string),
+                        c.to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(reports, expected, "{events:?}");
+            std::fs::remove_dir_all(dir).unwrap();
         }
-    }
-
-    fn synthetic_row(
-        id: &str,
-    ) -> (
-        String,
-        crate::store::Attribution,
-        crate::store::TokenUsage,
-        bool,
-    ) {
-        (
-            format!("claude-1:{id}"),
-            crate::store::Attribution::Unresolved {
-                reason: crate::store::Missing::SyntheticModel,
-            },
-            crate::store::TokenUsage {
-                input_tokens: Some(0),
-                output_tokens: Some(0),
-                cache_read_tokens: Some(0),
-                cache_write_tokens: Some(0),
-                reasoning_tokens: None,
-            },
-            false,
-        )
-    }
-
-    /// An abandoned stream is followed by a new request on another model: the result aggregate
-    /// replaces only the listed model's message snapshots, and the abandoned model stays an
-    /// identity without tokens.
-    #[test]
-    fn retried_request_keeps_each_executed_model_once_in_the_ledger() {
-        let dir = std::env::temp_dir().join(format!("orx-claude-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = capturing(&dir);
-        let state = feed(
-            &mut ctx,
-            &[
-                message_start("msg_a", "claude-opus-5-5", 1),
-                serde_json::json!({"type":"stream_event","session_id":"s1","parent_tool_use_id":null,
-                    "event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Look"}}}),
-                message_start("msg_b", "claude-sonnet-5-5", 1),
-                assistant(
-                    "msg_b",
-                    "claude-sonnet-5-5",
-                    serde_json::json!([{"type":"text","text":"Done."}]),
-                    20,
-                ),
-                serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"s1","result":"Done.",
-                    "modelUsage":{"claude-sonnet-5-5":{"inputTokens":3,"outputTokens":20,"cacheReadInputTokens":0,"cacheCreationInputTokens":100}}}),
-            ],
-        );
-        assert!(state.saw_result && !state.turn_errored);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.finalize_turn_usage("test-turn", "done").unwrap();
-        store.finalize_turn_usage("test-turn", "failed").unwrap();
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (
-                Some("done".into()),
-                vec![
-                    (
-                        "claude-1:aggregate:claude-sonnet-5-5".into(),
-                        exact("claude-sonnet-5-5"),
-                        measured(20),
-                        true,
-                    ),
-                    (
-                        "claude-1:msg_a".into(),
-                        exact("claude-opus-5-5"),
-                        Default::default(),
-                        false,
-                    ),
-                ]
-            )
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Init names the configured model before any request; a cancel there captures nothing.
-    #[test]
-    fn cancel_before_native_output_records_no_identity_from_init() {
-        let dir = std::env::temp_dir().join(format!("orx-claude-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = capturing(&dir);
-        let state = feed(
-            &mut ctx,
-            &[
-                serde_json::json!({"type":"system","subtype":"init","session_id":"s1",
-                "model":"claude-opus-5-5","tools":[],"permissionMode":"bypassPermissions"}),
-            ],
-        );
-        assert!(!state.had_activity && !state.saw_result);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.finalize_turn_usage("test-turn", "cancelled").unwrap();
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (Some("cancelled".into()), vec![])
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Claude's local `<synthetic>` auth error is never an identity or a tool invoker.
-    #[test]
-    fn pre_execution_failure_keeps_the_synthetic_error_out_of_identities() {
-        let dir = std::env::temp_dir().join(format!("orx-claude-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = capturing(&dir);
-        let mut auth = synthetic(
-            "e9adb23a-3a90-4edc-93e6-1f0d5e23afd0",
-            "Failed to authenticate: OAuth session expired and could not be refreshed",
-        );
-        auth["error"] = "authentication_failed".into();
-        let state = feed(
-            &mut ctx,
-            &[
-                serde_json::json!({"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-5-5"}),
-                auth,
-                serde_json::json!({"type":"result","subtype":"success","is_error":true,"session_id":"s1",
-                    "result":"Failed to authenticate","modelUsage":{}}),
-            ],
-        );
-        assert!(state.auth_failed && !state.had_activity);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.finalize_turn_usage("test-turn", "failed").unwrap();
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (
-                Some("failed".into()),
-                vec![synthetic_row("e9adb23a-3a90-4edc-93e6-1f0d5e23afd0")]
-            )
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A mid-turn API error after real output keeps every executed message's model, snapshot,
-    /// and tool invoker; the synthetic error message beside them stays unresolved.
-    #[test]
-    fn failure_after_native_output_keeps_the_executed_model() {
-        let dir = std::env::temp_dir().join(format!("orx-claude-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = capturing(&dir);
-        let state = feed(
-            &mut ctx,
-            &[
-                message_start("msg_a", "claude-opus-5-5", 1),
-                assistant(
-                    "msg_a",
-                    "claude-opus-5-5",
-                    serde_json::json!([{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]),
-                    12,
-                ),
-                serde_json::json!({"type":"user","session_id":"s1","parent_tool_use_id":null,
-                    "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.rs"}]}}),
-                message_start("msg_b", "claude-opus-5-5", 1),
-                synthetic(
-                    "5b0e8d9c-5a2e-4a57-9d8c-1f7f2e0b7c11",
-                    "API Error: 500 Internal server error",
-                ),
-                serde_json::json!({"type":"result","subtype":"success","is_error":true,"session_id":"s1",
-                    "result":"API Error: 500 Internal server error"}),
-            ],
-        );
-        assert!(state.turn_errored && state.had_activity);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.finalize_turn_usage("test-turn", "failed").unwrap();
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (
-                Some("failed".into()),
-                vec![
-                    synthetic_row("5b0e8d9c-5a2e-4a57-9d8c-1f7f2e0b7c11"),
-                    (
-                        "claude-1:msg_a".into(),
-                        exact("claude-opus-5-5"),
-                        measured(12),
-                        false
-                    ),
-                    (
-                        "claude-1:msg_b".into(),
-                        exact("claude-opus-5-5"),
-                        measured(1),
-                        false
-                    ),
-                ]
-            )
-        );
-        assert_eq!(
-            store
-                .native_invocation_identity("claude-code", "toolu_1")
-                .unwrap()
-                .map(|identity| identity.model),
-            Some("claude-opus-5-5".into())
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A process that dies mid-stream leaves the latest snapshot per message; startup recovery
-    /// closes that execution exactly once, and later native output is not kept.
-    #[test]
-    fn restart_finalizes_a_dead_turns_partial_claude_sample_once() {
-        let dir = std::env::temp_dir().join(format!("orx-claude-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = capturing(&dir);
-        feed(
-            &mut ctx,
-            &[
-                message_start("msg_a", "claude-opus-5-5", 1),
-                assistant(
-                    "msg_a",
-                    "claude-opus-5-5",
-                    serde_json::json!([{"type":"text","text":"Half"}]),
-                    7,
-                ),
-            ],
-        );
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.reconcile_unfinished_chat_turns().unwrap();
-        store.reconcile_unfinished_chat_turns().unwrap();
-        feed(&mut ctx, &[message_start("msg_late", "claude-opus-5-5", 3)]);
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (
-                Some("failed".into()),
-                vec![(
-                    "claude-1:msg_a".into(),
-                    exact("claude-opus-5-5"),
-                    measured(7),
-                    false
-                )]
-            )
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

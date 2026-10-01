@@ -51,26 +51,21 @@ impl InvocationIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Missing {
-    /// The native stream reported usage or a tool call without a model.
     IdentityNotReported,
-    /// A sub-agent or child the harness never identified; never inherits the parent's model.
+    /// A sub-agent the harness never identified; never inherits the parent's model.
     ChildModelUnknown,
     /// The native label is a path, URL, or ARN rather than a model identifier.
     InvalidLabel,
     /// Claude's locally generated `<synthetic>` error message.
     SyntheticModel,
-    /// A delivered execution produced no native samples.
     NoUsageReported,
-    /// A chat-launched run whose launching tool part was never found.
     InvokerNotLinked,
-    /// The tool parts that could have launched a run disagree on the model.
     InvokerAmbiguous,
     /// A native agent CLI outside OpenResearch chat launched the run; it reports no model.
     ExternalAgent,
 }
 
 impl Missing {
-    /// An unidentified sub-agent never inherits its parent's model.
     pub(crate) fn unidentified(child: bool) -> Self {
         if child {
             Self::ChildModelUnknown
@@ -153,80 +148,6 @@ impl Attribution {
     }
 }
 
-/// Identifies this process as the holder of open executions; a restart makes its holds stale.
-fn usage_holder() -> &'static str {
-    static HOLDER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HOLDER.get_or_init(|| uuid::Uuid::new_v4().to_string())
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RunLink {
-    session_id: String,
-    message_id: Option<String>,
-    command: String,
-}
-
-struct LaunchCandidate {
-    part_id: String,
-    nested: bool,
-    /// The command matches the launching shell's command (or is `orx exp run` without one).
-    hinted: bool,
-    /// The native tool output names this run's unique ID.
-    printed_run: bool,
-}
-
-fn normalized_command(command: &str) -> String {
-    command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
-/// Tool parts that may have launched `run_id`. Nested parts belong to sub-agents.
-fn run_launch_candidates(
-    parts: &[serde_json::Value],
-    hint: &str,
-    run_id: &str,
-    nested: bool,
-    out: &mut Vec<LaunchCandidate>,
-) {
-    for part in parts {
-        if let Some(children) = part.get("children").and_then(serde_json::Value::as_array) {
-            run_launch_candidates(children, hint, run_id, true, out);
-        }
-        let (Some(id), Some(input)) = (
-            part.get("id").and_then(serde_json::Value::as_str),
-            part.pointer("/state/input")
-                .and_then(serde_json::Value::as_object),
-        ) else {
-            continue;
-        };
-        let command = normalized_command(crate::local::chat::tool_command(input));
-        let launches = command.contains("orx exp run");
-        let hinted = if hint.is_empty() {
-            launches
-        } else {
-            !command.is_empty() && (command.contains(hint) || hint.contains(&command))
-        };
-        let printed_run = (launches || hinted)
-            && ["/state/output", "/state/error"].iter().any(|pointer| {
-                part.pointer(pointer)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| text.to_ascii_lowercase().contains(run_id))
-            });
-        if hinted || printed_run {
-            out.push(LaunchCandidate {
-                part_id: id.to_string(),
-                nested,
-                hinted,
-                printed_run,
-            });
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TokenUsage {
@@ -279,6 +200,46 @@ impl TokenUsage {
     }
 }
 
+/// One launcher's attribution, `invoker_ambiguous` when launchers disagree, `None` without any.
+fn agreed(mut found: std::collections::BTreeSet<Attribution>) -> Option<Attribution> {
+    match found.len() {
+        0 => None,
+        1 => found.pop_first(),
+        _ => Some(Attribution::Unresolved {
+            reason: Missing::InvokerAmbiguous,
+        }),
+    }
+}
+
+/// Launch tool parts (`… exp run …`) whose native output names `run_id`; nested parts are sub-agents'.
+fn printed_launches(
+    parts: &[serde_json::Value],
+    run_id: &str,
+    nested: bool,
+    out: &mut Vec<(String, bool)>,
+) {
+    for part in parts {
+        if let Some(children) = part.get("children").and_then(serde_json::Value::as_array) {
+            printed_launches(children, run_id, true, out);
+        }
+        let (Some(id), Some(input)) = (
+            part.get("id").and_then(serde_json::Value::as_str),
+            part.pointer("/state/input")
+                .and_then(serde_json::Value::as_object),
+        ) else {
+            continue;
+        };
+        let printed = ["/state/output", "/state/error"].iter().any(|pointer| {
+            part.pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.to_ascii_lowercase().contains(run_id))
+        });
+        if printed && crate::local::chat::tool_command(input).contains("exp run") {
+            out.push((id.to_string(), nested));
+        }
+    }
+}
+
 impl Store {
     pub(crate) fn native_invocation_identity(
         &self,
@@ -311,49 +272,48 @@ impl Store {
         Ok(())
     }
 
-    /// Call inside the transaction that inserts the run. A chat-launched run without a native
-    /// invoker stays pending until its launching tool part resolves; it is never reported as manual.
+    /// Call inside the transaction that inserts the run. A chat-launched run without a forwarded
+    /// native identity binds at its terminal transition to the tool part whose output printed it.
     pub(crate) fn reserve_run_telemetry(
         &self,
         run_id: &str,
         identity: Option<&InvocationIdentity>,
         launching_session: Option<&str>,
-        tool_command: Option<&str>,
         agent_origin: Option<&str>,
         report: Option<&(String, serde_json::Value)>,
     ) -> Result<()> {
         if let Some(identity) = identity {
             identity.validate()?;
         }
+        // A context inherited from another agent (a host CLI around the app) never overrides the
+        // launching chat's own harness.
+        let chat_harness: Option<String> = launching_session
+            .map(|session| {
+                self.conn
+                    .query_row(
+                        "SELECT harness FROM chat_sessions WHERE id = ?1",
+                        [session],
+                        |row| row.get(0),
+                    )
+                    .optional()
+            })
+            .transpose()?
+            .flatten();
+        let identity = identity.filter(|identity| {
+            chat_harness
+                .as_deref()
+                .is_none_or(|harness| harness == identity.harness)
+        });
         let mut report = report.map(|(_, payload)| payload.clone());
-        let mut link = None;
         if let Some(payload) = report.as_mut() {
             let (harness, attribution) = match (identity, launching_session) {
                 (Some(identity), _) => (Some(identity.harness.clone()), Attribution::of(identity)),
-                (None, Some(session_id)) => {
-                    let (harness, message_id) = self
-                        .conn
-                        .query_row(
-                            // With no turn running, a natively woken run (no app turn) launched it:
-                            // it belongs to the session's latest turn still held for descendants.
-                            "SELECT s.harness, COALESCE((SELECT t.assistant_message_id FROM chat_turns t WHERE t.session_id = s.id AND t.state IN ('preparing', 'retrying', 'running') ORDER BY t.created_at DESC LIMIT 1), (SELECT t.assistant_message_id FROM chat_turns t JOIN chat_usage_executions u ON u.turn_id = t.id WHERE t.session_id = s.id AND u.outcome IS NULL AND u.held_by IS NOT NULL ORDER BY t.created_at DESC LIMIT 1)) FROM chat_sessions s WHERE s.id = ?1",
-                            [session_id],
-                            |row| Ok((Some(row.get(0)?), row.get(1)?)),
-                        )
-                        .optional()?
-                        .unwrap_or((None, None));
-                    link = Some(RunLink {
-                        session_id: session_id.to_string(),
-                        message_id,
-                        command: tool_command.unwrap_or_default().to_string(),
-                    });
-                    (
-                        harness,
-                        Attribution::Unresolved {
-                            reason: Missing::InvokerNotLinked,
-                        },
-                    )
-                }
+                (None, Some(_)) => (
+                    chat_harness.clone(),
+                    Attribution::Unresolved {
+                        reason: Missing::InvokerNotLinked,
+                    },
+                ),
                 (None, None) => match agent_origin {
                     Some(origin) => (
                         ["claude-code", "codex", "opencode", "cursor", "antigravity"]
@@ -370,8 +330,8 @@ impl Store {
             properties["harness"] = serde_json::json!(harness);
             attribution.apply(properties)?;
         }
-        self.conn.execute("INSERT INTO run_telemetry (run_id, identity_json, report_json, link_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(run_id) DO NOTHING", params![run_id, identity.map(serde_json::to_string).transpose()?, report.as_ref().map(serde_json::to_string).transpose()?, link.as_ref().map(serde_json::to_string).transpose()?])?;
-        self.settle_run_report(run_id, false)
+        self.conn.execute("INSERT INTO run_telemetry (run_id, identity_json, report_json) VALUES (?1, ?2, ?3) ON CONFLICT(run_id) DO NOTHING", params![run_id, identity.map(serde_json::to_string).transpose()?, report.as_ref().map(serde_json::to_string).transpose()?])?;
+        Ok(())
     }
 
     pub(super) fn stage_run_terminal(&self, run_id: &str, status: RunStatus) -> Result<()> {
@@ -390,156 +350,190 @@ impl Store {
             payload["events"][0]["occurredAt"] =
                 serde_json::json!(crate::telemetry::iso8601_utc(now_ms()));
             self.conn.execute(
-                "UPDATE run_telemetry SET report_json = ?2, terminal = 1 WHERE run_id = ?1",
-                params![run_id, serde_json::to_string(&payload)?],
+                "UPDATE run_telemetry SET report_json = ?2, pending_since = ?3 WHERE run_id = ?1",
+                params![run_id, serde_json::to_string(&payload)?, now_ms()],
             )?;
-            self.settle_run_report(run_id, true)?;
+            self.settle_run(run_id)?;
         }
         Ok(())
     }
 
-    /// Resolves pending run invokers whose evidence may have changed. Safe to repeat and to race.
-    pub(crate) fn reconcile_run_attribution(&self) -> Result<()> {
+    /// Terminal runs whose launching chat may still persist the tool output that printed them.
+    /// Called after each turn's final flush and at startup; safe to repeat.
+    pub(crate) fn settle_pending_runs(&self) -> Result<()> {
         let pending = self
             .conn
-            .prepare("SELECT run_id FROM run_telemetry WHERE link_json IS NOT NULL AND report_json IS NOT NULL")?
+            .prepare("SELECT run_id FROM run_telemetry WHERE pending_since IS NOT NULL")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for run_id in pending {
             let tx = self.begin_immediate()?;
-            self.settle_run_report(&run_id, false)?;
+            self.settle_run(&run_id)?;
             tx.commit()?;
         }
         Ok(())
     }
 
-    /// Caller holds a write transaction. Stages the terminal report exactly once: either at the
-    /// terminal transition (`terminal_now`) with an already resolved invoker, or when a pending
-    /// invoker resolves after the run was already terminal.
-    fn settle_run_report(&self, run_id: &str, terminal_now: bool) -> Result<()> {
-        let Some((report, link, terminal)) = self
+    /// Caller holds a write transaction. Stages a terminal run's report exactly once: bound to the
+    /// launch part that printed it, or as it stands once no turn of its chat is still running.
+    fn settle_run(&self, run_id: &str) -> Result<()> {
+        let Some(report) = self
             .conn
             .query_row(
-                "SELECT report_json, link_json, terminal FROM run_telemetry WHERE run_id = ?1 AND report_json IS NOT NULL",
+                "SELECT report_json FROM run_telemetry WHERE run_id = ?1 AND pending_since IS NOT NULL AND report_json IS NOT NULL",
                 [run_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, bool>(2)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
         else {
             return Ok(());
         };
         let mut payload: serde_json::Value = serde_json::from_str(&report)?;
-        let resolved_now = if let Some(link) = link {
-            let Some(attribution) =
-                self.resolve_run_invoker(run_id, &serde_json::from_str(&link)?)?
-            else {
-                return Ok(());
+        let properties = &mut payload["events"][0]["properties"];
+        if properties["attributionReason"] == "invoker_not_linked" {
+            let (attribution, active) = match self.printed_run_invoker(run_id)? {
+                Some(attribution) => (Some(attribution), false),
+                None => self.native_run_invoker(run_id)?,
             };
-            attribution.apply(&mut payload["events"][0]["properties"])?;
-            self.conn.execute(
-                "UPDATE run_telemetry SET report_json = ?2, link_json = NULL WHERE run_id = ?1",
-                params![run_id, serde_json::to_string(&payload)?],
-            )?;
-            true
-        } else {
-            false
-        };
-        if terminal && (terminal_now || resolved_now) {
-            let id = payload["events"][0]["eventId"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Missing run telemetry event ID"))?
-                .to_string();
-            self.stage_telemetry(&id, &payload)?;
+            match attribution {
+                Some(attribution) => attribution.apply(properties)?,
+                None if active || self.launching_turn_running(run_id)? => return Ok(()),
+                None => {}
+            }
         }
+        let id = payload["events"][0]["eventId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing run telemetry event ID"))?
+            .to_string();
+        self.stage_telemetry(&id, &payload)?;
+        self.conn.execute(
+            "UPDATE run_telemetry SET report_json = ?2, pending_since = NULL WHERE run_id = ?1",
+            params![run_id, serde_json::to_string(&payload)?],
+        )?;
         Ok(())
     }
 
-    /// The part whose native output prints the run ID is definitive at any time. Without one, only the
-    /// settled turn's full set of command matches may decide, and only when they all agree.
-    /// `None` while the launching turn can still persist that evidence.
-    fn resolve_run_invoker(&self, run_id: &str, link: &RunLink) -> Result<Option<Attribution>> {
-        let (settled, parts) = match &link.message_id {
-            None => (true, None),
-            Some(message_id) => self
-                .conn
-                .query_row(
-                    "SELECT t.state IN ('completed', 'failed', 'interrupted') AND (m.completed_at IS NOT NULL OR NOT EXISTS (SELECT 1 FROM chat_turn_leases l WHERE l.chat_session_id = t.session_id)) AND NOT EXISTS (SELECT 1 FROM chat_usage_executions u WHERE u.turn_id = t.id AND u.outcome IS NULL), m.parts_json FROM chat_turns t LEFT JOIN chat_messages m ON m.id = t.assistant_message_id WHERE t.assistant_message_id = ?1",
-                    [message_id],
-                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
-                )
-                .optional()?
-                .unwrap_or((true, None)),
-        };
-        let harness: Option<String> = self
+    /// The run's launcher from its harness's native records, and whether that session still writes.
+    fn native_run_invoker(&self, run_id: &str) -> Result<(Option<Attribution>, bool)> {
+        let Some((harness, session, native_id)) = self
             .conn
             .query_row(
-                "SELECT harness FROM chat_sessions WHERE id = ?1",
-                [&link.session_id],
+                "SELECT s.harness, s.id, s.native_session_id FROM runs r JOIN chat_sessions s ON s.id = r.chat_session_id WHERE r.id = ?1 AND s.native_session_id IS NOT NULL",
+                [run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .optional()?
+        else {
+            return Ok((None, false));
+        };
+        let (found, active) = crate::local::harness::native_run_invokers(
+            self, &harness, &session, &native_id, run_id,
+        );
+        Ok((agreed(found.into_iter().collect()), active))
+    }
+
+    /// Records the native server process now serving `session` (since `now`): an earlier step's
+    /// owner is the latest one started before it, and survives an ORX restart.
+    pub(crate) fn record_native_owner(&self, session: &str, pid: u32, port: u16) -> Result<()> {
+        let mut owners = self.native_owners(session)?;
+        owners.push((pid, port, now_ms()));
+        // ponytail: keeps the last 8 servers; older steps' owners read as gone.
+        let owners = &owners[owners.len().saturating_sub(8)..];
+        self.conn.execute(
+            "UPDATE chat_sessions SET native_owners_json = ?2 WHERE id = ?1",
+            params![session, serde_json::to_string(owners)?],
+        )?;
+        Ok(())
+    }
+
+    /// (pid, port, started) of the native servers recorded for `session`, oldest first.
+    pub(crate) fn native_owners(&self, session: &str) -> Result<Vec<(u32, u16, i64)>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT native_owners_json FROM chat_sessions WHERE id = ?1",
+                [session],
                 |row| row.get(0),
             )
-            .optional()?;
-        let mut parts: Vec<serde_json::Value> = parts
+            .optional()?
+            .flatten();
+        Ok(json
             .map(|json| serde_json::from_str(&json))
             .transpose()?
-            .unwrap_or_default();
-        // Tool parts no transcript holds (natively woken runs), kept as native scopes.
-        if let Some(message_id) = &link.message_id {
-            let detached = self
-                .conn
-                .prepare("SELECT b.totals_json FROM native_usage_baselines b JOIN chat_usage_executions u ON u.execution_id = b.execution_id JOIN chat_turns t ON t.id = u.turn_id WHERE t.assistant_message_id = ?1 AND substr(b.prefix, 1, 10) = 'tool-part:'")?
-                .query_map([message_id], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for json in detached {
-                parts.push(serde_json::from_str(&json)?);
-            }
-        }
-        let hint = normalized_command(&link.command);
-        let mut candidates = Vec::new();
-        run_launch_candidates(
-            &parts,
-            &hint,
-            &run_id.to_ascii_lowercase(),
-            false,
-            &mut candidates,
-        );
-        let printed = candidates.iter().any(|candidate| candidate.printed_run);
-        if !printed && !settled {
+            .unwrap_or_default())
+    }
+
+    /// The chat session's native conversations its hooks recorded identities for.
+    pub(crate) fn invocation_conversations(
+        &self,
+        harness: &str,
+        session: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let keys = self
+            .conn
+            .prepare("SELECT call_id FROM native_invocation_identities WHERE harness = ?1 AND session_id = ?2")?
+            .query_map([harness, session], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys
+            .iter()
+            .filter_map(|key| {
+                key.strip_prefix(&format!("{harness}:"))?
+                    .split_once(":step:")
+            })
+            .map(|(conversation, _)| conversation.to_string())
+            .collect())
+    }
+
+    fn launching_turn_running(&self, run_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM runs r JOIN chat_turns t ON t.session_id = r.chat_session_id WHERE r.id = ?1 AND t.state IN ('preparing', 'retrying', 'running'))",
+            [run_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The native invoker of the launch tool part whose output printed `run_id` in its chat.
+    /// `None` when no part printed it (for example a run that ended before its tool output persisted).
+    fn printed_run_invoker(&self, run_id: &str) -> Result<Option<Attribution>> {
+        let Some((harness, created_at, session)) = self
+            .conn
+            .query_row(
+                "SELECT s.harness, r.created_at, s.id FROM runs r JOIN chat_sessions s ON s.id = r.chat_session_id WHERE r.id = ?1",
+                [run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            )
+            .optional()?
+        else {
             return Ok(None);
-        }
-        let mut identities = std::collections::BTreeSet::new();
-        let mut unidentified = None;
-        for candidate in candidates.into_iter().filter(|candidate| {
-            if printed {
-                candidate.printed_run
-            } else {
-                candidate.hinted
-            }
-        }) {
-            match harness
-                .as_deref()
-                .map(|harness| self.native_invocation_identity(harness, &candidate.part_id))
-                .transpose()?
-                .flatten()
-            {
-                Some(identity) => {
-                    identities.insert(Attribution::of(&identity));
-                }
-                None => unidentified = Some(unidentified.unwrap_or(false) || candidate.nested),
-            }
-        }
-        if identities.len() == 1 && unidentified.is_none() {
-            return Ok(identities.pop_first());
-        }
-        if !settled {
-            return Ok(None);
-        }
-        let reason = match (identities.len(), unidentified) {
-            (0, None) => Missing::InvokerNotLinked,
-            (0, Some(true)) => Missing::ChildModelUnknown,
-            (0, Some(false)) => Missing::IdentityNotReported,
-            _ => Missing::InvokerAmbiguous,
         };
-        Ok(Some(Attribution::Unresolved { reason }))
+        // The launching turn started before the run; a few recent replies cover it.
+        let messages = self
+            .conn
+            .prepare("SELECT parts_json FROM chat_messages WHERE session_id = ?1 AND role = 'assistant' AND created_at <= ?2 ORDER BY created_at DESC LIMIT 5")?
+            .query_map(params![session, created_at], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut launches = Vec::new();
+        for json in messages {
+            let parts: Vec<serde_json::Value> = serde_json::from_str(&json)?;
+            printed_launches(&parts, &run_id.to_ascii_lowercase(), false, &mut launches);
+        }
+        let mut found = std::collections::BTreeSet::new();
+        for (part_id, nested) in &launches {
+            // Harnesses whose part ids repeat across chats scope them by session.
+            let identity = match self.native_invocation_identity(&harness, part_id)? {
+                Some(identity) => Some(identity),
+                None => {
+                    self.native_invocation_identity(&harness, &format!("{session}:{part_id}"))?
+                }
+            };
+            found.insert(match identity {
+                Some(identity) => Attribution::of(&identity),
+                None => Attribution::Unresolved {
+                    reason: Missing::unidentified(*nested),
+                },
+            });
+        }
+        Ok(agreed(found))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -604,6 +598,7 @@ impl Store {
                 attribution,
                 &delta,
                 true,
+                false,
             )?;
         }
         let baseline = CumulativeBaseline {
@@ -663,8 +658,8 @@ impl Store {
                     tx.execute("UPDATE native_usage_baselines SET totals_json = NULL WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, prefix])?;
                     tx.execute("UPDATE chat_usage_samples SET complete = 0 WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2", params![execution_id, prefix])?;
                 } else {
-                    // The aggregate counts every request's tokens, so listed identities are replaced
-                    // and any other identity keeps only its model (its label may differ from the key).
+                    // The aggregate counts every request's tokens, so listed models are replaced
+                    // and any other identity keeps only its model.
                     let models: Vec<_> = samples.iter().map(|(model, _, _)| model).collect();
                     tx.execute("DELETE FROM chat_usage_samples WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2 AND (substr(sample_id, 1, length(?3)) = ?3 OR model IN (SELECT value FROM json_each(?4)))", params![execution_id, prefix, format!("{prefix}aggregate:"), serde_json::to_string(&models)?])?;
                     tx.execute("UPDATE chat_usage_samples SET usage_json = ?3, complete = 0 WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2", params![execution_id, prefix, serde_json::to_string(&TokenUsage::default())?])?;
@@ -698,15 +693,20 @@ impl Store {
                                 .and_then(|n| n.checked_sub(previous.reasoning_tokens?)),
                         };
                         let sample_id = format!("{prefix}aggregate:{model}");
-                        self.record_usage_sample(
+                        self.record_attributed_sample(
                             execution_id,
                             &sample_id,
                             harness,
-                            Some(model),
-                            provider.as_deref(),
+                            &Attribution::native(
+                                harness,
+                                Some(model),
+                                provider.as_deref(),
+                                Missing::IdentityNotReported,
+                            ),
                             &delta,
+                            delta.input_tokens.is_some() && delta.output_tokens.is_some(),
+                            false,
                         )?;
-                        tx.execute("UPDATE chat_usage_samples SET complete = ?3 WHERE execution_id = ?1 AND sample_id = ?2", params![execution_id, sample_id, delta.input_tokens.is_some() && delta.output_tokens.is_some()])?;
                     }
                 }
             }
@@ -726,16 +726,89 @@ impl Store {
         Ok(())
     }
 
+    /// Opens an execution for native work outside any chat turn (a sub-agent that outlives its
+    /// parent's turn), owned by the session's latest turn. Its id starts with `native:`, so the
+    /// turn's own finalization leaves it open; it closes on its native end or startup recovery.
+    pub(crate) fn begin_native_execution(
+        &self,
+        execution_id: &str,
+        session_id: &str,
+        harness: &str,
+    ) -> Result<bool> {
+        debug_assert!(execution_id.starts_with("native:"));
+        let inserted = self.conn.execute("INSERT INTO chat_usage_executions (execution_id, turn_id, harness, report_id, suppressed) SELECT ?1, t.id, ?3, ?4, ?5 FROM chat_turns t WHERE t.session_id = ?2 ORDER BY t.created_at DESC LIMIT 1 ON CONFLICT(execution_id) DO NOTHING", params![execution_id, session_id, harness, uuid::Uuid::new_v4().to_string(), !crate::telemetry::accounting_reports_enabled()])?;
+        Ok(inserted > 0
+            || self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL)",
+                [execution_id],
+                |row| row.get(0),
+            )?)
+    }
+
+    /// The open chat execution of `turn_id` on `harness`, with its native session and start time.
+    pub(crate) fn open_turn_execution(
+        &self,
+        turn_id: &str,
+        harness: &str,
+    ) -> Result<Option<(String, String, i64)>> {
+        Ok(self.conn.query_row("SELECT u.execution_id, s.native_session_id, t.created_at FROM chat_usage_executions u JOIN chat_turns t ON t.id = u.turn_id JOIN chat_sessions s ON s.id = t.session_id WHERE u.turn_id = ?1 AND u.harness = ?2 AND u.outcome IS NULL AND substr(u.execution_id, 1, 7) <> 'native:' AND s.native_session_id IS NOT NULL", params![turn_id, harness], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?)
+    }
+
+    /// Samples under `prefix` that carry no native model and no hook identity.
+    pub(crate) fn unidentified_samples(
+        &self,
+        execution_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT s.sample_id FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 AND s.model IS NULL AND n.call_id IS NULL AND substr(s.sample_id, 1, length(?2)) = ?2")?
+            .query_map(params![execution_id, prefix], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Turns whose chat execution is still open.
+    pub(crate) fn open_execution_turns(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT turn_id FROM chat_usage_executions WHERE outcome IS NULL AND substr(execution_id, 1, 7) <> 'native:'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// (session, native session, first accounted turn start) on `harness` with no turn still
+    /// running. Native history before ORX's first turn (an imported session) is never accounted.
+    pub(crate) fn idle_native_sessions(&self, harness: &str) -> Result<Vec<(String, String, i64)>> {
+        Ok(self
+            .conn
+            .prepare("SELECT s.id, s.native_session_id, MIN(t.created_at) FROM chat_sessions s JOIN chat_turns t ON t.session_id = s.id JOIN chat_usage_executions u ON u.turn_id = t.id WHERE s.harness = ?1 AND s.native_session_id IS NOT NULL GROUP BY s.id HAVING SUM(u.outcome IS NULL AND substr(u.execution_id, 1, 7) <> 'native:') = 0")?
+            .query_map([harness], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Whether any execution holds native sample `sample_id` (measured, when `measured`).
+    pub(crate) fn native_sample_exists(
+        &self,
+        harness: &str,
+        sample_id: &str,
+        measured: bool,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM chat_usage_samples WHERE harness = ?1 AND sample_id = ?2 AND (NOT ?3 OR usage_json <> ?4))",
+            params![harness, sample_id, measured, serde_json::to_string(&TokenUsage::default())?],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn recover_terminal_usage(&self) -> Result<()> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT t.id, t.state FROM chat_usage_executions u JOIN chat_turns t ON t.id = u.turn_id WHERE u.outcome IS NULL AND t.state IN ('completed', 'failed', 'interrupted') AND NOT EXISTS (SELECT 1 FROM chat_turn_leases l WHERE l.chat_session_id = t.session_id)")?;
-        let rows = stmt
+        let rows = self.conn.prepare("SELECT u.execution_id, t.state FROM chat_usage_executions u JOIN chat_turns t ON t.id = u.turn_id WHERE u.outcome IS NULL AND t.state IN ('completed', 'failed', 'interrupted') AND NOT EXISTS (SELECT 1 FROM chat_turn_leases l WHERE l.chat_session_id = t.session_id)")?
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (turn_id, state) in rows {
-            self.finalize_turn_usage(
-                &turn_id,
+        for (execution_id, state) in rows {
+            self.finalize_usage_execution(
+                &execution_id,
                 match state.as_str() {
                     "completed" => "done",
                     "interrupted" => "cancelled",
@@ -746,112 +819,16 @@ impl Store {
         Ok(())
     }
 
-    /// Closes the turn's executions. One this process holds (native descendants still running)
-    /// only records the outcome and closes on release; a hold left by a dead process closes now.
     pub(crate) fn finalize_turn_usage(&self, turn_id: &str, outcome: &str) -> Result<()> {
         let executions = self
             .conn
-            .prepare("SELECT execution_id FROM chat_usage_executions WHERE turn_id = ?1 AND outcome IS NULL")?
+            .prepare("SELECT execution_id FROM chat_usage_executions WHERE turn_id = ?1 AND outcome IS NULL AND substr(execution_id, 1, 7) <> 'native:'")?
             .query_map([turn_id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for execution_id in executions {
-            let held = self.conn.execute("UPDATE chat_usage_executions SET pending_outcome = COALESCE(pending_outcome, ?2) WHERE execution_id = ?1 AND outcome IS NULL AND held_by = ?3", params![execution_id, outcome, usage_holder()])?;
-            if held == 0 {
-                self.finalize_usage_execution(&execution_id, outcome)?;
-            }
+            self.finalize_usage_execution(&execution_id, outcome)?;
         }
         Ok(())
-    }
-
-    /// Keeps an open execution accepting native samples after its turn ends, until
-    /// [`Self::release_usage_execution`] or this process exits. False if it already closed.
-    pub(crate) fn hold_usage_execution(&self, execution_id: &str) -> Result<bool> {
-        Ok(self.conn.execute(
-            "UPDATE chat_usage_executions SET held_by = ?2 WHERE execution_id = ?1 AND outcome IS NULL",
-            params![execution_id, usage_holder()],
-        )? == 1)
-    }
-
-    /// Ends a hold; closes the execution now if its turn already ended.
-    pub(crate) fn release_usage_execution(&self, execution_id: &str) -> Result<()> {
-        let pending: Option<Option<String>> = self.conn.query_row("UPDATE chat_usage_executions SET held_by = NULL WHERE execution_id = ?1 AND outcome IS NULL RETURNING pending_outcome", [execution_id], |row| row.get(0)).optional()?;
-        if let Some(Some(outcome)) = pending {
-            self.finalize_usage_execution(execution_id, &outcome)?;
-            // Native descendants settled, so run invokers waiting on them can resolve now.
-            self.reconcile_run_attribution()?;
-        }
-        Ok(())
-    }
-
-    /// Drops an open execution's placeholder sample that later native evidence superseded.
-    pub(crate) fn delete_usage_sample(&self, execution_id: &str, sample_id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM chat_usage_samples WHERE execution_id = ?1 AND sample_id = ?2 AND EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL)", params![execution_id, sample_id])?;
-        Ok(())
-    }
-
-    /// Durable per-execution native capture state (e.g. which rollout segment belongs to it),
-    /// so a restart can finish reading evidence a dead process left behind.
-    pub(crate) fn set_native_scope(
-        &self,
-        execution_id: &str,
-        prefix: &str,
-        state: &serde_json::Value,
-    ) -> Result<()> {
-        self.conn.execute("INSERT INTO native_usage_baselines (execution_id, prefix, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(execution_id, prefix) DO UPDATE SET totals_json = excluded.totals_json", params![execution_id, prefix, state.to_string()])?;
-        Ok(())
-    }
-
-    pub(crate) fn clear_native_scope(&self, execution_id: &str, prefix: &str) -> Result<()> {
-        self.conn.execute("UPDATE native_usage_baselines SET totals_json = NULL WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, prefix])?;
-        Ok(())
-    }
-
-    /// Native scopes under `prefix`, flagged when their execution is open and no live process
-    /// holds it (a dead process left it). Call before recovery closes them.
-    pub(crate) fn native_scopes(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<(String, String, serde_json::Value, bool)>> {
-        self.conn
-            .prepare("SELECT b.execution_id, b.prefix, b.totals_json, u.outcome IS NULL AND (u.held_by IS NULL OR u.held_by != ?2) FROM native_usage_baselines b JOIN chat_usage_executions u ON u.execution_id = b.execution_id WHERE substr(b.prefix, 1, length(?1)) = ?1 AND b.totals_json IS NOT NULL")?
-            .query_map(params![prefix, usage_holder()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            })?
-            .map(|row| {
-                let (execution, prefix, json, orphaned) = row?;
-                Ok((execution, prefix, serde_json::from_str(&json)?, orphaned))
-            })
-            .collect()
-    }
-
-    /// The last cumulative total recorded for `native_scope` in this execution.
-    pub(crate) fn cumulative_usage_total(
-        &self,
-        execution_id: &str,
-        native_scope: &str,
-    ) -> Result<Option<TokenUsage>> {
-        let json: Option<String> = self.conn.query_row("SELECT totals_json FROM native_usage_baselines WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, format!("cumulative:{native_scope}")], |row| row.get(0)).optional()?.flatten();
-        Ok(json
-            .map(|json| serde_json::from_str::<CumulativeBaseline>(&json))
-            .transpose()?
-            .map(|baseline| baseline.usage))
-    }
-
-    /// The open execution of a turn, for native evidence captured outside its `TurnCtx`.
-    pub(crate) fn open_usage_execution(&self, turn_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT execution_id FROM chat_usage_executions WHERE turn_id = ?1 AND outcome IS NULL",
-                [turn_id],
-                |row| row.get(0),
-            )
-            .optional()?)
     }
 
     /// One report per (attribution, measured counters) group of an execution's samples.
@@ -863,102 +840,70 @@ impl Store {
         outcome: &str,
         delivery: Option<&str>,
     ) -> Result<Vec<serde_json::Value>> {
-        let mut samples = self.conn.prepare("SELECT s.sample_id, s.model, s.provider, s.usage_json, s.complete, n.identity_json, s.attribution_json FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 ORDER BY s.sample_id")?;
-        // A `None` attribution is a sample recorded before attribution existed; it reports as legacy.
-        type Key = (
-            Option<Attribution>,
-            Option<String>,
-            Option<String>,
-            [bool; 5],
-        );
-        let mut rows = Vec::<(String, Key, TokenUsage, bool)>::new();
-        for row in samples.query_map([&execution_id], |row| {
+        type Key = (Attribution, [bool; 5]);
+        let mut grouped = std::collections::BTreeMap::<Key, Vec<(TokenUsage, bool)>>::new();
+        let mut samples = self.conn.prepare("SELECT s.model, s.provider, s.usage_json, s.complete, n.identity_json, s.attribution_json FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 ORDER BY s.sample_id")?;
+        for row in samples.query_map([execution_id], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(0)?,
                 row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, bool>(4)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
             ))
         })? {
-            let (sample_id, model, provider, json, complete, identity, attribution) = row?;
+            let (model, provider, json, complete, identity, attribution) = row?;
             let identity: Option<InvocationIdentity> = identity
                 .map(|json| serde_json::from_str(&json))
                 .transpose()?;
-            let attribution: Option<Attribution> = attribution
-                .map(|json| serde_json::from_str(&json))
-                .transpose()?;
-            // A native identity recorded under the same sample ID resolves it, child or not.
-            let (attribution, model, provider) = match (attribution, identity) {
-                (
-                    Some(Attribution::Unresolved {
-                        reason: Missing::IdentityNotReported | Missing::ChildModelUnknown,
-                    }),
-                    Some(identity),
-                ) => (Some(Attribution::of(&identity)), None, None),
-                (Some(attribution), _) => (Some(attribution), None, None),
-                (None, identity) => (
-                    None,
-                    model.or_else(|| identity.as_ref().map(|identity| identity.model.clone())),
-                    provider.or_else(|| identity.and_then(|identity| identity.provider)),
+            // Rows from before attribution existed carry only the model.
+            let attribution = match attribution {
+                Some(json) => serde_json::from_str(&json)?,
+                None => Attribution::native(
+                    harness,
+                    model.as_deref(),
+                    provider.as_deref(),
+                    Missing::IdentityNotReported,
                 ),
+            };
+            // A native identity recorded under the same sample id (a hook) resolves it.
+            let attribution = match (attribution, identity) {
+                (
+                    Attribution::Unresolved {
+                        reason: Missing::IdentityNotReported | Missing::ChildModelUnknown,
+                    },
+                    Some(identity),
+                ) => Attribution::of(&identity),
+                (attribution, _) => attribution,
             };
             let usage: TokenUsage = serde_json::from_str(&json)?;
             let measured = usage.counters().map(|counter| counter.is_some());
-            rows.push((
-                sample_id,
-                (attribution, model, provider, measured),
-                usage,
-                complete,
-            ));
+            grouped
+                .entry((attribution, measured))
+                .or_default()
+                .push((usage, complete));
         }
-        // Every identity-only request stays visible, except two explicit markers: a
-        // `{scope}:identity[:…]` marker whose own scope has measured samples of the same
-        // attribution, and a `…:subagent:{child}` spawn marker once that child's own exact
-        // samples exist. A sibling's identity never covers another child's spawn.
-        let covered: Vec<bool> = rows
-            .iter()
-            .map(|(id, key, _, _)| {
-                if key.3.contains(&true) {
-                    return false;
-                }
-                if let Some((_, child)) = id.split_once(":subagent:") {
-                    let own = format!(":{child}:");
-                    return rows.iter().any(|(other, other_key, _, _)| {
-                        (other.contains(&own) || other.starts_with(&own[1..]))
-                            && matches!(other_key.0, Some(Attribution::Exact { .. }))
-                    });
-                }
-                id.find(":identity").is_some_and(|at| {
-                    let scope = &id[..=at];
-                    rows.iter().any(|(other, other_key, _, _)| {
-                        other.starts_with(scope)
-                            && other_key.3.contains(&true)
-                            && other_key.0 == key.0
-                    })
-                })
-            })
+        // An identity seen without counters joins its model's measured requests when there are any.
+        let measured: std::collections::BTreeSet<Attribution> = grouped
+            .keys()
+            .filter(|(_, mask)| mask.contains(&true))
+            .map(|(attribution, _)| attribution.clone())
             .collect();
-        let mut grouped = std::collections::BTreeMap::<Key, Vec<(TokenUsage, bool)>>::new();
-        for ((_, key, usage, complete), covered) in rows.into_iter().zip(covered) {
-            if !covered {
-                grouped.entry(key).or_default().push((usage, complete));
-            }
-        }
+        grouped.retain(|(attribution, mask), _| {
+            mask.contains(&true) || !measured.contains(attribution)
+        });
         // A zero-usage synthetic error only reports when nothing else ran.
         let only_group = grouped.len() == 1;
-        grouped.retain(|(attribution, _, _, _), samples| match attribution {
-            Some(Attribution::Unresolved {
-                reason: Missing::SyntheticModel,
-            }) => {
-                only_group
-                    || samples
-                        .iter()
-                        .any(|(usage, _)| usage.counters().iter().any(|n| n.unwrap_or(0) > 0))
-            }
-            _ => true,
+        grouped.retain(|(attribution, _), samples| {
+            *attribution
+                != Attribution::Unresolved {
+                    reason: Missing::SyntheticModel,
+                }
+                || only_group
+                || samples
+                    .iter()
+                    .any(|(usage, _)| usage.counters().iter().any(|n| n.unwrap_or(0) > 0))
         });
         if grouped.is_empty() {
             let attribution = if matches!(delivery, Some("not_sent" | "rejected")) {
@@ -968,14 +913,11 @@ impl Store {
                     reason: Missing::NoUsageReported,
                 }
             };
-            grouped.insert((Some(attribution), None, None, [false; 5]), Vec::new());
+            grouped.insert((attribution, [false; 5]), Vec::new());
         }
         let mut reports = Vec::new();
-        for ((attribution, model, provider, _), samples) in grouped {
+        for ((attribution, _), samples) in grouped {
             let sum = |field: fn(&TokenUsage) -> Option<u64>| -> Option<u64> {
-                if samples.is_empty() {
-                    return None;
-                }
                 let measured: Vec<_> = samples
                     .iter()
                     .filter_map(|(usage, _)| field(usage))
@@ -998,26 +940,15 @@ impl Store {
             let mut properties = serde_json::to_value(&usage)?;
             properties["reportId"] = serde_json::json!(report_id);
             properties["harness"] = serde_json::json!(harness);
-            properties["model"] = serde_json::json!(model);
-            properties["provider"] = serde_json::json!(provider);
-            // Legacy samples keep the old rule that complete coverage also needs a model.
-            let identity_complete = match &attribution {
-                Some(attribution) => {
-                    attribution.apply(&mut properties)?;
-                    true
-                }
-                None => model.is_some(),
-            };
+            attribution.apply(&mut properties)?;
             properties["totalTokens"] = serde_json::json!(usage.total());
             properties["outcome"] = serde_json::json!(outcome);
             properties["coverage"] =
                 serde_json::json!(if usage.counters().iter().all(Option::is_none) {
                     "missing"
-                } else if identity_complete
-                    && samples.iter().all(|(usage, complete)| *complete
-                        && usage.input_tokens.is_some()
-                        && usage.output_tokens.is_some())
-                {
+                } else if samples.iter().all(|(usage, complete)| {
+                    *complete && usage.input_tokens.is_some() && usage.output_tokens.is_some()
+                }) {
                     "complete"
                 } else {
                     "partial"
@@ -1027,33 +958,46 @@ impl Store {
         Ok(reports)
     }
 
-    /// Snapshots, closes, and stages under one write lock, so a sample committed by another
-    /// process is either in the report or rejected as late; never accepted and unreported.
-    fn finalize_usage_execution(&self, execution_id: &str, outcome: &str) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+
+    /// Every execution's report properties at `outcome`, without closing or staging.
+    #[cfg(test)]
+    pub(crate) fn test_usage_reports(&self, outcome: &str) -> Result<Vec<serde_json::Value>> {
+        let executions = self
+            .conn
+            .prepare("SELECT u.execution_id, u.harness, u.report_id, t.delivery_state FROM chat_usage_executions u LEFT JOIN chat_turns t ON t.id = u.turn_id ORDER BY u.execution_id")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut reports = Vec::new();
+        for (execution, harness, report_id, delivery) in executions {
+            reports.extend(self.usage_report_properties(
+                &execution,
+                &harness,
+                &report_id,
+                outcome,
+                delivery.as_deref(),
+            )?);
+        }
+        Ok(reports)
+    }
+
+    /// Closes and stages under one write lock, so a sample committed by another process is either
+    /// in the report or rejected as late; never accepted and unreported.
+    pub(crate) fn finalize_usage_execution(&self, execution_id: &str, outcome: &str) -> Result<()> {
         let tx = self.begin_immediate()?;
-        let Some((turn_id, harness, report_id, suppressed, pending)) = tx
+        let Some((turn_id, harness, report_id, suppressed)) = tx
             .query_row(
-                "SELECT turn_id, harness, report_id, suppressed, pending_outcome FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL",
-                [execution_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, bool>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                },
+                "UPDATE chat_usage_executions SET outcome = ?2 WHERE execution_id = ?1 AND outcome IS NULL RETURNING turn_id, harness, report_id, suppressed",
+                params![execution_id, outcome],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?)),
             )
             .optional()?
         else {
             return Ok(());
         };
-        let outcome = pending.as_deref().unwrap_or(outcome);
-        tx.execute(
-            "UPDATE chat_usage_executions SET outcome = ?2, held_by = NULL WHERE execution_id = ?1",
-            params![execution_id, outcome],
-        )?;
         if !suppressed {
             let delivery: Option<String> = tx
                 .query_row(
@@ -1067,7 +1011,9 @@ impl Store {
                 &harness,
                 &report_id,
                 outcome,
-                delivery.as_deref(),
+                delivery
+                    .as_deref()
+                    .filter(|_| !execution_id.starts_with("native:")),
             )? {
                 if let Some((id, payload)) =
                     crate::telemetry::pending_event_payload("chat_model_usage", properties)
@@ -1115,7 +1061,7 @@ impl Store {
         let tx = self.begin()?;
         tx.execute("DELETE FROM telemetry_pending_events", [])?;
         tx.execute(
-            "UPDATE run_telemetry SET report_json = NULL, link_json = NULL",
+            "UPDATE run_telemetry SET report_json = NULL, pending_since = NULL",
             [],
         )?;
         tx.execute(
@@ -1126,26 +1072,10 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn record_usage_sample(
-        &self,
-        execution_id: &str,
-        sample_id: &str,
-        harness: &str,
-        model: Option<&str>,
-        provider: Option<&str>,
-        usage: &TokenUsage,
-    ) -> Result<()> {
-        self.record_attributed_sample(
-            execution_id,
-            sample_id,
-            harness,
-            &Attribution::native(harness, model, provider, Missing::IdentityNotReported),
-            usage,
-            false,
-        )
-    }
-
-    /// Upserts one native sample; a later sample without a model never downgrades a recorded model.
+    /// Upserts one native sample: an identity-only write keeps measured counters, and a measured
+    /// write replaces them (snapshots, not deltas). `exclusive` skips a sample already measured
+    /// by another execution, so re-read native records count once.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_attributed_sample(
         &self,
         execution_id: &str,
@@ -1154,12 +1084,13 @@ impl Store {
         attribution: &Attribution,
         usage: &TokenUsage,
         complete: bool,
+        exclusive: bool,
     ) -> Result<()> {
         usage.validate()?;
         let (model, provider) = attribution.model();
+        let unmeasured = serde_json::to_string(&TokenUsage::default())?;
         let measured = usage != &TokenUsage::default();
-        // An identity-only write keeps measured counters; a measured write replaces them (snapshots, not deltas).
-        self.conn.execute("INSERT INTO chat_usage_samples (execution_id, sample_id, harness, model, provider, usage_json, complete, attribution_json) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL) ON CONFLICT(execution_id, sample_id) DO UPDATE SET usage_json = CASE WHEN ?9 THEN excluded.usage_json ELSE usage_json END, complete = CASE WHEN ?9 THEN excluded.complete ELSE complete END, model = COALESCE(excluded.model, model), provider = CASE WHEN excluded.model IS NULL AND model IS NOT NULL THEN provider ELSE excluded.provider END, attribution_json = CASE WHEN excluded.model IS NULL AND model IS NOT NULL THEN attribution_json ELSE excluded.attribution_json END", params![execution_id, sample_id, harness, model, provider, serde_json::to_string(usage)?, complete, serde_json::to_string(attribution)?, measured])?;
+        self.conn.execute("INSERT INTO chat_usage_samples (execution_id, sample_id, harness, model, provider, usage_json, complete, attribution_json) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL) AND NOT (?10 AND EXISTS (SELECT 1 FROM chat_usage_samples o WHERE o.sample_id = ?2 AND o.harness = ?3 AND o.execution_id <> ?1 AND o.usage_json <> ?11)) ON CONFLICT(execution_id, sample_id) DO UPDATE SET usage_json = CASE WHEN ?9 THEN excluded.usage_json ELSE usage_json END, complete = CASE WHEN ?9 THEN excluded.complete ELSE complete END, model = COALESCE(excluded.model, model), provider = CASE WHEN excluded.model IS NULL AND model IS NOT NULL THEN provider ELSE excluded.provider END, attribution_json = CASE WHEN excluded.model IS NULL AND model IS NOT NULL THEN attribution_json ELSE excluded.attribution_json END", params![execution_id, sample_id, harness, model, provider, serde_json::to_string(usage)?, complete, serde_json::to_string(attribution)?, measured, exclusive, unmeasured])?;
         Ok(())
     }
 }
@@ -1167,6 +1098,28 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Store {
+        fn record_usage_sample(
+            &self,
+            execution_id: &str,
+            sample_id: &str,
+            harness: &str,
+            model: Option<&str>,
+            provider: Option<&str>,
+            usage: &TokenUsage,
+        ) -> Result<()> {
+            self.record_attributed_sample(
+                execution_id,
+                sample_id,
+                harness,
+                &Attribution::native(harness, model, provider, Missing::IdentityNotReported),
+                usage,
+                false,
+                false,
+            )
+        }
+    }
 
     #[test]
     fn prepared_chat_report_cannot_escape_opt_out_or_duplicate_finalization() {
@@ -1178,6 +1131,16 @@ mod tests {
         store
             .conn
             .execute("UPDATE chat_usage_executions SET suppressed = 0", [])
+            .unwrap();
+        store
+            .record_usage_sample(
+                "execution",
+                "sample",
+                "claude-code",
+                Some("claude-opus-5-5"),
+                None,
+                &TokenUsage::default(),
+            )
             .unwrap();
         store.purge_pending_telemetry().unwrap();
         store.finalize_usage_execution("execution", "done").unwrap();
@@ -1403,7 +1366,7 @@ mod tests {
         );
         let tx = store.begin().unwrap();
         store
-            .reserve_run_telemetry(&run.id, Some(&identity), None, None, None, Some(&report))
+            .reserve_run_telemetry(&run.id, Some(&identity), None, None, Some(&report))
             .unwrap();
         store.upsert_run(&run).unwrap();
         tx.commit().unwrap();
@@ -1584,12 +1547,6 @@ mod tests {
         store
             .begin_usage_execution("execution", "turn", "codex")
             .unwrap();
-        let exact = Attribution::native(
-            "codex",
-            Some("gpt-6-sol"),
-            None,
-            Missing::IdentityNotReported,
-        );
         for _ in 0..2 {
             store
                 .record_cumulative_usage(
@@ -1597,7 +1554,9 @@ mod tests {
                     "codex",
                     "thread",
                     "native-turn",
-                    &exact,
+                    &Attribution::Unresolved {
+                        reason: Missing::IdentityNotReported,
+                    },
                     &usage(1100, 110),
                     &usage(100, 10),
                 )
@@ -1609,7 +1568,9 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
-                &exact,
+                &Attribution::Unresolved {
+                    reason: Missing::IdentityNotReported,
+                },
                 &usage(1200, 120),
                 &usage(100, 10),
             )
@@ -1620,7 +1581,9 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
-                &exact,
+                &Attribution::Unresolved {
+                    reason: Missing::IdentityNotReported,
+                },
                 &usage(1000, 100),
                 &usage(0, 0),
             )
@@ -1631,7 +1594,9 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
-                &exact,
+                &Attribution::Unresolved {
+                    reason: Missing::IdentityNotReported,
+                },
                 &usage(1100, 110),
                 &usage(100, 10),
             )
@@ -1807,1242 +1772,476 @@ mod tests {
         .is_err());
     }
 
-    fn chat_fixture(harness: &str) -> (std::path::PathBuf, Store) {
-        let dir = std::env::temp_dir().join(format!("orx-run-invoker-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store.conn.execute("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('session', 'project', ?1, 1, 1)", [harness]).unwrap();
-        store.conn.execute("INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('turn', 'session', 'message', 'client', 'hash', '', '{}', 'running', 'accepted', 1, 1)", []).unwrap();
-        store.conn.execute("INSERT INTO chat_messages (id, session_id, role, parts_json, created_at) VALUES ('message', 'session', 'assistant', '[]', 1)", []).unwrap();
-        store.conn.execute("INSERT INTO chat_turn_leases (chat_session_id, claim_token, heartbeat_at) VALUES ('session', 'claim', ?1)", [now_ms()]).unwrap();
-        (dir, store)
+    fn exact(model: &str) -> Attribution {
+        Attribution::Exact {
+            model: model.into(),
+            provider: None,
+        }
     }
 
-    fn tool(id: &str, command: &str) -> serde_json::Value {
-        serde_json::json!({"id": id, "type": "tool", "state": {"input": {"command": command}}})
+    fn measured(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            ..Default::default()
+        }
     }
 
-    fn set_parts(store: &Store, parts: serde_json::Value) {
-        store
-            .conn
-            .execute(
-                "UPDATE chat_messages SET parts_json = ?1 WHERE id = 'message'",
-                [parts.to_string()],
-            )
-            .unwrap();
-    }
+    /// Report rows as (attribution, model, reason, coverage, input).
+    type Row = (String, Option<String>, Option<String>, String, Option<u64>);
 
-    fn launch(store: &Store, run_id: &str, session: Option<&str>, command: &str) {
-        let event_id = uuid::Uuid::new_v4().to_string();
-        let report = (
-            event_id.clone(),
-            serde_json::json!({"events":[{"eventId":event_id,"properties":{"status":"failed"}}]}),
-        );
-        let tx = store.begin().unwrap();
+    fn rows(store: &Store) -> Vec<Row> {
         store
-            .reserve_run_telemetry(run_id, None, session, Some(command), None, Some(&report))
-            .unwrap();
-        store
-            .upsert_run(&StoredRun {
-                id: run_id.into(),
-                experiment_id: "exp".into(),
-                project_id: "project".into(),
-                status: "starting".into(),
-                backend_json: "{}".into(),
-                command: "".into(),
-                created_at: 1,
-                updated_at: 1,
-                ended_at: None,
-                exit_code: None,
-                commit_sha: None,
-                result_markdown: None,
-                cancel_requested: false,
-                chat_session_id: session.map(str::to_string),
-            })
-            .unwrap();
-        tx.commit().unwrap();
-    }
-
-    fn staged(store: &Store) -> Vec<serde_json::Value> {
-        store
-            .pending_telemetry()
+            .test_usage_reports("done")
             .unwrap()
-            .into_iter()
-            .map(|(_, payload)| payload["events"][0]["properties"].clone())
+            .iter()
+            .map(|r| {
+                (
+                    r["attribution"].as_str().unwrap().into(),
+                    r["model"].as_str().map(Into::into),
+                    r["attributionReason"].as_str().map(Into::into),
+                    r["coverage"].as_str().unwrap().into(),
+                    r["inputTokens"].as_u64(),
+                )
+            })
             .collect()
     }
 
-    fn codex_identity() -> InvocationIdentity {
-        InvocationIdentity {
-            harness: "codex".into(),
-            model: "gpt-6-sol".into(),
-            provider: Some("openai".into()),
-        }
+    fn row(
+        attribution: &str,
+        model: Option<&str>,
+        reason: Option<&str>,
+        coverage: &str,
+        input: Option<u64>,
+    ) -> Row {
+        (
+            attribution.into(),
+            model.map(Into::into),
+            reason.map(Into::into),
+            coverage.into(),
+            input,
+        )
     }
 
-    fn printed(id: &str, command: &str, run_id: &str) -> serde_json::Value {
-        let mut part = tool(id, command);
-        part["state"]["output"] = serde_json::json!(format!(
-            "\u{2713} local run submitted by orx up.\n  run  {run_id}\n"
-        ));
-        part
-    }
-
-    #[test]
-    fn run_finishing_before_its_tool_binds_waits_across_restart_and_reports_once() {
-        let (dir, store) = chat_fixture("codex");
-        let run = uuid::Uuid::new_v4().to_string();
-        launch(&store, &run, Some("session"), "orx exp run exp");
-        assert!(store
-            .update_status(&run, RunStatus::Failed, Some(2), Some(1))
-            .unwrap());
-        store.reconcile_run_attribution().unwrap();
-        assert!(staged(&store).is_empty());
-        drop(store);
-        let store = Store::open_at(dir.clone()).unwrap();
-        assert!(store
-            .reconcile_expired_unfinished_chat_turns()
-            .unwrap()
-            .is_empty());
-        set_parts(
-            &store,
-            serde_json::json!([tool("call-1", "cd /repo && orx exp run exp")]),
-        );
-        store
-            .record_native_invocation("call-1", &codex_identity(), Some("session"))
-            .unwrap();
-        store.reconcile_run_attribution().unwrap();
-        assert!(
-            staged(&store).is_empty(),
-            "a command match alone must wait for the output or the settled turn"
-        );
-        set_parts(
-            &store,
-            serde_json::json!([printed("call-1", "cd /repo && orx exp run exp", &run)]),
-        );
-        store.reconcile_run_attribution().unwrap();
-        store.reconcile_run_attribution().unwrap();
-        assert!(!store
-            .update_status(&run, RunStatus::Cancelled, Some(3), None)
-            .unwrap());
-        let reports = staged(&store);
-        assert_eq!(reports.len(), 1);
-        assert_eq!(
-            reports[0],
-            serde_json::json!({"status":"failed","harness":"codex","model":"gpt-6-sol","provider":"openai","attribution":"exact","attributionReason":null})
-        );
-        let (id, _) = store.pending_telemetry().unwrap().remove(0);
-        store.acknowledge_pending_telemetry(&id).unwrap();
-        store.reconcile_run_attribution().unwrap();
-        assert!(staged(&store).is_empty());
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn run_bound_before_it_finishes_reports_exact_at_cancellation() {
-        let (dir, store) = chat_fixture("codex");
-        let run = uuid::Uuid::new_v4().to_string();
-        let command = "orx exp run exp --backend local";
-        store
-            .record_native_invocation("call-1", &codex_identity(), Some("session"))
-            .unwrap();
-        launch(&store, &run, Some("session"), command);
-        set_parts(
-            &store,
-            serde_json::json!([printed("call-1", command, &run)]),
-        );
-        store.reconcile_run_attribution().unwrap();
-        assert!(staged(&store).is_empty());
-        for _ in 0..2 {
-            store
-                .update_status(&run, RunStatus::Cancelled, Some(2), None)
-                .unwrap();
-        }
-        let reports = staged(&store);
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0]["status"], "cancelled");
-        assert_eq!(reports[0]["attribution"], "exact");
-        assert_eq!(reports[0]["model"], "gpt-6-sol");
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn identical_commands_from_different_models_bind_by_their_printed_run_ids() {
-        let (dir, store) = chat_fixture("codex");
-        let command = "orx exp run exp";
-        let child_model = InvocationIdentity {
-            model: "gpt-6-mini".into(),
-            ..codex_identity()
-        };
-        store
-            .record_native_invocation("parent-call", &codex_identity(), Some("session"))
-            .unwrap();
-        store
-            .record_native_invocation("child-call", &child_model, Some("session"))
-            .unwrap();
-        let [parent_run, child_run, silent_run] =
-            std::array::from_fn(|_| uuid::Uuid::new_v4().to_string());
-        for run in [&parent_run, &child_run, &silent_run] {
-            launch(&store, run, Some("session"), command);
-        }
-        let parts = |parent_output: bool| {
-            let mut spawn = tool("spawn", "");
-            spawn["children"] = serde_json::json!([printed("child-call", command, &child_run)]);
-            let parent = if parent_output {
-                printed("parent-call", command, &parent_run)
-            } else {
-                tool("parent-call", command)
-            };
-            serde_json::json!([spawn, parent])
-        };
-        set_parts(&store, serde_json::json!([tool("parent-call", command)]));
-        for run in [&child_run, &parent_run, &silent_run] {
-            store
-                .update_status(run, RunStatus::Done, Some(2), Some(0))
-                .unwrap();
-        }
-        assert!(staged(&store).is_empty());
-        set_parts(&store, parts(false));
-        store.reconcile_run_attribution().unwrap();
-        assert_eq!(
-            staged(&store),
-            [
-                serde_json::json!({"status":"done","harness":"codex","model":"gpt-6-mini","provider":"openai","attribution":"exact","attributionReason":null})
-            ]
-        );
-        set_parts(&store, parts(true));
-        store.reconcile_run_attribution().unwrap();
-        assert_eq!(staged(&store).len(), 2);
-        assert_eq!(staged(&store)[1]["model"], "gpt-6-sol");
-        store.interrupt_chat_turn("turn").unwrap();
-        store
-            .conn
-            .execute("UPDATE chat_messages SET completed_at = 2", [])
-            .unwrap();
-        store.reconcile_run_attribution().unwrap();
-        let reports = staged(&store);
-        assert_eq!(reports.len(), 3);
-        assert_eq!(reports[2]["attributionReason"], "invoker_ambiguous");
-        assert_eq!(reports[2]["model"], serde_json::Value::Null);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn external_agent_launches_are_not_manual_and_forwarded_requests_ignore_server_env() {
-        let (dir, store) = chat_fixture("codex");
-        for (run, origin) in [
-            ("codex-run", Some("codex")),
-            ("nested-run", Some("unknown")),
-            ("manual-run", None),
-        ] {
-            let report = (
-                run.to_string(),
-                serde_json::json!({"events":[{"eventId":run,"properties":{"status":"failed"}}]}),
-            );
-            store
-                .reserve_run_telemetry(run, None, None, None, origin, Some(&report))
-                .unwrap();
-            store.stage_run_terminal(run, RunStatus::Done).unwrap();
-        }
-        let reports: std::collections::BTreeMap<_, _> = store
-            .pending_telemetry()
-            .unwrap()
-            .into_iter()
-            .map(|(id, payload)| {
-                let properties = &payload["events"][0]["properties"];
-                (
-                    id,
-                    (
-                        properties["harness"].clone(),
-                        properties["attribution"].clone(),
-                        properties["attributionReason"].clone(),
-                    ),
-                )
-            })
-            .collect();
-        let expect = |harness: serde_json::Value, attribution: &str, reason: serde_json::Value| {
-            (harness, serde_json::json!(attribution), reason)
-        };
-        assert_eq!(
-            reports["codex-run"],
-            expect(
-                serde_json::json!("codex"),
-                "unresolved",
-                serde_json::json!("external_agent")
-            )
-        );
-        assert_eq!(
-            reports["nested-run"],
-            expect(
-                serde_json::Value::Null,
-                "unresolved",
-                serde_json::json!("external_agent")
-            )
-        );
-        assert_eq!(
-            reports["manual-run"],
-            expect(serde_json::Value::Null, "manual", serde_json::Value::Null)
-        );
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |key: &str| {
-                pairs
-                    .iter()
-                    .find(|(name, _)| *name == key)
-                    .map(|(_, value)| value.to_string())
-            }
-        };
-        assert_eq!(crate::agent_origin(env(&[])), None);
-        assert_eq!(crate::agent_origin(env(&[("CLAUDECODE", "")])), None);
-        assert_eq!(
-            crate::agent_origin(env(&[("CODEX_THREAD_ID", "thread")])).as_deref(),
-            Some("codex")
-        );
-        assert_eq!(
-            crate::agent_origin(env(&[("CURSOR_AGENT", "1"), ("OPENCODE", "1")])).as_deref(),
-            Some("unknown")
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn identity_only_writes_never_erase_measured_usage_and_snapshots_replace() {
-        let dir = std::env::temp_dir().join(format!("orx-sample-upsert-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("execution", "turn", "opencode")
-            .unwrap();
-        let usage = |input, output| TokenUsage {
-            input_tokens: Some(input),
-            output_tokens: Some(output),
-            ..Default::default()
-        };
-        let exact = Attribution::native(
-            "opencode",
-            Some("gpt-6-sol"),
-            Some("openai"),
-            Missing::IdentityNotReported,
-        );
-        let unknown = Attribution::Unresolved {
-            reason: Missing::IdentityNotReported,
-        };
-        let record = |id: &str, attribution: &Attribution, usage: &TokenUsage, complete| {
-            store
-                .record_attributed_sample("execution", id, "opencode", attribution, usage, complete)
-                .unwrap()
-        };
-        let row = |id: &str| -> (Option<String>, TokenUsage, bool) {
-            let (model, json, complete): (Option<String>, String, bool) = store
-                .conn
-                .query_row(
-                    "SELECT model, usage_json, complete FROM chat_usage_samples WHERE sample_id = ?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            (model, serde_json::from_str(&json).unwrap(), complete)
-        };
-        record("tokens-first", &unknown, &usage(10, 2), true);
-        record("tokens-first", &exact, &TokenUsage::default(), false);
-        assert_eq!(
-            row("tokens-first"),
-            (Some("gpt-6-sol".into()), usage(10, 2), true)
-        );
-        record("identity-first", &exact, &TokenUsage::default(), false);
-        record("identity-first", &unknown, &usage(7, 1), true);
-        assert_eq!(
-            row("identity-first"),
-            (Some("gpt-6-sol".into()), usage(7, 1), true)
-        );
-        for (input, output) in [(3, 1), (9, 4), (9, 4)] {
-            record("polled", &exact, &usage(input, output), true);
-            record("polled", &exact, &TokenUsage::default(), false);
-        }
-        assert_eq!(row("polled"), (Some("gpt-6-sol".into()), usage(9, 4), true));
-        let reports = store
-            .usage_report_properties("execution", "opencode", "report", "done", Some("accepted"))
-            .unwrap();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0]["totalTokens"], 12 + 8 + 13);
-        assert_eq!(reports[0]["coverage"], "complete");
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn settled_turns_give_unlinked_child_and_ambiguous_runs_explicit_reasons() {
-        let (dir, store) = chat_fixture("codex");
-        let mut spawn = tool("spawn", "");
-        spawn["children"] = serde_json::json!([tool("child-call", "orx exp run child")]);
-        set_parts(
-            &store,
-            serde_json::json!([
-                spawn,
-                tool("call-a", "orx exp run twice"),
-                tool("call-b", "orx exp run twice")
-            ]),
-        );
-        store
-            .record_native_invocation("call-a", &codex_identity(), Some("session"))
-            .unwrap();
-        for (run, command) in [
-            ("unlinked", "orx exp run other"),
-            ("child", "orx exp run child"),
-            ("ambiguous", "orx exp run twice"),
-        ] {
-            launch(&store, run, Some("session"), command);
-            store
-                .update_status(run, RunStatus::Done, Some(2), Some(0))
-                .unwrap();
-        }
-        store.reconcile_run_attribution().unwrap();
-        assert!(staged(&store).is_empty());
-        store
-            .conn
-            .execute("UPDATE chat_turn_leases SET heartbeat_at = 0", [])
-            .unwrap();
-        store.reconcile_expired_unfinished_chat_turns().unwrap();
-        let mut reasons: Vec<_> = staged(&store)
-            .into_iter()
-            .map(|report| {
-                assert_eq!(report["harness"], "codex");
-                assert_eq!(report["attribution"], "unresolved");
-                assert_eq!(report["model"], serde_json::Value::Null);
-                report["attributionReason"].as_str().unwrap().to_string()
-            })
-            .collect();
-        reasons.sort();
-        assert_eq!(
-            reasons,
-            [
-                "child_model_unknown",
-                "invoker_ambiguous",
-                "invoker_not_linked"
-            ]
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn interrupted_turn_settles_pending_runs_and_manual_runs_report_directly() {
-        let (dir, store) = chat_fixture("cursor");
-        launch(&store, "agent", Some("session"), "orx exp run exp");
-        launch(&store, "manual", None, "");
-        for run in ["agent", "manual"] {
-            store
-                .update_status(run, RunStatus::Failed, Some(2), Some(1))
-                .unwrap();
-        }
-        let reports = staged(&store);
-        assert_eq!(reports.len(), 1);
-        assert_eq!(
-            reports[0],
-            serde_json::json!({"status":"failed","harness":null,"model":null,"provider":null,"attribution":"manual","attributionReason":null})
-        );
-        store.interrupt_chat_turn("turn").unwrap();
-        store
-            .conn
-            .execute("UPDATE chat_messages SET completed_at = 2", [])
-            .unwrap();
-        store.reconcile_run_attribution().unwrap();
-        let reports = staged(&store);
-        assert_eq!(reports.len(), 2);
-        assert!(reports.iter().any(|report| report["harness"] == "cursor"
-            && report["attributionReason"] == "invoker_not_linked"));
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
+    /// Native samples → reports: identity survives without tokens, children and exceptions stay
+    /// explicit, and nothing executed is never a model.
     #[test]
     fn usage_reports_keep_identities_tokens_and_exceptions_separate() {
-        let dir = std::env::temp_dir().join(format!("orx-attribution-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("execution", "turn", "claude-code")
-            .unwrap();
-        let tokens = TokenUsage {
-            input_tokens: Some(10),
-            output_tokens: Some(2),
-            ..Default::default()
-        };
-        let exact = |model: &str| {
-            Attribution::native(
-                "claude-code",
-                Some(model),
-                None,
-                Missing::IdentityNotReported,
-            )
-        };
-        let record = |id: &str, attribution: &Attribution, usage: &TokenUsage| {
-            store
-                .record_attributed_sample("execution", id, "claude-code", attribution, usage, true)
-                .unwrap()
-        };
-        record("thread:turn:0", &exact("claude-opus-5-5"), &tokens);
-        record(
-            "thread:turn:0",
-            &Attribution::Unresolved {
-                reason: Missing::IdentityNotReported,
-            },
-            &tokens,
-        );
-        // A scoped marker is covered by its own scope's measured samples.
-        record(
-            "thread:turn:identity",
-            &exact("claude-opus-5-5"),
-            &TokenUsage::default(),
-        );
-        // A distinct request of the same model without counters stays visible.
-        record(
-            "other-request",
-            &exact("claude-opus-5-5"),
-            &TokenUsage::default(),
-        );
-        record(
-            "helper-identity",
-            &exact("claude-sonnet-5-5"),
-            &TokenUsage::default(),
-        );
-        record(
-            "child",
-            &Attribution::Unresolved {
-                reason: Missing::ChildModelUnknown,
-            },
-            &tokens,
-        );
-        store
-            .record_usage_sample(
-                "execution",
-                "synthetic",
-                "claude-code",
-                Some("<synthetic>"),
-                None,
-                &TokenUsage {
-                    input_tokens: Some(0),
-                    output_tokens: Some(0),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        store
-            .record_usage_sample("execution", "joined", "claude-code", None, None, &tokens)
-            .unwrap();
-        store
-            .record_native_invocation(
-                "joined",
-                &InvocationIdentity {
-                    harness: "claude-code".into(),
-                    model: "claude-haiku-4-5-20251001".into(),
-                    provider: None,
-                },
-                None,
-            )
-            .unwrap();
-        store.conn.execute("INSERT INTO chat_usage_samples (execution_id, sample_id, harness, model, usage_json) VALUES ('execution', 'legacy', 'claude-code', 'legacy-model', ?1)", [serde_json::to_string(&tokens).unwrap()]).unwrap();
-        let reports = store
-            .usage_report_properties(
-                "execution",
-                "claude-code",
-                "report",
-                "done",
-                Some("accepted"),
-            )
-            .unwrap();
-        let find = |model: &str| {
-            reports
-                .iter()
-                .find(|report| report["model"] == model)
-                .unwrap()
-                .clone()
-        };
-        assert_eq!(reports.len(), 6);
-        let opus: Vec<_> = reports
-            .iter()
-            .filter(|report| report["model"] == "claude-opus-5-5")
-            .map(|report| (report["coverage"].as_str(), report["inputTokens"].clone()))
-            .collect();
-        assert_eq!(
-            opus,
-            [
-                (Some("missing"), serde_json::Value::Null),
-                (Some("complete"), serde_json::json!(10))
-            ]
-        );
-        let helper = find("claude-sonnet-5-5");
-        assert_eq!(helper["coverage"], "missing");
-        assert_eq!(helper["totalTokens"], serde_json::Value::Null);
-        let child = reports
-            .iter()
-            .find(|report| report["attributionReason"] == "child_model_unknown")
-            .unwrap();
-        assert_eq!(child["model"], serde_json::Value::Null);
-        assert_eq!(child["coverage"], "complete");
-        assert_eq!(find("claude-haiku-4-5-20251001")["attribution"], "exact");
-        let legacy = find("legacy-model");
-        assert!(legacy.get("attribution").is_none());
-        assert_eq!(legacy["coverage"], "partial");
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn empty_and_exceptional_executions_are_explicit() {
-        let dir = std::env::temp_dir().join(format!("orx-empty-usage-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("execution", "turn", "codex")
-            .unwrap();
-        let only = |delivery| {
-            let reports = store
-                .usage_report_properties("execution", "codex", "report", "failed", delivery)
-                .unwrap();
-            assert_eq!(reports.len(), 1);
-            assert_eq!(reports[0]["coverage"], "missing");
-            (
-                reports[0]["attribution"].as_str().unwrap().to_string(),
-                reports[0]["attributionReason"].clone(),
-            )
-        };
-        assert_eq!(only(Some("rejected")).0, "not_executed");
-        assert_eq!(
-            only(Some("unknown")),
-            ("unresolved".into(), serde_json::json!("no_usage_reported"))
-        );
-        store
-            .record_usage_sample(
-                "execution",
-                "synthetic",
-                "claude-code",
-                Some("<synthetic>"),
-                None,
-                &TokenUsage::default(),
-            )
-            .unwrap();
-        assert_eq!(
-            only(Some("accepted")),
-            ("unresolved".into(), serde_json::json!("synthetic_model"))
-        );
-        assert_eq!(
-            Attribution::native("cursor", Some("Auto"), None, Missing::IdentityNotReported),
-            Attribution::AutoRouting
-        );
-        assert_eq!(
-            Attribution::native(
-                "opencode",
-                Some("/models/x.gguf"),
-                None,
-                Missing::ChildModelUnknown
-            ),
-            Attribution::Unresolved {
-                reason: Missing::InvalidLabel
-            }
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn sample_ids(store: &Store, execution: &str) -> Vec<String> {
-        store
-            .conn
-            .prepare("SELECT sample_id FROM chat_usage_samples WHERE execution_id = ?1 ORDER BY sample_id")
-            .unwrap()
-            .query_map([execution], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap()
-    }
-
-    fn outcome(store: &Store, execution: &str) -> Option<String> {
-        store
-            .conn
-            .query_row(
-                "SELECT outcome FROM chat_usage_executions WHERE execution_id = ?1",
-                [execution],
-                |row| row.get(0),
-            )
-            .unwrap()
-    }
-
-    #[test]
-    fn held_executions_accept_late_descendants_and_close_once_on_release_or_restart() {
-        let (dir, store) = chat_fixture("codex");
-        let tokens = TokenUsage {
-            input_tokens: Some(5),
-            output_tokens: Some(1),
-            ..Default::default()
-        };
-        let child = Attribution::native(
-            "codex",
-            Some("gpt-6-mini"),
-            None,
-            Missing::ChildModelUnknown,
-        );
-        for execution in ["held", "orphaned"] {
-            store
-                .begin_usage_execution(execution, "turn", "codex")
-                .unwrap();
-        }
-        assert!(store.hold_usage_execution("held").unwrap());
-        assert!(store.hold_usage_execution("orphaned").unwrap());
-        // A dead process's hold must not keep an execution open across restart.
-        store
-            .conn
-            .execute(
-                "UPDATE chat_usage_executions SET held_by = 'dead-process' WHERE execution_id = 'orphaned'",
-                [],
-            )
-            .unwrap();
-        store.interrupt_chat_turn("turn").unwrap();
-        store.finalize_turn_usage("turn", "cancelled").unwrap();
-        assert_eq!(outcome(&store, "held"), None);
-        assert_eq!(outcome(&store, "orphaned").as_deref(), Some("cancelled"));
-        // The spawning turn is over; its sub-agent's request still lands in its execution.
-        store
-            .record_attributed_sample("held", "child:c:request:6", "codex", &child, &tokens, true)
-            .unwrap();
-        store
-            .conn
-            .execute("DELETE FROM chat_turn_leases", [])
-            .unwrap();
-        store.recover_terminal_usage().unwrap();
-        assert_eq!(outcome(&store, "held"), None, "a live holder keeps it open");
-        store.release_usage_execution("held").unwrap();
-        store.release_usage_execution("held").unwrap();
-        assert_eq!(outcome(&store, "held").as_deref(), Some("cancelled"));
-        assert_eq!(sample_ids(&store, "held"), ["child:c:request:6"]);
-        store
-            .record_attributed_sample("held", "child:c:request:9", "codex", &child, &tokens, true)
-            .unwrap();
-        assert_eq!(sample_ids(&store, "held"), ["child:c:request:6"]);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_sample_racing_finalization_is_reported_or_rejected_never_silently_kept() {
-        let dir = std::env::temp_dir().join(format!("orx-final-race-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("execution", "turn", "antigravity")
-            .unwrap();
-        // Finalization's snapshot and close happen under one write lock; a hook process
-        // writing meanwhile waits and then finds the execution closed.
-        let tx = store.begin_immediate().unwrap();
-        let hook = {
-            let dir = dir.clone();
-            std::thread::spawn(move || {
-                let hook = Store::open_at(dir).unwrap();
-                hook.record_attributed_sample(
-                    "execution",
-                    "antigravity:conv:step:3",
-                    "antigravity",
-                    &Attribution::native(
-                        "antigravity",
-                        Some("gemini-3.1-pro-high"),
-                        None,
-                        Missing::IdentityNotReported,
-                    ),
-                    &TokenUsage::default(),
-                    false,
-                )
-            })
-        };
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        store
-            .conn
-            .execute("UPDATE chat_usage_executions SET outcome = 'done'", [])
-            .unwrap();
-        tx.commit().unwrap();
-        hook.join().unwrap().unwrap();
-        assert!(sample_ids(&store, "execution").is_empty());
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Runs the real finalization while a hook's sample is in flight, then writes a late sample.
-    fn finalize_during_an_in_flight_sample(dir: &std::path::Path) -> Store {
-        let store = Store::open_at(dir.to_path_buf()).unwrap();
-        store
-            .begin_usage_execution("execution", "turn", "antigravity")
-            .unwrap();
-        let sample = |store: &Store, id: &str| {
-            store.record_attributed_sample(
-                "execution",
-                id,
-                "antigravity",
-                &Attribution::native(
-                    "antigravity",
-                    Some("gemini-3.1-pro-high"),
-                    None,
-                    Missing::IdentityNotReported,
-                ),
-                &TokenUsage {
-                    input_tokens: Some(3),
-                    output_tokens: Some(1),
-                    ..Default::default()
-                },
-                true,
-            )
-        };
-        // A hook process is mid-write when the real finalization starts in another process.
-        let hook = Store::open_at(dir.to_path_buf()).unwrap();
-        let finalizer = Store::open_at(dir.to_path_buf()).unwrap();
-        let tx = hook.begin_immediate().unwrap();
-        sample(&hook, "antigravity:conv:step:1").unwrap();
-        let finalizer =
-            std::thread::spawn(move || finalizer.finalize_usage_execution("execution", "done"));
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(
-            !finalizer.is_finished(),
-            "finalization waits for the writer"
-        );
-        tx.commit().unwrap();
-        finalizer.join().unwrap().unwrap();
-        sample(&hook, "antigravity:conv:step:2").unwrap();
-        assert_eq!(sample_ids(&store, "execution"), ["antigravity:conv:step:1"]);
-        assert_eq!(outcome(&store, "execution").as_deref(), Some("done"));
-        store
-    }
-
-    #[test]
-    fn finalization_snapshots_after_an_in_flight_sample_commits_and_rejects_later_ones() {
-        let dir = std::env::temp_dir().join(format!("orx-final-order-{}", uuid::Uuid::new_v4()));
-        let store = finalize_during_an_in_flight_sample(&dir);
-        if crate::telemetry::build_channel() != "production" {
-            assert!(store.pending_telemetry().unwrap().is_empty());
-        }
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Official builds only; run alone:
-    /// `ORX_OFFICIAL_RELEASE_BUILD=1 GITHUB_ACTIONS=true GITHUB_REPOSITORY=alphaXiv/OpenResearch cargo test --locked --bin orx store::telemetry::tests::official_finalization_reports_the_in_flight_sample_not_the_late_one -- --ignored --exact --test-threads=1`
-    #[test]
-    #[ignore = "official-build accounting gate; see the invocation above"]
-    fn official_finalization_reports_the_in_flight_sample_not_the_late_one() {
-        assert_eq!(crate::telemetry::build_channel(), "production");
-        let _env = crate::telemetry::tests::EnvGuard::new(&[
-            "XDG_CONFIG_HOME",
-            "ORX_DATA_DIR",
-            "ORX_TELEMETRY_ENV",
-            "ORX_TELEMETRY_HOST",
-        ]);
-        let dir = std::env::temp_dir().join(format!("orx-official-final-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
-        // Any stray default-store open lands here, never in the user's data dir.
-        std::env::set_var("ORX_DATA_DIR", dir.join("default-data"));
-        // Any send lands on this loopback sink, never production; none is expected.
-        let receiver = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        std::env::set_var(
-            "ORX_TELEMETRY_HOST",
-            format!("http://{}", receiver.local_addr().unwrap()),
-        );
-        assert!(crate::telemetry::accounting_reports_enabled());
-
-        let store = finalize_during_an_in_flight_sample(&dir.join("data"));
-        let staged = store.pending_telemetry().unwrap();
-        assert_eq!(staged.len(), 1, "one report for the one model");
-        let event = &staged[0].1["events"][0];
-        assert_eq!(event["name"], "cli_chat_model_usage");
-        let properties = &event["properties"];
-        assert_eq!(properties["model"], "gemini-3.1-pro-high");
-        assert_eq!(properties["attribution"], "exact");
-        assert_eq!(properties["outcome"], "done");
-        // Exactly the in-flight sample's counters: the late sample was rejected, not added.
-        assert_eq!(properties["inputTokens"], 3);
-        assert_eq!(properties["outputTokens"], 1);
-        assert_eq!(properties["coverage"], "complete");
-        assert!(
-            matches!(receiver.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-            "finalization only stages; nothing is sent"
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn claude_aggregates_replace_only_listed_identities_per_attempt() {
-        let dir = std::env::temp_dir().join(format!("orx-claude-agg-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("e", "t", "claude-code")
-            .unwrap();
-        store
-            .begin_native_usage_attempt("e", "claude-1:", "claude-code", None)
-            .unwrap();
-        let exact = |model: &str| {
-            Attribution::native(
-                "claude-code",
-                Some(model),
-                None,
-                Missing::IdentityNotReported,
-            )
-        };
-        let usage = |input, output| TokenUsage {
-            input_tokens: Some(input),
-            output_tokens: Some(output),
-            ..Default::default()
-        };
-        let record = |id: &str, attribution: &Attribution, usage: &TokenUsage| {
-            store
-                .record_attributed_sample("e", id, "claude-code", attribution, usage, false)
-                .unwrap()
-        };
-        record("claude-1:msg_p", &exact("claude-opus-5-5"), &usage(10, 5));
-        record(
-            "claude-1:msg_c",
-            &exact("claude-haiku-4-5-20251001"),
-            &usage(3, 1),
-        );
-        record(
-            "claude-1:msg_s",
-            &exact("claude-sonnet-5-5"),
-            &TokenUsage::default(),
-        );
-        record(
-            "claude-1:msg_u",
-            &Attribution::Unresolved {
-                reason: Missing::ChildModelUnknown,
-            },
-            &usage(2, 1),
-        );
-        // Attempt 2 was interrupted: no modelUsage, so its messages keep their own counters.
-        record("claude-2:msg_q", &exact("claude-opus-5-5"), &usage(4, 2));
-        let full = |input, output| TokenUsage {
-            input_tokens: Some(input),
-            output_tokens: Some(output),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            reasoning_tokens: Some(0),
-        };
-        store
-            .replace_native_usage_aggregate(
-                "e",
-                "claude-1:",
-                "claude-code",
-                "scope",
-                &[("claude-opus-5-5".into(), None, full(15, 7))],
-            )
-            .unwrap();
-        let reports = store
-            .usage_report_properties("e", "claude-code", "report", "done", Some("accepted"))
-            .unwrap();
-        let mut summary: Vec<_> = reports
-            .iter()
-            .map(|report| {
-                (
-                    report["model"]
-                        .as_str()
-                        .unwrap_or(report["attributionReason"].as_str().unwrap_or_default()),
-                    report["coverage"].as_str().unwrap(),
-                    report["totalTokens"].to_string(),
-                )
-            })
-            .collect();
-        summary.sort();
-        assert_eq!(
-            summary,
-            [
-                ("child_model_unknown", "missing", "null".into()),
-                ("claude-haiku-4-5-20251001", "missing", "null".into()),
-                ("claude-opus-5-5", "complete", "22".into()),
-                ("claude-opus-5-5", "partial", "6".into()),
-                ("claude-sonnet-5-5", "missing", "null".into()),
-            ]
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_native_identity_under_the_same_sample_resolves_an_unknown_child() {
-        let dir = std::env::temp_dir().join(format!("orx-child-join-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("e", "t", "antigravity")
-            .unwrap();
-        let unknown = Attribution::Unresolved {
+        type Sample = (&'static str, Attribution, TokenUsage, bool);
+        let unknown_child = Attribution::Unresolved {
             reason: Missing::ChildModelUnknown,
         };
-        for id in ["antigravity:child:step:1", "antigravity:other:step:1"] {
+        let synthetic = Attribution::Unresolved {
+            reason: Missing::SyntheticModel,
+        };
+        let cases: Vec<(&str, Vec<Sample>, Vec<_>)> =
+            vec![
+            (
+                "identity joins its measured requests; another model's identity alone is missing",
+                vec![
+                    ("a", exact("m1"), measured(10, 2), true),
+                    ("a-id", exact("m1"), TokenUsage::default(), false),
+                    ("b", exact("m2"), TokenUsage::default(), false),
+                ],
+                vec![
+                    row("exact", Some("m1"), None, "complete", Some(10)),
+                    row("exact", Some("m2"), None, "missing", None),
+                ],
+            ),
+            (
+                "an unidentified child never takes the parent's model",
+                vec![
+                    ("p", exact("m1"), measured(5, 1), true),
+                    ("c", unknown_child.clone(), measured(3, 1), true),
+                ],
+                vec![
+                    row("exact", Some("m1"), None, "complete", Some(5)),
+                    row("unresolved", None, Some("child_model_unknown"), "complete", Some(3)),
+                ],
+            ),
+            (
+                "a zero-usage synthetic error only reports alone",
+                vec![
+                    ("p", exact("m1"), measured(5, 1), true),
+                    ("s", synthetic.clone(), measured(0, 0), true),
+                ],
+                vec![row("exact", Some("m1"), None, "complete", Some(5))],
+            ),
+            (
+                "a synthetic error alone is explicit",
+                vec![("s", synthetic, measured(0, 0), true)],
+                vec![row("unresolved", None, Some("synthetic_model"), "complete", Some(0))],
+            ),
+            (
+                "a delivered turn with no native evidence is unresolved",
+                vec![],
+                vec![row("unresolved", None, Some("no_usage_reported"), "missing", None)],
+            ),
+        ];
+        for (name, samples, expected) in cases {
+            let dir = std::env::temp_dir().join(format!("orx-reports-{}", uuid::Uuid::new_v4()));
+            let store = Store::open_at(dir.clone()).unwrap();
+            store.begin_usage_execution("e", "t", "codex").unwrap();
+            for (id, attribution, usage, complete) in samples {
+                store
+                    .record_attributed_sample(
+                        "e",
+                        id,
+                        "codex",
+                        &attribution,
+                        &usage,
+                        complete,
+                        false,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(rows(&store), expected, "{name}");
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        // Never delivered: not executed, not a model.
+        let dir = std::env::temp_dir().join(format!("orx-reports-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store.conn.execute_batch("INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{}', 'failed', 'rejected', 1, 1)").unwrap();
+        store.begin_usage_execution("e", "t", "codex").unwrap();
+        assert_eq!(
+            rows(&store),
+            vec![row("not_executed", None, None, "missing", None)]
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Re-read native records count once across executions, and a sub-agent's own execution
+    /// outlives its parent turn's finalization until it closes natively or at recovery.
+    #[test]
+    fn native_records_count_once_and_late_children_close_independently() {
+        let dir = std::env::temp_dir().join(format!("orx-native-exec-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store.conn.execute_batch("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'opencode', 1, 1);
+            INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{}', 'running', 'accepted', 1, 1);").unwrap();
+        store
+            .begin_usage_execution("turn", "t", "opencode")
+            .unwrap();
+        let record = |execution: &str, id: &str, usage: TokenUsage| {
             store
                 .record_attributed_sample(
-                    "e",
+                    execution,
                     id,
-                    "antigravity",
-                    &unknown,
-                    &TokenUsage {
-                        input_tokens: Some(3),
-                        output_tokens: Some(1),
-                        ..Default::default()
-                    },
+                    "opencode",
+                    &exact("m"),
+                    &usage,
+                    true,
                     true,
                 )
-                .unwrap();
-        }
-        store
-            .record_native_invocation(
-                "antigravity:child:step:1",
-                &InvocationIdentity {
-                    harness: "antigravity".into(),
-                    model: "gemini-3.8-flash-high".into(),
-                    provider: None,
-                },
-                None,
-            )
-            .unwrap();
-        let reports = store
-            .usage_report_properties("e", "antigravity", "report", "done", Some("accepted"))
-            .unwrap();
-        let mut attributions: Vec<_> = reports
-            .iter()
-            .map(|report| (report["attribution"].clone(), report["model"].clone()))
-            .collect();
-        attributions.sort_by_key(|pair| pair.0.to_string());
-        assert_eq!(
-            attributions,
-            [
-                (
-                    serde_json::json!("exact"),
-                    serde_json::json!("gemini-3.8-flash-high")
-                ),
-                (serde_json::json!("unresolved"), serde_json::Value::Null),
-            ]
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn report_summary(
-        store: &Store,
-        execution: &str,
-        harness: &str,
-    ) -> Vec<(String, String, String)> {
-        let mut summary: Vec<_> = store
-            .usage_report_properties(execution, harness, "report", "done", Some("accepted"))
-            .unwrap()
-            .iter()
-            .map(|report| {
-                (
-                    report["model"]
-                        .as_str()
-                        .or(report["attributionReason"].as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    report["coverage"].as_str().unwrap().to_string(),
-                    report["totalTokens"].to_string(),
-                )
-            })
-            .collect();
-        summary.sort();
-        summary
-    }
-
-    #[test]
-    fn spawn_markers_resolve_only_through_their_own_childs_identity() {
-        let dir = std::env::temp_dir().join(format!("orx-spawns-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("e", "t", "antigravity")
-            .unwrap();
-        let unknown = Attribution::Unresolved {
-            reason: Missing::ChildModelUnknown,
-        };
-        let record = |id: &str, attribution: &Attribution| {
-            store
-                .record_attributed_sample(
-                    "e",
-                    id,
-                    "antigravity",
-                    attribution,
-                    &TokenUsage::default(),
-                    false,
-                )
                 .unwrap()
         };
-        for child in ["child-a", "child-b", "#0.0"] {
-            record(
-                &format!("antigravity:parent:step:11:subagent:{child}"),
-                &unknown,
-            );
-        }
-        record(
-            "antigravity:child-a:step:1",
-            &Attribution::native(
-                "antigravity",
-                Some("gemini-3.1-pro-high"),
-                None,
-                Missing::IdentityNotReported,
-            ),
-        );
-        assert_eq!(
-            report_summary(&store, "e", "antigravity"),
-            [
-                (
-                    "child_model_unknown".into(),
-                    "missing".into(),
-                    "null".into()
-                ),
-                (
-                    "gemini-3.1-pro-high".into(),
-                    "missing".into(),
-                    "null".into()
-                ),
-            ]
-        );
-        // Without child-b's and the unnamed child's markers, child-a's identity covers everything.
+        record("turn", "step-1", measured(10, 1));
+        record("turn", "step-2", TokenUsage::default());
+        assert!(store
+            .begin_native_execution("native:late", "s", "opencode")
+            .unwrap());
+        record("native:late", "step-1", measured(10, 1));
+        record("native:late", "step-2", measured(20, 2));
+        store.finalize_turn_usage("t", "done").unwrap();
+        assert!(store
+            .native_sample_exists("opencode", "step-2", true)
+            .unwrap());
+        let open: Vec<String> = store
+            .conn
+            .prepare("SELECT execution_id FROM chat_usage_executions WHERE outcome IS NULL")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(open, ["native:late"]);
+        let late: Vec<String> = store
+            .conn
+            .prepare("SELECT sample_id FROM chat_usage_samples WHERE execution_id = 'native:late'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(late, ["step-2"]);
+        store
+            .conn
+            .execute_batch("UPDATE chat_turns SET state = 'completed'")
+            .unwrap();
+        store.recover_terminal_usage().unwrap();
+        let open: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_usage_executions WHERE outcome IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 0);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A chat-launched run without forwarded identity binds at its terminal transition to the
+    /// launch part whose native output printed it, never to the chat's other models.
     #[test]
-    fn a_rerouted_away_model_keeps_its_identity_and_only_its_own_scope_covers_a_marker() {
-        let dir = std::env::temp_dir().join(format!("orx-reroute-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        store.begin_usage_execution("e", "t", "codex").unwrap();
-        let exact = |model: &str| {
-            Attribution::native("codex", Some(model), None, Missing::IdentityNotReported)
+    fn runs_bind_to_their_printed_launch_part_or_stay_explicit() {
+        let launch = |id: &str, run: &str| {
+            serde_json::json!({"id": id, "type": "tool", "state": {"status": "completed",
+                "input": {"command": "orx exp run e"}, "output": format!("Run {run} started")}})
         };
-        for model in ["gpt-6-sol", "gpt-6-astra"] {
+        let cases = [
+            // (parts, invokers, expected attribution, reason)
+            (
+                vec![launch("p1", "7f3a-run")],
+                vec![("p1", "m1")],
+                "exact",
+                None,
+            ),
+            (
+                vec![serde_json::json!({"id": "task", "children": [launch("c1", "7f3a-run")]})],
+                vec![("task", "m1")],
+                "unresolved",
+                Some("child_model_unknown"),
+            ),
+            (
+                vec![launch("p1", "7f3a-run"), launch("p2", "7f3a-run")],
+                vec![("p1", "m1"), ("p2", "m2")],
+                "unresolved",
+                Some("invoker_ambiguous"),
+            ),
+            (
+                vec![launch("p1", "9c1b-run")],
+                vec![("p1", "m1")],
+                "unresolved",
+                Some("invoker_not_linked"),
+            ),
+        ];
+        for (parts, invokers, attribution, reason) in cases {
+            let dir = std::env::temp_dir().join(format!("orx-run-bind-{}", uuid::Uuid::new_v4()));
+            let store = Store::open_at(dir.clone()).unwrap();
+            store.conn.execute("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'cursor', 1, 1)", []).unwrap();
+            store.conn.execute("INSERT INTO chat_messages (id, session_id, role, parts_json, created_at) VALUES ('m', 's', 'assistant', ?1, 1)", [serde_json::to_string(&parts).unwrap()]).unwrap();
+            for (part, model) in invokers {
+                let identity = InvocationIdentity {
+                    harness: "cursor".into(),
+                    model: model.into(),
+                    provider: None,
+                };
+                store
+                    .record_native_invocation(part, &identity, Some("s"))
+                    .unwrap();
+            }
+            let event = serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
+            let tx = store.begin().unwrap();
             store
-                .record_attributed_sample(
-                    "e",
-                    &format!("thread:turn:identity:{model}"),
-                    "codex",
-                    &exact(model),
-                    &TokenUsage::default(),
-                    false,
+                .reserve_run_telemetry(
+                    "7f3a-run",
+                    None,
+                    Some("s"),
+                    None,
+                    Some(&("ev".into(), event)),
                 )
                 .unwrap();
-        }
-        let usage = |input, output| TokenUsage {
-            input_tokens: Some(input),
-            output_tokens: Some(output),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            reasoning_tokens: Some(0),
-        };
-        store
-            .record_cumulative_usage(
-                "e",
-                "codex",
-                "thread",
-                "turn",
-                &exact("gpt-6-astra"),
-                &usage(40, 4),
-                &usage(40, 4),
-            )
-            .unwrap();
-        // Another turn's measured samples never cover this turn's marker.
-        store
-            .record_cumulative_usage(
-                "e",
-                "codex",
-                "thread",
-                "other",
-                &exact("gpt-6-sol"),
-                &usage(90, 9),
-                &usage(50, 5),
-            )
-            .unwrap();
-        assert_eq!(
-            report_summary(&store, "e", "codex"),
-            [
-                ("gpt-6-astra".into(), "complete".into(), "44".into()),
-                ("gpt-6-sol".into(), "complete".into(), "55".into()),
-                ("gpt-6-sol".into(), "missing".into(), "null".into()),
-            ]
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn held_descendants_defer_fallback_settlement_but_not_a_printed_run_id() {
-        let (dir, store) = chat_fixture("opencode");
-        store
-            .begin_usage_execution("exec", "turn", "opencode")
-            .unwrap();
-        assert!(store.hold_usage_execution("exec").unwrap());
-        let (printed, silent) = (
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string(),
-        );
-        let mut part = tool("call-1", "orx exp run exp");
-        part["state"]["output"] = serde_json::json!(format!("  run  {printed}\n"));
-        set_parts(&store, serde_json::json!([part]));
-        store
-            .record_native_invocation(
-                "call-1",
-                &InvocationIdentity {
-                    harness: "opencode".into(),
-                    model: "big-pickle".into(),
-                    provider: Some("opencode".into()),
-                },
-                Some("session"),
-            )
-            .unwrap();
-        for run in [&printed, &silent] {
-            launch(&store, run, Some("session"), "orx exp run other");
             store
-                .update_status(run, RunStatus::Done, Some(2), Some(0))
+                .upsert_run(&StoredRun {
+                    id: "7f3a-run".into(),
+                    experiment_id: "e".into(),
+                    project_id: "p".into(),
+                    status: "starting".into(),
+                    backend_json: "{}".into(),
+                    command: String::new(),
+                    created_at: 2,
+                    updated_at: 2,
+                    ended_at: None,
+                    exit_code: None,
+                    commit_sha: None,
+                    result_markdown: None,
+                    cancel_requested: false,
+                    chat_session_id: Some("s".into()),
+                })
                 .unwrap();
+            tx.commit().unwrap();
+            assert!(store
+                .update_status("7f3a-run", RunStatus::Done, Some(3), Some(0))
+                .unwrap());
+            let staged = store.pending_telemetry().unwrap();
+            let properties = &staged[0].1["events"][0]["properties"];
+            assert_eq!(properties["harness"], "cursor");
+            assert_eq!(properties["status"], "done");
+            assert_eq!(properties["attribution"], attribution, "{parts:?}");
+            assert_eq!(
+                properties["attributionReason"].as_str(),
+                reason,
+                "{parts:?}"
+            );
+            assert_eq!(
+                properties["model"].as_str(),
+                (attribution == "exact").then_some("m1")
+            );
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
         }
-        // The turn ended; its execution stays held for background descendants.
-        store.conn.execute_batch("UPDATE chat_turns SET state = 'completed'; UPDATE chat_messages SET completed_at = 2; DELETE FROM chat_turn_leases;").unwrap();
-        store.finalize_turn_usage("turn", "done").unwrap();
-        store.reconcile_run_attribution().unwrap();
-        let staged = staged(&store);
-        assert_eq!(staged.len(), 1, "only the definitive printed binding");
-        assert_eq!(staged[0]["model"], "big-pickle");
-        store.release_usage_execution("exec").unwrap();
-        store.reconcile_run_attribution().unwrap();
-        let staged = self::staged(&store);
-        assert_eq!(staged.len(), 2);
-        assert_eq!(staged[1]["attributionReason"], "invoker_not_linked");
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        // Outside chat: an agent CLI marker is external, nothing is manual.
+        for (origin, harness, attribution) in [
+            (Some("codex"), Some("codex"), "unresolved"),
+            (Some("unknown"), None, "unresolved"),
+            (None, None, "manual"),
+        ] {
+            let dir = std::env::temp_dir().join(format!("orx-run-origin-{}", uuid::Uuid::new_v4()));
+            let store = Store::open_at(dir.clone()).unwrap();
+            let event = serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
+            store
+                .reserve_run_telemetry("run", None, None, origin, Some(&("ev".into(), event)))
+                .unwrap();
+            let report: String = store
+                .conn
+                .query_row("SELECT report_json FROM run_telemetry", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+            let properties = &report["events"][0]["properties"];
+            assert_eq!(properties["harness"].as_str(), harness);
+            assert_eq!(properties["attribution"], attribution);
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
+    /// A fast run can end before its launch tool's output persists: the report waits (durably,
+    /// across a restart) while the launching turn runs, then emits once — exact once the printed
+    /// part appears, or invoker_not_linked once the turn settles without it.
     #[test]
-    fn a_run_a_natively_woken_continuation_launched_binds_through_its_detached_tool_evidence() {
-        let (dir, store) = chat_fixture("opencode");
-        store
-            .begin_usage_execution("exec", "turn", "opencode")
-            .unwrap();
-        assert!(store.hold_usage_execution("exec").unwrap());
-        store.conn.execute_batch("UPDATE chat_turns SET state = 'completed'; UPDATE chat_messages SET completed_at = 2; DELETE FROM chat_turn_leases;").unwrap();
-        store.finalize_turn_usage("turn", "done").unwrap();
-        let run = uuid::Uuid::new_v4().to_string();
-        // What the held watcher records for the woken run's bash call (not in any transcript).
-        let mut part = tool("prt_bash", "orx exp run exp");
-        part["state"]["output"] = serde_json::json!(format!("  run  {run}\n"));
-        store
-            .set_native_scope("exec", "tool-part:prt_bash", &part)
-            .unwrap();
-        store
-            .record_native_invocation(
-                "prt_bash",
-                &InvocationIdentity {
+    fn terminal_runs_wait_for_their_launch_output_and_emit_once() {
+        for (evidence, restart) in [(true, false), (true, true), (false, true)] {
+            let dir =
+                std::env::temp_dir().join(format!("orx-run-pending-{}", uuid::Uuid::new_v4()));
+            let mut store = Store::open_at(dir.clone()).unwrap();
+            store.conn.execute_batch("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'opencode', 1, 1);
+                INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('t', 's', 'm', 'c', 'h', '', '{}', 'running', 'accepted', 1, 1);
+                INSERT INTO chat_messages (id, session_id, role, parts_json, created_at) VALUES ('m', 's', 'assistant', '[]', 1);").unwrap();
+            let event = serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
+            let tx = store.begin().unwrap();
+            store
+                .reserve_run_telemetry(
+                    "7f3a-run",
+                    None,
+                    Some("s"),
+                    None,
+                    Some(&("ev".into(), event)),
+                )
+                .unwrap();
+            store
+                .upsert_run(&StoredRun {
+                    id: "7f3a-run".into(),
+                    experiment_id: "e".into(),
+                    project_id: "p".into(),
+                    status: "starting".into(),
+                    backend_json: "{}".into(),
+                    command: String::new(),
+                    created_at: 2,
+                    updated_at: 2,
+                    ended_at: None,
+                    exit_code: None,
+                    commit_sha: None,
+                    result_markdown: None,
+                    cancel_requested: false,
+                    chat_session_id: Some("s".into()),
+                })
+                .unwrap();
+            tx.commit().unwrap();
+            assert!(store
+                .update_status("7f3a-run", RunStatus::Done, Some(3), Some(0))
+                .unwrap());
+            store.settle_pending_runs().unwrap();
+            assert!(
+                store.pending_telemetry().unwrap().is_empty(),
+                "waits for the turn"
+            );
+            if restart {
+                drop(store);
+                store = Store::open_at(dir.clone()).unwrap();
+            }
+            if evidence {
+                let parts = serde_json::json!([{"id": "call_1", "type": "tool", "state": {"status": "completed",
+                    "input": {"command": "orx exp run e"}, "output": "Run 7f3a-run done"}}]);
+                store
+                    .conn
+                    .execute(
+                        "UPDATE chat_messages SET parts_json = ?1",
+                        [parts.to_string()],
+                    )
+                    .unwrap();
+                let identity = InvocationIdentity {
                     harness: "opencode".into(),
                     model: "big-pickle".into(),
                     provider: Some("opencode".into()),
-                },
-                Some("session"),
+                };
+                store
+                    .record_native_invocation("call_1", &identity, Some("s"))
+                    .unwrap();
+            } else {
+                store
+                    .conn
+                    .execute("UPDATE chat_turns SET state = 'completed'", [])
+                    .unwrap();
+            }
+            store.settle_pending_runs().unwrap();
+            store.settle_pending_runs().unwrap();
+            let staged = store.pending_telemetry().unwrap();
+            assert_eq!(staged.len(), 1);
+            let properties = &staged[0].1["events"][0]["properties"];
+            assert_eq!(properties["status"], "done");
+            if evidence {
+                assert_eq!(properties["attribution"], "exact");
+                assert_eq!(properties["model"], "big-pickle");
+            } else {
+                assert_eq!(properties["attributionReason"], "invoker_not_linked");
+            }
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// A run launched from an OpenCode chat inside a host Codex inherits the host's context: it
+    /// must not report the host's model, and the chat's own native binding takes over.
+    #[test]
+    fn inherited_foreign_context_never_overrides_the_launching_chats_harness() {
+        let dir = std::env::temp_dir().join(format!("orx-run-foreign-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store.conn.execute("INSERT INTO chat_sessions (id, project_id, harness, created_at, updated_at) VALUES ('s', 'p', 'opencode', 1, 1)", []).unwrap();
+        let host = InvocationIdentity {
+            harness: "codex".into(),
+            model: "gpt-6-astra".into(),
+            provider: None,
+        };
+        let event =
+            serde_json::json!({"events": [{"eventId": "ev", "properties": {"status": "failed"}}]});
+        store
+            .reserve_run_telemetry(
+                "run",
+                Some(&host),
+                Some("s"),
+                None,
+                Some(&("ev".into(), event)),
             )
             .unwrap();
-        launch(&store, &run, Some("session"), "orx exp run exp");
-        store
-            .update_status(&run, RunStatus::Done, Some(2), Some(0))
+        let (identity, report): (Option<String>, String) = store
+            .conn
+            .query_row(
+                "SELECT identity_json, report_json FROM run_telemetry",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        let staged = staged(&store);
-        assert_eq!(staged.len(), 1);
-        assert_eq!(staged[0]["attribution"], "exact");
-        assert_eq!(staged[0]["model"], "big-pickle");
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        let properties = &report["events"][0]["properties"];
+        assert!(identity.is_none());
+        assert_eq!(properties["harness"], "opencode");
+        assert_eq!(properties["model"], serde_json::Value::Null);
+        assert_eq!(properties["attributionReason"], "invoker_not_linked");
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

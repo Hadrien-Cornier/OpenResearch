@@ -464,8 +464,7 @@ impl Store {
                 run_id TEXT PRIMARY KEY,
                 identity_json TEXT,
                 report_json TEXT,
-                link_json TEXT,
-                terminal INTEGER NOT NULL DEFAULT 0
+                pending_since INTEGER
             );
             CREATE TABLE IF NOT EXISTS telemetry_pending_events (
                 event_id TEXT PRIMARY KEY,
@@ -489,9 +488,7 @@ impl Store {
                 harness TEXT NOT NULL,
                 report_id TEXT NOT NULL,
                 suppressed INTEGER NOT NULL,
-                outcome TEXT,
-                held_by TEXT,
-                pending_outcome TEXT
+                outcome TEXT
             );
             CREATE TABLE IF NOT EXISTS chat_usage_samples (
                 execution_id TEXT NOT NULL,
@@ -675,10 +672,8 @@ impl Store {
             "ALTER TABLE native_invocation_identities ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_usage_samples ADD COLUMN complete INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_usage_samples ADD COLUMN attribution_json TEXT",
-            "ALTER TABLE chat_usage_executions ADD COLUMN held_by TEXT",
-            "ALTER TABLE chat_usage_executions ADD COLUMN pending_outcome TEXT",
-            "ALTER TABLE run_telemetry ADD COLUMN link_json TEXT",
-            "ALTER TABLE run_telemetry ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE run_telemetry ADD COLUMN pending_since INTEGER",
+            "ALTER TABLE chat_sessions ADD COLUMN native_owners_json TEXT",
             "ALTER TABLE runs ADD COLUMN commit_sha TEXT",
             "ALTER TABLE runs ADD COLUMN result_markdown TEXT",
             "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
@@ -721,6 +716,7 @@ impl Store {
         ] {
             let _ = conn.execute(ddl, []);
         }
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS chat_usage_samples_sample ON chat_usage_samples (sample_id);")?;
         conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
         conn.execute(
             "DELETE FROM native_invocation_identities WHERE session_id IS NULL AND created_at < ?1",
@@ -2856,7 +2852,6 @@ impl Store {
         )?;
         transaction.commit()?;
         self.recover_terminal_usage()?;
-        self.reconcile_run_attribution()?;
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {CHAT_TURN_COLS} FROM chat_turns
              WHERE state = 'failed' AND recovery_action IS NOT NULL

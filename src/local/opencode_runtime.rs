@@ -263,6 +263,15 @@ impl AgentEndpoint {
             .timeout(Duration::from_secs(2))
     }
 
+    pub fn v2_export_path(&self, session: &str) -> String {
+        let prefix = if self.legacy_v2_api {
+            "/api"
+        } else {
+            "/api/experimental"
+        };
+        format!("{prefix}/session/{session}/export")
+    }
+
     pub fn v2_generate_path(&self) -> &'static str {
         if self.legacy_v2_api {
             "/api/generate"
@@ -638,6 +647,10 @@ mod tests {
             assert_eq!(endpoint.check_health().await.unwrap(), ready);
             assert_eq!(endpoint.legacy_v2_api, legacy);
             let prefix = if legacy { "/api" } else { "/api/experimental" };
+            assert_eq!(
+                endpoint.v2_export_path("ses_test"),
+                format!("{prefix}/session/ses_test/export")
+            );
             assert_eq!(endpoint.v2_generate_path(), format!("{prefix}/generate"));
             server.abort();
         }

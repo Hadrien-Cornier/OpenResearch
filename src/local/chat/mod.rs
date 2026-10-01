@@ -5820,13 +5820,15 @@ impl ChatHost {
                 false
             };
             if _terminal_won {
-                let _ = Store::open()
-                    .and_then(|store| store.finalize_turn_usage(&ctx.turn_id, usage_outcome));
+                let _ = Store::open().and_then(|store| {
+                    crate::local::harness::record_turn_steps(&store, &ctx.turn_id);
+                    store.finalize_turn_usage(&ctx.turn_id, usage_outcome)
+                });
             }
             ctx.assistant.completed_at = Some(now_ms());
             let _ = ctx.flush();
-            // Runs this turn launched can resolve their invoker only once its final parts persist.
-            let _ = Store::open().and_then(|store| store.reconcile_run_attribution());
+            // Runs this turn launched bind to its final tool output.
+            let _ = Store::open().and_then(|store| store.settle_pending_runs());
             crate::telemetry::retry_outbox();
             if let Some(path) = ctx.target_event_path.as_ref() {
                 let _ = std::fs::remove_file(path);
@@ -5999,13 +6001,7 @@ impl ChatHost {
                                 let _ = host.opencode.interrupt(&session_id, nid).await;
                             }
                         } else if session.harness == "codex" {
-                            let execution = active.as_ref().and_then(|active| {
-                                store.open_usage_execution(&active.turn_id).ok().flatten()
-                            });
-                            return host
-                                .codex
-                                .interrupt_session(&session_id, execution.as_deref())
-                                .await;
+                            return host.codex.interrupt_session(&session_id).await;
                         } else if session.harness == "claude-code" {
                             host.claude.kill_session(&session_id).await;
                         }
@@ -6019,7 +6015,11 @@ impl ChatHost {
                 .flatten();
             if let Some(active) = active {
                 let _ = active.handle.await;
-                // Recovered parts are evidence for accounting and run binding, so persist them first.
+                let _ = Store::open().and_then(|store| {
+                    crate::local::harness::record_turn_steps(&store, &active.turn_id);
+                    store.finalize_turn_usage(&active.turn_id, "cancelled")
+                });
+                crate::telemetry::retry_outbox();
                 let mut message = reconcile_target_file(&session_id, &active.message_id);
                 if let Some(items) = interrupted_items.as_deref() {
                     message = crate::local::harness::codex::reconcile_interrupted_items(
@@ -6029,16 +6029,13 @@ impl ChatHost {
                     )
                     .or(message);
                 }
-                let _ = Store::open().and_then(|store| {
-                    store.finalize_turn_usage(&active.turn_id, "cancelled")?;
-                    store.reconcile_run_attribution()
-                });
-                crate::telemetry::retry_outbox();
                 if let Some(message) = message {
                     host.emit("chat.message", message_json(&message, &session_id));
                 }
                 let _ = std::fs::remove_file(target_event_path(&session_id, &active.message_id));
                 remove_target_pointer_if_matches(&session_id, &active.message_id);
+                let _ = Store::open().and_then(|store| store.settle_pending_runs());
+                crate::telemetry::retry_outbox();
             }
             host.finish_interruption(&session_id).await;
         });
@@ -7118,26 +7115,54 @@ fn rebase_prepared_attachment_paths(input: &str) -> String {
 }
 
 impl TurnCtx {
+    pub(crate) fn record_native_invocations(&self, message: &Value) {
+        if !self.durable {
+            return;
+        }
+        let Some(model) = message.get("model").and_then(Value::as_str) else {
+            return;
+        };
+        let identity = crate::store::InvocationIdentity {
+            harness: self.harness.clone(),
+            model: model.to_string(),
+            provider: message
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        if let Some(parts) = message.get("content").and_then(Value::as_array) {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if let Some(call_id) = part.get("id").and_then(Value::as_str) {
+                        if let Err(error) = Store::open().and_then(|store| {
+                            store.record_native_invocation(
+                                call_id,
+                                &identity,
+                                Some(&self.session_id),
+                            )
+                        }) {
+                            eprintln!("orx up: could not capture native tool identity: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// This turn's usage execution, for native evidence recorded outside `TurnCtx` (hooks,
-    /// cancellation capture, descendants that outlive the turn). `None` when nothing is recorded.
+    /// native store reads). `None` when nothing is recorded.
+    pub(crate) fn capture_store(&self) -> Result<Store> {
+        #[cfg(test)]
+        if let Some(dir) = &self.store_dir {
+            return Store::open_at(dir.clone());
+        }
+        Store::open()
+    }
+
     pub(crate) fn usage_execution_id(&self) -> Option<&str> {
         self.durable.then_some(self.usage_execution_id.as_str())
     }
 
-    /// Native descendants still running when the turn ends: the execution keeps accepting their
-    /// samples until `Store::release_usage_execution`, or this process exits (next start closes it).
-    pub(crate) fn hold_usage(&self) {
-        if !self.durable {
-            return;
-        }
-        if let Err(error) =
-            Store::open().and_then(|store| store.hold_usage_execution(&self.usage_execution_id))
-        {
-            eprintln!("orx up: could not hold usage for late native samples: {error}");
-        }
-    }
-
-    /// Native attribution for this turn's harness; see [`crate::store::Attribution::native`].
     pub(crate) fn native_attribution(
         &self,
         model: Option<&str>,
@@ -7147,55 +7172,29 @@ impl TurnCtx {
         crate::store::Attribution::native(&self.harness, model, provider, missing)
     }
 
-    pub(crate) fn capture_store(&self) -> Result<Store> {
-        #[cfg(test)]
-        if let Some(dir) = &self.store_dir {
-            return Store::open_at(dir.clone());
-        }
-        Store::open()
-    }
-
-    /// Record one native sample. `complete` means the counters cover the whole native request.
-    /// Record an identity with `TokenUsage::default()` when the model is reported without usage.
-    pub(crate) fn record_attributed_usage(
+    pub(crate) fn record_cumulative_usage(
         &self,
-        sample_id: &str,
-        attribution: crate::store::Attribution,
-        usage: crate::store::TokenUsage,
-        complete: bool,
+        native_scope: &str,
+        native_turn: &str,
+        attribution: &crate::store::Attribution,
+        total: crate::store::TokenUsage,
+        last: crate::store::TokenUsage,
     ) {
         if !self.durable {
             return;
         }
         if let Err(error) = self.capture_store().and_then(|store| {
-            store.record_attributed_sample(
+            store.record_cumulative_usage(
                 &self.usage_execution_id,
-                sample_id,
                 &self.harness,
-                &attribution,
-                &usage,
-                complete,
+                native_scope,
+                native_turn,
+                attribution,
+                &total,
+                &last,
             )
         }) {
-            eprintln!("orx up: could not persist native token usage: {error}");
-        }
-    }
-
-    /// Durably record the native model that issued tool part `part_id` (the `WirePart.id`), so a
-    /// run it launched resolves to its invoker even after a restart.
-    pub(crate) fn record_tool_invoker(&self, part_id: &str, model: &str, provider: Option<&str>) {
-        if !self.durable {
-            return;
-        }
-        let identity = crate::store::InvocationIdentity {
-            harness: self.harness.clone(),
-            model: model.to_string(),
-            provider: provider.map(str::to_string),
-        };
-        if let Err(error) = self.capture_store().and_then(|store| {
-            store.record_native_invocation(part_id, &identity, Some(&self.session_id))
-        }) {
-            eprintln!("orx up: could not capture native tool identity: {error}");
+            eprintln!("orx up: could not persist cumulative usage: {error}");
         }
     }
 
@@ -7235,6 +7234,51 @@ impl TurnCtx {
 
     pub(crate) fn attempt_count_for_usage(&self) -> i64 {
         self.attempt_count
+    }
+
+    /// Record one native sample. `complete` means the counters cover the whole native request;
+    /// record an identity seen without usage with `TokenUsage::default()`.
+    pub(crate) fn record_attributed_usage(
+        &self,
+        sample_id: &str,
+        attribution: crate::store::Attribution,
+        usage: crate::store::TokenUsage,
+        complete: bool,
+    ) {
+        if !self.durable {
+            return;
+        }
+        if let Err(error) = self.capture_store().and_then(|store| {
+            store.record_attributed_sample(
+                &self.usage_execution_id,
+                sample_id,
+                &self.harness,
+                &attribution,
+                &usage,
+                complete,
+                false,
+            )
+        }) {
+            eprintln!("orx up: could not persist native token usage: {error}");
+        }
+    }
+
+    /// Durably record the native model that issued tool part `part_id` (the `WirePart.id`), so
+    /// a run whose launch output that part printed binds to it.
+    pub(crate) fn record_tool_invoker(&self, part_id: &str, model: &str, provider: Option<&str>) {
+        if !self.durable {
+            return;
+        }
+        let identity = crate::store::InvocationIdentity {
+            harness: self.harness.clone(),
+            model: model.to_string(),
+            provider: provider.map(str::to_string),
+        };
+        if let Err(error) = self.capture_store().and_then(|store| {
+            store.record_native_invocation(part_id, &identity, Some(&self.session_id))
+        }) {
+            eprintln!("orx up: could not capture native tool identity: {error}");
+        }
     }
 
     pub fn http(&self) -> &reqwest::Client {
@@ -7486,9 +7530,8 @@ impl TurnCtx {
         }
     }
 
-    /// A durable [`Self::test_stub`] on its first attempt: native capture methods write into a
-    /// fresh store at `dir` holding its running, accepted turn and open usage execution. Other
-    /// persistence still targets the real data dir, so don't flush it.
+    /// A durable [`Self::test_stub`] on its first attempt whose native capture writes into a fresh
+    /// store at `dir` holding its running, accepted turn and open usage execution.
     #[cfg(test)]
     pub(crate) fn test_capture(dir: PathBuf, harness: &str) -> Self {
         let store = Store::open_at(dir.clone()).unwrap();
@@ -7511,41 +7554,14 @@ impl TurnCtx {
         }
     }
 
-    /// The [`Self::test_capture`] execution's outcome and samples (id, attribution, usage, complete).
+    /// Report properties every execution in a [`Self::test_capture`] store would stage at `outcome`:
+    /// the end behavior the service receives.
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn test_ledger(
-        dir: &std::path::Path,
-    ) -> (
-        Option<String>,
-        Vec<(
-            String,
-            crate::store::Attribution,
-            crate::store::TokenUsage,
-            bool,
-        )>,
-    ) {
-        let db = rusqlite::Connection::open(dir.join("orx.db")).unwrap();
-        let outcome = db
-            .query_row("SELECT outcome FROM chat_usage_executions", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let samples = db
-            .prepare("SELECT sample_id, attribution_json, usage_json, complete FROM chat_usage_samples ORDER BY sample_id")
+    pub(crate) fn test_reports(dir: &std::path::Path, outcome: &str) -> Vec<Value> {
+        Store::open_at(dir.to_path_buf())
             .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    serde_json::from_str(&row.get::<_, String>(1)?).unwrap(),
-                    serde_json::from_str(&row.get::<_, String>(2)?).unwrap(),
-                    row.get(3)?,
-                ))
-            })
+            .test_usage_reports(outcome)
             .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        (outcome, samples)
     }
 
     fn apply_target_events(&mut self) {
@@ -8026,21 +8042,16 @@ fn materialize_unfinished_turns(
     include_existing_failures: bool,
 ) -> Result<Vec<(String, WireMessage)>> {
     let mut messages = Vec::new();
+    // Native steps of turns a dead process left open belong in their executions before recovery closes them.
+    for turn in store.open_execution_turns()? {
+        crate::local::harness::record_turn_steps(store, &turn);
+    }
     let turns = if include_existing_failures {
-        // Startup: native evidence a dead process left unread belongs in its executions first.
-        if let Err(error) = crate::local::harness::codex::recover_orphaned_usage(store) {
-            eprintln!("orx up: could not recover codex rollout usage: {error}");
-        }
-        if let Err(error) = crate::local::harness::antigravity::recover_orphaned_turns(store) {
-            eprintln!("orx up: could not recover Antigravity transcripts: {error}");
-        }
-        if let Err(error) = crate::local::harness::opencode::adopt_orphaned_background(store) {
-            eprintln!("orx up: could not adopt OpenCode background usage: {error}");
-        }
         store.reconcile_unfinished_chat_turns()?
     } else {
         store.reconcile_expired_unfinished_chat_turns()?
     };
+    store.settle_pending_runs()?;
     for turn in turns {
         let action = turn.recovery_action.as_deref().unwrap_or({
             if matches!(turn.delivery_state.as_str(), "not_sent" | "rejected") {
@@ -8746,10 +8757,8 @@ fn zshenv_hook(original_zdotdir: &std::path::Path) -> String {
          [[ -r \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
          _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
          ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
-         if [[ -n \"${{ZSH_EXECUTION_STRING-}}\" || -z \"${{ORX_CHAT_TOOL_SCOPE-}}\" ]]; then\n\
-           export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
-           export ORX_CHAT_TOOL_COMMAND=\"${{ZSH_EXECUTION_STRING-}}\"\n\
-         fi\n\
+         export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"${{ZSH_EXECUTION_STRING-}}\"\n\
          if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
          elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
@@ -8772,10 +8781,8 @@ fn bash_env_hook(original: Option<String>) -> String {
         .unwrap_or_default();
     format!(
         "{source}\
-         if [[ -n \"${{BASH_EXECUTION_STRING-}}\" || -z \"${{ORX_CHAT_TOOL_SCOPE-}}\" ]]; then\n\
-           export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
-           export ORX_CHAT_TOOL_COMMAND=\"${{BASH_EXECUTION_STRING-}}\"\n\
-         fi\n\
+         export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"${{BASH_EXECUTION_STRING-}}\"\n\
          if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
          elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
@@ -8839,8 +8846,6 @@ pub fn set_chat_session_env(
     }
     cmd.env_remove(CHAT_TARGET_FILE_ENV);
     cmd.env_remove(CHAT_TARGET_POINTER_ENV);
-    cmd.env_remove("ORX_CHAT_TOOL_SCOPE");
-    cmd.env_remove("ORX_CHAT_TOOL_COMMAND");
 
     let shell_dir = shell_hook_dir(session_id);
     if std::fs::create_dir_all(&shell_dir).is_err() {

@@ -198,24 +198,12 @@ pub async fn run_antigravity() -> Result<()> {
                 .and_then(Value::as_i64)
                 .filter(|step| *step >= 0)
                 .ok_or_else(|| anyhow!("Missing native invocation step"))?;
-            let model = payload
-                .get("modelName")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("Missing native invocation model"))?;
-            let identity = crate::store::InvocationIdentity {
-                harness: "antigravity".into(),
-                model: model.to_string(),
-                provider: None,
-            };
-            // A sub-agent's conversation is not the chat's native session; the chat id still owns it.
-            let owner = std::env::var("ORX_SESSION_ID").unwrap_or_else(|_| conversation.into());
             record_invocation(
                 &crate::store::Store::open()?,
                 &payload,
                 conversation,
                 step,
-                &identity,
-                &owner,
+                &std::env::var("ORX_SESSION_ID").unwrap_or_else(|_| conversation.into()),
                 std::env::var("ORX_USAGE_EXECUTION_ID").ok().as_deref(),
             )?;
             println!("{{}}");
@@ -229,97 +217,53 @@ pub async fn run_antigravity() -> Result<()> {
     Ok(())
 }
 
-/// Persist one native invocation's identity under its planner step (the key its stream usage
-/// uses), its tool parts (crash-safe without harness memory), and, given the open execution, as
-/// identity samples plus one `child_model_unknown` marker per child each spawn created.
+/// One PostInvocation hook: the native model keyed to the invocation's own planner step (the
+/// stream's usage key), owned by the chat session (`owner`), and as an identity sample of the
+/// running turn's execution — a sub-agent's only per-call record.
 pub(crate) fn record_invocation(
     store: &crate::store::Store,
     payload: &Value,
     conversation: &str,
-    initial_steps: i64,
-    identity: &crate::store::InvocationIdentity,
+    step: i64,
     owner: &str,
     execution: Option<&str>,
 ) -> Result<()> {
-    use crate::local::harness::antigravity::{
-        invocation_planner, invocation_sample_id, planner_tool_steps, requested_subagents,
-        spawn_sample_id, spawned_children, tool_part_id, transcript_rows, unmatched_invocation_id,
+    let model = payload
+        .get("modelName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Missing native invocation model"))?;
+    let identity = crate::store::InvocationIdentity {
+        harness: "antigravity".into(),
+        model: model.to_string(),
+        provider: None,
     };
-    let rows = payload
+    // The invocation's own planner row: native steps inserted at or after `initialNumSteps` precede it.
+    let planner = payload
         .get("transcriptPath")
         .and_then(Value::as_str)
-        .map(|path| transcript_rows(std::path::Path::new(path)))
-        .unwrap_or_default();
-    let planner = invocation_planner(&rows, initial_steps);
-    let planner_step = planner.and_then(|row| row.get("step_index")?.as_i64());
-    let sample = match planner_step {
-        Some(step) => invocation_sample_id(conversation, step),
-        // Explicit, never matched to a later row: a later invocation could own it.
-        None => unmatched_invocation_id(conversation, initial_steps),
-    };
-    store.record_native_invocation(&sample, identity, Some(owner))?;
-    let mut spawns = Vec::new();
-    if let (Some(planner), Some(step)) = (planner, planner_step) {
-        let calls = planner_tool_steps(&rows, planner);
-        for (_, output) in &calls {
-            if let Some(tool_step) = output.get("step_index").and_then(Value::as_i64) {
-                store.record_native_invocation(
-                    &tool_part_id(conversation, tool_step),
-                    identity,
-                    Some(owner),
-                )?;
-            }
-        }
-        let paired = !calls.is_empty();
-        let spawn_calls = planner
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .filter(|(_, call)| {
-                call.get("name").and_then(Value::as_str) == Some("invoke_subagent")
-            });
-        for (index, call) in spawn_calls {
-            let children = if paired {
-                spawned_children(&calls[index].1)
-            } else {
-                Vec::new()
-            };
-            let shortfall = requested_subagents(call).saturating_sub(children.len());
-            spawns.extend(
-                children
-                    .into_iter()
-                    .chain((0..shortfall).map(|missing| format!("#{index}.{missing}")))
-                    .map(|child| spawn_sample_id(conversation, step, &child)),
-            );
-        }
-    }
-    let Some(execution) = execution else {
-        return Ok(());
-    };
-    store.record_attributed_sample(
-        execution,
-        &sample,
-        "antigravity",
-        &crate::store::Attribution::native(
-            "antigravity",
-            Some(&identity.model),
-            None,
-            crate::store::Missing::IdentityNotReported,
-        ),
-        &Default::default(),
-        false,
-    )?;
-    for spawn in spawns {
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|row| row["type"] == "PLANNER_RESPONSE")
+                .find_map(|row| row["step_index"].as_i64().filter(|index| *index >= step))
+        })
+        .unwrap_or(step);
+    let key = crate::local::harness::antigravity::invocation_sample_id(conversation, planner);
+    store.record_native_invocation(&key, &identity, Some(owner))?;
+    if let Some(execution) = execution {
         store.record_attributed_sample(
             execution,
-            &spawn,
+            &key,
             "antigravity",
-            &crate::store::Attribution::Unresolved {
-                reason: crate::store::Missing::ChildModelUnknown,
-            },
+            &crate::store::Attribution::native(
+                "antigravity",
+                Some(model),
+                None,
+                crate::store::Missing::IdentityNotReported,
+            ),
             &Default::default(),
+            false,
             false,
         )?;
     }
@@ -412,237 +356,6 @@ mod antigravity_tests {
             &payload
         ));
         assert!(!workspace_read("view_file", &json!({}), &payload));
-    }
-
-    fn write_rows(path: &std::path::Path, rows: &[Value]) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            path,
-            rows.iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n",
-        )
-        .unwrap();
-    }
-
-    fn samples(dir: &std::path::Path) -> Vec<(String, crate::store::Attribution)> {
-        let conn = rusqlite::Connection::open(dir.join("orx.db")).unwrap();
-        let rows = conn
-            .prepare(
-                "SELECT sample_id, attribution_json FROM chat_usage_samples ORDER BY sample_id",
-            )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1)?)))
-            .unwrap()
-            .map(|row| {
-                let (id, json) = row.unwrap();
-                (id, serde_json::from_str(&json).unwrap())
-            })
-            .collect();
-        rows
-    }
-
-    fn identity(model: &str) -> crate::store::InvocationIdentity {
-        crate::store::InvocationIdentity {
-            harness: "antigravity".into(),
-            model: model.into(),
-            provider: None,
-        }
-    }
-
-    fn exact(model: &str) -> crate::store::Attribution {
-        crate::store::Attribution::Exact {
-            model: model.into(),
-            provider: None,
-        }
-    }
-
-    /// Native agy 1.2.14 shape: system/user steps are inserted at or after `initialNumSteps`, so the
-    /// invocation is its first planner from there; a failed invocation with no planner stays an
-    /// explicit unmatched identity and never claims the next invocation's planner.
-    #[test]
-    fn invocation_hook_maps_its_own_planner_and_never_a_later_one() {
-        let dir = std::env::temp_dir().join(format!("orx-agy-hook-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("execution", "turn", "antigravity")
-            .unwrap();
-        let transcript = dir.join("brain/conv/logs/transcript_full.jsonl");
-        let mut rows = vec![
-            json!({"step_index":2,"type":"USER_INPUT","status":"DONE"}),
-            json!({"step_index":3,"type":"SYSTEM_MESSAGE","status":"DONE"}),
-            json!({"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[
-                {"name":"run_command","args":{"CommandLine":"orx exp run e"}}]}),
-            json!({"step_index":5,"type":"GENERIC","status":"DONE","content":"run 1b2c"}),
-        ];
-        write_rows(&transcript, &rows);
-        let payload = json!({"transcriptPath": transcript});
-        let hook = |initial, model: &str| {
-            record_invocation(
-                &store,
-                &payload,
-                "conv",
-                initial,
-                &identity(model),
-                "session",
-                Some("execution"),
-            )
-            .unwrap()
-        };
-        hook(3, "gemini-3.1-pro-high");
-        // The next invocation fails before any model output.
-        rows.push(json!({"step_index":6,"type":"USER_INPUT","status":"DONE"}));
-        write_rows(&transcript, &rows);
-        hook(6, "claude-sonnet-4-6");
-        rows.push(json!({"step_index":7,"type":"SYSTEM_MESSAGE","status":"DONE"}));
-        rows.push(json!({"step_index":8,"type":"PLANNER_RESPONSE","status":"DONE","content":"ok"}));
-        write_rows(&transcript, &rows);
-        hook(7, "gemini-3.8-flash-high");
-        let recorded = |key: &str| {
-            store
-                .native_invocation_identity("antigravity", key)
-                .unwrap()
-                .map(|identity| identity.model)
-        };
-        assert_eq!(
-            recorded("antigravity:conv:step:4").as_deref(),
-            Some("gemini-3.1-pro-high")
-        );
-        assert_eq!(recorded("antigravity:conv:step:3"), None);
-        assert_eq!(
-            recorded("tool-conv-5").as_deref(),
-            Some("gemini-3.1-pro-high")
-        );
-        assert_eq!(
-            recorded("antigravity:conv:step:8").as_deref(),
-            Some("gemini-3.8-flash-high")
-        );
-        drop(store);
-        assert_eq!(
-            samples(&dir),
-            [
-                (
-                    "antigravity:conv:invocation:6".into(),
-                    exact("claude-sonnet-4-6")
-                ),
-                (
-                    "antigravity:conv:step:4".into(),
-                    exact("gemini-3.1-pro-high")
-                ),
-                (
-                    "antigravity:conv:step:8".into(),
-                    exact("gemini-3.8-flash-high")
-                ),
-            ]
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// One native `invoke_subagent` creating two children (output shape observed live, compact
-    /// transcript with JSON-encoded args): each child gets its own spawn marker and its own
-    /// identity per invocation; a requested child the output never named stays explicit.
-    #[test]
-    fn spawns_link_each_named_child_and_keep_distinct_child_identities() {
-        let dir = std::env::temp_dir().join(format!("orx-agy-children-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store
-            .begin_usage_execution("execution", "turn", "antigravity")
-            .unwrap();
-        let parent = dir.join("parent/transcript.jsonl");
-        let subagents =
-            json!([{"Model":"inherit","Prompt":"reply A"},{"Model":"inherit","Prompt":"reply B"},
-            {"Model":"inherit","Prompt":"reply C"}])
-            .to_string();
-        write_rows(
-            &parent,
-            &[
-                json!({"step_index":10,"type":"SYSTEM_MESSAGE","status":"DONE"}),
-                json!({"step_index":11,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[
-                {"name":"invoke_subagent","args":{"Subagents":subagents,"toolAction":"\"Invoking\""}}]}),
-                json!({"step_index":12,"type":"GENERIC","status":"DONE","content":
-                "Created At: x\nCompleted At: x\nCreated the following subagents:\n{\n  \"conversationId\":  \"child-a\",\n  \"logAbsoluteUri\":  \"file:///a\",\n  \"workspaceUris\":  []\n}\n{\n  \"conversationId\":  \"child-b\",\n  \"logAbsoluteUri\":  \"file:///b\",\n  \"workspaceUris\":  []\n}\nThe subagents will send you a message when they have completed their task."}),
-            ],
-        );
-        record_invocation(
-            &store,
-            &json!({"transcriptPath": parent}),
-            "parent",
-            10,
-            &identity("gemini-3.8-flash-high"),
-            "session",
-            Some("execution"),
-        )
-        .unwrap();
-        // Child A changes model between invocations; child B has its own; child C never hooks.
-        let child_rows = |dir: &str| {
-            let path = std::path::Path::new(dir).join("transcript_full.jsonl");
-            write_rows(
-                &path,
-                &[
-                    json!({"step_index":0,"type":"SYSTEM_MESSAGE","status":"DONE"}),
-                    json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"ok"}),
-                    json!({"step_index":2,"type":"SYSTEM_MESSAGE","status":"DONE"}),
-                    json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"ok"}),
-                ],
-            );
-            json!({"transcriptPath": path})
-        };
-        for (child, initial, model) in [
-            ("child-a", 0, "gemini-3.1-pro-high"),
-            ("child-a", 2, "claude-sonnet-4-6"),
-            ("child-b", 0, "gemini-3.8-flash-high"),
-        ] {
-            record_invocation(
-                &store,
-                &child_rows(dir.join(child).to_str().unwrap()),
-                child,
-                initial,
-                &identity(model),
-                "session",
-                Some("execution"),
-            )
-            .unwrap();
-        }
-        drop(store);
-        let unknown = crate::store::Attribution::Unresolved {
-            reason: crate::store::Missing::ChildModelUnknown,
-        };
-        assert_eq!(
-            samples(&dir),
-            [
-                (
-                    "antigravity:child-a:step:1".into(),
-                    exact("gemini-3.1-pro-high")
-                ),
-                (
-                    "antigravity:child-a:step:3".into(),
-                    exact("claude-sonnet-4-6")
-                ),
-                (
-                    "antigravity:child-b:step:1".into(),
-                    exact("gemini-3.8-flash-high")
-                ),
-                (
-                    "antigravity:parent:step:11".into(),
-                    exact("gemini-3.8-flash-high")
-                ),
-                (
-                    "antigravity:parent:step:11:subagent:#0.0".into(),
-                    unknown.clone()
-                ),
-                (
-                    "antigravity:parent:step:11:subagent:child-a".into(),
-                    unknown.clone()
-                ),
-                (
-                    "antigravity:parent:step:11:subagent:child-b".into(),
-                    unknown
-                ),
-            ]
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

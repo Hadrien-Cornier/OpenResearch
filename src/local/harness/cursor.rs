@@ -1696,168 +1696,88 @@ ActionRequiredError: Named models unavailable Free plans can only use Auto. Swit
         assert!(matches!(reject, ResumeAction::Nothing));
     }
 
-    fn feed(ctx: &mut TurnCtx, events: &[Value]) -> TurnState {
-        let mut state = TurnState::default();
-        for event in events {
-            apply_event(ctx, &mut state, event);
-        }
-        state
-    }
-
-    fn init() -> Value {
-        serde_json::json!({"type": "system", "subtype": "init", "apiKeySource": "login",
-            "cwd": "/ws", "session_id": "s1", "model": "Opus 4.8 High", "permissionMode": "default"})
-    }
-
-    fn delta(text: &str) -> Value {
-        serde_json::json!({"type": "assistant", "timestamp_ms": 1, "session_id": "s1",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
-    }
-
-    fn opus() -> crate::store::Attribution {
-        crate::store::Attribution::Exact {
-            model: "Opus 4.8 High".into(),
-            provider: None,
-        }
-    }
-
-    /// Output streamed before Cursor's native retry and after it is one request: the result total
-    /// replaces the execution's identity write, so nothing is counted twice.
+    /// Native print-mode streams → the reports the service receives.
     #[test]
-    fn native_retry_keeps_one_result_snapshot_for_the_init_model() {
-        let dir = std::env::temp_dir().join(format!("orx-cursor-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = TurnCtx::test_capture(dir.clone(), "cursor");
-        let state = feed(
-            &mut ctx,
-            &[
-                init(),
-                delta("Hel"),
-                serde_json::json!({"type": "retry", "subtype": "started"}),
-                delta("Hello"),
-                serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
-                    "result": "Hello", "session_id": "s1", "request_id": "r1",
-                    "usage": {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 100, "cacheWriteTokens": 0}}),
-            ],
-        );
-        assert!(state.executed && !state.turn_errored);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.finalize_turn_usage("test-turn", "done").unwrap();
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (
-                Some("done".into()),
-                vec![(
-                    "cursor-result-1".into(),
-                    opus(),
-                    crate::store::TokenUsage {
-                        input_tokens: Some(110),
-                        output_tokens: Some(5),
-                        cache_read_tokens: Some(100),
-                        cache_write_tokens: Some(0),
-                        reasoning_tokens: None,
-                    },
-                    true
-                )]
-            )
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A failed result after output keeps the executed init model without tokens; a hidden
-    /// sub-agent stays an explicit unknown even when its request names a model, while the parent
-    /// is recorded only as the Task call's invoker.
-    #[test]
-    fn failure_after_output_keeps_the_model_and_the_hidden_child_stays_unknown() {
-        let dir = std::env::temp_dir().join(format!("orx-cursor-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = TurnCtx::test_capture(dir.clone(), "cursor");
-        let state = feed(
-            &mut ctx,
-            &[
-                init(),
-                delta("Delegating."),
-                serde_json::json!({"type": "tool_call", "subtype": "started", "call_id": "task-1",
-                    "session_id": "s1", "timestamp_ms": 1, "model_call_id": "mc-1",
-                    "tool_call": {"taskToolCall": {"args": {"description": "Explore",
-                        "prompt": "Find the loader", "model": "gpt-5.5"}}}}),
-                serde_json::json!({"type": "result", "subtype": "error", "is_error": true,
-                    "result": "Rate limit exceeded", "session_id": "s1"}),
-            ],
-        );
-        assert!(state.executed && state.turn_errored);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.finalize_turn_usage("test-turn", "failed").unwrap();
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (
-                Some("failed".into()),
-                vec![
-                    ("cursor-result-1".into(), opus(), Default::default(), false),
-                    (
-                        "cursor-task-task-1".into(),
-                        crate::store::Attribution::Unresolved {
-                            reason: crate::store::Missing::ChildModelUnknown
-                        },
-                        Default::default(),
-                        false
-                    ),
-                ]
-            )
-        );
-        assert_eq!(
-            store
-                .native_invocation_identity("cursor", "task-1")
-                .unwrap()
-                .map(|identity| identity.model),
-            Some("Opus 4.8 High".into())
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Init names the model before the request; cancelled there, nothing executed.
-    #[test]
-    fn cancel_before_output_records_no_identity_from_init() {
-        let dir = std::env::temp_dir().join(format!("orx-cursor-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = TurnCtx::test_capture(dir.clone(), "cursor");
+    fn native_streams_report_the_init_model_once_and_children_stay_unknown() {
+        let init = serde_json::json!({"type": "system", "subtype": "init", "session_id": "s1",
+            "model": "Opus 4.8 High"});
+        let delta = |text: &str| {
+            serde_json::json!({"type": "assistant", "session_id": "s1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+        };
         let echo = serde_json::json!({"type": "user", "session_id": "s1",
             "message": {"role": "user", "content": [{"type": "text", "text": "run it"}]}});
-        assert!(!feed(&mut ctx, &[init(), echo]).executed);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.finalize_turn_usage("test-turn", "cancelled").unwrap();
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
-            (Some("cancelled".into()), vec![])
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A process that dies after output leaves the identity write; startup recovery closes the
-    /// execution exactly once, and a later result is not kept.
-    #[test]
-    fn restart_finalizes_a_dead_cursor_turn_once() {
-        let dir = std::env::temp_dir().join(format!("orx-cursor-ledger-{}", uuid::Uuid::new_v4()));
-        let mut ctx = TurnCtx::test_capture(dir.clone(), "cursor");
-        let mut state = feed(&mut ctx, &[init(), delta("Half")]);
-        let store = crate::store::Store::open_at(dir.clone()).unwrap();
-        store.reconcile_unfinished_chat_turns().unwrap();
-        store.reconcile_unfinished_chat_turns().unwrap();
-        apply_event(
-            &mut ctx,
-            &mut state,
-            &serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
-                "result": "Half", "session_id": "s1",
-                "usage": {"inputTokens": 1, "outputTokens": 1, "cacheReadTokens": 0, "cacheWriteTokens": 0}}),
-        );
-        assert_eq!(
-            TurnCtx::test_ledger(&dir),
+        let task = serde_json::json!({"type": "tool_call", "subtype": "started", "call_id": "task-1",
+            "tool_call": {"taskToolCall": {"args": {"prompt": "Find the loader", "model": "gpt-5.5"}}}});
+        let failed = serde_json::json!({"type": "result", "subtype": "error", "is_error": true,
+            "result": "Rate limit exceeded", "session_id": "s1"});
+        let done = serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+            "result": "Hello", "session_id": "s1",
+            "usage": {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 100, "cacheWriteTokens": 0}});
+        let report = |attribution: &str, model: Value, reason: Value, coverage: &str| {
+            (attribution.to_string(), model, reason, coverage.to_string())
+        };
+        let cases = [
+            // Output before and after a native retry is one request with one result total.
             (
-                Some("failed".into()),
-                vec![("cursor-result-1".into(), opus(), Default::default(), false)]
-            )
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+                vec![
+                    init.clone(),
+                    delta("Hel"),
+                    serde_json::json!({"type": "retry"}),
+                    delta("Hello"),
+                    done,
+                ],
+                vec![report(
+                    "exact",
+                    "Opus 4.8 High".into(),
+                    Value::Null,
+                    "complete",
+                )],
+            ),
+            // Failed after output: the model executed; the hidden sub-agent never takes it.
+            (
+                vec![init.clone(), delta("Delegating."), task, failed],
+                vec![
+                    report("exact", "Opus 4.8 High".into(), Value::Null, "missing"),
+                    report(
+                        "unresolved",
+                        Value::Null,
+                        "child_model_unknown".into(),
+                        "missing",
+                    ),
+                ],
+            ),
+            // Cancelled after init only: init names a configured model, never an execution.
+            (
+                vec![init, echo],
+                vec![report(
+                    "unresolved",
+                    Value::Null,
+                    "no_usage_reported".into(),
+                    "missing",
+                )],
+            ),
+        ];
+        for (events, expected) in cases {
+            let dir = std::env::temp_dir().join(format!("orx-cursor-{}", uuid::Uuid::new_v4()));
+            let mut ctx = TurnCtx::test_capture(dir.clone(), "cursor");
+            let mut state = TurnState::default();
+            for event in &events {
+                apply_event(&mut ctx, &mut state, event);
+            }
+            let reports: Vec<_> = TurnCtx::test_reports(&dir, "failed")
+                .into_iter()
+                .map(|r| {
+                    report(
+                        r["attribution"].as_str().unwrap(),
+                        r["model"].clone(),
+                        r["attributionReason"].clone(),
+                        r["coverage"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(reports, expected, "{events:?}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

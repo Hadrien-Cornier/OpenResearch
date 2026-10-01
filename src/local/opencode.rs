@@ -498,22 +498,6 @@ async fn spawn_agent(
     })
 }
 
-/// Natively stops one OpenCode session's run.
-pub(crate) async fn abort_session(endpoint: &AgentEndpoint, native_id: &str) -> Result<()> {
-    let path = match endpoint.protocol {
-        Protocol::V1 => format!("/session/{native_id}/abort"),
-        Protocol::V2 => format!("/api/session/{native_id}/interrupt"),
-    };
-    endpoint
-        .client
-        .post(format!("{}{path}", endpoint.base_url))
-        .json(&json!({}))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
 /// Why a summarize attempt did or did not compact in place.
 pub(crate) enum SummarizeOutcome {
     Compacted,
@@ -536,10 +520,6 @@ pub struct AgentHost {
     up_port: std::sync::OnceLock<u16>,
     starting: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     stopping: std::sync::atomic::AtomicBool,
-    /// Sessions being deleted: no background start until a turn revives one whose deletion failed.
-    retired: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Each session's running turn, so an interrupt can capture what the aborted turn cannot.
-    turns: std::sync::Mutex<HashMap<String, crate::local::harness::opencode::TrackedTurn>>,
 }
 
 struct StartupRegistration<'a> {
@@ -564,24 +544,6 @@ impl AgentHost {
             up_port: std::sync::OnceLock::new(),
             starting: std::sync::Mutex::new(HashMap::new()),
             stopping: std::sync::atomic::AtomicBool::new(false),
-            retired: std::sync::Mutex::new(std::collections::HashSet::new()),
-            turns: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub(crate) fn track(
-        &self,
-        session_id: &str,
-        turn: crate::local::harness::opencode::TrackedTurn,
-    ) {
-        if let Ok(mut turns) = self.turns.lock() {
-            turns.insert(session_id.to_string(), turn);
-        }
-    }
-
-    pub(crate) fn untrack(&self, session_id: &str) {
-        if let Ok(mut turns) = self.turns.lock() {
-            turns.remove(session_id);
         }
     }
 
@@ -596,19 +558,6 @@ impl AgentHost {
         guard.values().map(AgentChild::status).collect()
     }
 
-    /// A turn on a session whose deletion failed may start its server again.
-    pub(crate) fn revive(&self, session_id: &str) {
-        if let Ok(mut retired) = self.retired.lock() {
-            retired.remove(session_id);
-        }
-    }
-
-    pub(crate) fn is_retired(&self, session_id: &str) -> bool {
-        self.retired
-            .lock()
-            .map_or(true, |retired| retired.contains(session_id))
-    }
-
     pub(crate) async fn endpoint_for(&self, session_id: &str) -> Option<AgentEndpoint> {
         let mut guard = self.inner.lock().await;
         let agent = guard.get_mut(session_id)?;
@@ -620,26 +569,21 @@ impl AgentHost {
         }
     }
 
-    /// Stops the native turn and, before the shared interrupt finalizes usage, captures the native
-    /// evidence of the turn it aborted.
-    pub(crate) async fn interrupt(
-        self: &std::sync::Arc<Self>,
-        session_id: &str,
-        native_id: &str,
-    ) -> Result<()> {
-        let turn = self
-            .turns
-            .lock()
-            .ok()
-            .and_then(|mut turns| turns.remove(session_id))
-            .filter(|turn| turn.native_id == native_id);
+    pub(crate) async fn interrupt(&self, session_id: &str, native_id: &str) -> Result<()> {
         let Some(endpoint) = self.endpoint_for(session_id).await else {
             return Ok(());
         };
-        abort_session(&endpoint, native_id).await?;
-        if let Some(turn) = turn {
-            crate::local::harness::opencode::capture_interrupted(self, &endpoint, &turn).await;
-        }
+        let path = match endpoint.protocol {
+            Protocol::V1 => format!("/session/{native_id}/abort"),
+            Protocol::V2 => format!("/api/session/{native_id}/interrupt"),
+        };
+        endpoint
+            .client
+            .post(format!("{}{path}", endpoint.base_url))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -689,18 +633,10 @@ impl AgentHost {
             return Err(anyhow!("OpenCode is shutting down"));
         }
         let (sender, mut cancel) = tokio::sync::watch::channel(false);
-        {
-            let mut starting = self
-                .starting
-                .lock()
-                .map_err(|_| anyhow!("OpenCode startup lock failed"))?;
-            // Checked with the registration, so a concurrent deletion either sees this start or
-            // cancels it.
-            if self.is_retired(session_id) {
-                return Err(anyhow!("this chat session is being deleted"));
-            }
-            starting.insert(session_id.to_string(), sender);
-        }
+        self.starting
+            .lock()
+            .map_err(|_| anyhow!("OpenCode startup lock failed"))?
+            .insert(session_id.to_string(), sender);
         let _registration = StartupRegistration {
             host: self,
             session: session_id,
@@ -795,23 +731,25 @@ impl AgentHost {
             return Err(anyhow!("OpenCode startup was cancelled"));
         }
         let status = agent.status();
+        // A pending run report waits only while the server that owns its native step lives.
+        if let Some(pid) = agent.child.id() {
+            if let Err(error) = crate::store::Store::open()
+                .and_then(|store| store.record_native_owner(session_id, pid, agent.port))
+            {
+                eprintln!("orx up: could not record the OpenCode server owner: {error}");
+            }
+        }
         inner.insert(session_id.to_string(), agent);
         Ok(status)
     }
 
-    /// Kill and reap one session's child (on session delete), after a last read of the background
-    /// usage it holds. No-op when the session has none.
+    /// Kill and reap one session's child (on session delete). No-op when the
+    /// session has none.
     pub async fn kill_session(&self, session_id: &str) {
         if let Ok(mut starting) = self.starting.lock() {
-            if let Ok(mut retired) = self.retired.lock() {
-                retired.insert(session_id.to_string());
-            }
             if let Some(cancel) = starting.remove(session_id) {
                 let _ = cancel.send(true);
             }
-        }
-        if let Some(endpoint) = self.endpoint_for(session_id).await {
-            crate::local::harness::opencode::reconcile_retiring(&endpoint, session_id).await;
         }
         if let Some(mut agent) = self.inner.lock().await.remove(session_id) {
             let _ = agent.child.kill().await;
@@ -852,21 +790,6 @@ mod tests {
             .await
             .unwrap();
         assert!(host.stopping.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    /// Deleting a session stops background restarts of its server, but a deletion that then fails
-    /// must not leave the chat unable to start OpenCode: its next turn revives it.
-    #[tokio::test]
-    async fn a_failed_deletion_lets_the_next_turn_start_the_server() {
-        let host = AgentHost::new(None);
-        host.kill_session("chat").await;
-        assert!(
-            host.is_retired("chat"),
-            "no background restart while deleting"
-        );
-        host.revive("chat");
-        assert!(!host.is_retired("chat"));
-        assert!(!host.is_retired("other"));
     }
 
     fn sample_project() -> LocalProject {

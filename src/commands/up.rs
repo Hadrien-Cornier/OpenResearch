@@ -105,10 +105,27 @@ pub async fn run(args: UpArgs) -> Result<()> {
     // Harnesses spawn lazily on the first message to one of their sessions;
     // no eager agent bring-up. (--no-agent is now a no-op kept for compat.)
     let agent = Arc::new(AgentHost::new(args.model.clone()));
-    local::harness::opencode::recover_adopted_background(agent.clone());
     let codex = Arc::new(local::codex::CodexHost::new());
     let claude = Arc::new(local::claude::ClaudeHost::new());
     claude.start_reaper();
+    // Native work can finish after its turn with no later turn or restart: OpenCode sub-agents,
+    // and runs whose launch output a natively woken step writes later.
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let _ = tokio::task::spawn_blocking(|| {
+                if let Err(error) = Store::open().and_then(|store| {
+                    local::harness::opencode::reconcile_native_usage(&store)?;
+                    store.settle_pending_runs()
+                }) {
+                    eprintln!("orx up: could not reconcile native usage: {error}");
+                }
+                crate::telemetry::retry_outbox();
+            })
+            .await;
+        }
+    });
     let remote_instance_id = persistent_host.then(|| uuid::Uuid::new_v4().to_string());
     let stopping = Arc::new(AtomicBool::new(false));
     let state = AppState {
@@ -2083,7 +2100,6 @@ struct CreateRunReq {
     #[serde(default)]
     force: bool,
     chat_session_id: Option<String>,
-    launch_command: Option<String>,
     agent_origin: Option<String>,
 }
 
@@ -2169,7 +2185,6 @@ pub(crate) async fn submit_run_via_up(
         disk: args.disk,
         force: args.force,
         chat_session_id: args.launching_chat_session(),
-        launch_command: args.launching_tool_command(),
         agent_origin: args.launching_agent_origin(),
     };
     let response =
@@ -2254,7 +2269,6 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
         timeout: req.timeout,
         force: req.force,
         chat_session_id: req.chat_session_id,
-        launch_command: req.launch_command,
         agent_origin: req.agent_origin,
         forwarded: true,
     };
@@ -8483,14 +8497,12 @@ mod tests {
             disk: None,
             force: true,
             chat_session_id: Some("session-1".into()),
-            launch_command: Some("orx exp run experiment-1".into()),
             agent_origin: Some("codex".into()),
         };
 
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["experimentId"], "experiment-1");
         assert_eq!(value["chatSessionId"], "session-1");
-        assert_eq!(value["launchCommand"], "orx exp run experiment-1");
         assert_eq!(value["force"], true);
         assert_eq!(
             serde_json::from_value::<CreateRunReq>(value).unwrap(),

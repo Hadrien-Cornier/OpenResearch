@@ -1227,7 +1227,7 @@ pub(crate) fn capture_experiment_started(kind: &str, local: bool, target: Option
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
@@ -1239,16 +1239,16 @@ pub(crate) mod tests {
     // k8s/slurm/ssh tests are pure functions; localbox uses a disjoint
     // ORX_DATA_DIR), so there's no race. Any NEW test elsewhere that touches
     // these vars or config_dir() must isolate itself (e.g. its own temp
-    // XDG_CONFIG_HOME) or hold an `EnvGuard` too.
+    // XDG_CONFIG_HOME) — it cannot rely on this lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    pub(crate) struct EnvGuard {
+    struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
         saved: Vec<(&'static str, Option<String>)>,
     }
 
     impl EnvGuard {
-        pub(crate) fn new(vars: &[&'static str]) -> Self {
+        fn new(vars: &[&'static str]) -> Self {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let saved = vars
                 .iter()
@@ -2306,17 +2306,21 @@ pub(crate) mod tests {
             .begin_usage_execution("execution", "turn", "codex")
             .unwrap();
         store
-            .record_usage_sample(
+            .record_attributed_sample(
                 "execution",
                 "sample",
                 "codex",
-                Some("gpt-6-sol"),
-                None,
+                &crate::store::Attribution::Exact {
+                    model: "gpt-6-sol".into(),
+                    provider: None,
+                },
                 &crate::store::TokenUsage {
                     input_tokens: Some(5),
                     output_tokens: Some(2),
                     ..Default::default()
                 },
+                true,
+                false,
             )
             .unwrap();
         store.finalize_turn_usage("turn", "done").unwrap();
@@ -2333,7 +2337,6 @@ pub(crate) mod tests {
                     model: "gpt-6-sol".into(),
                     provider: None,
                 }),
-                None,
                 None,
                 None,
                 report.as_ref(),

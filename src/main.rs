@@ -565,22 +565,18 @@ pub struct ExpRunArgs {
     pub chat_session_id: Option<String>,
     #[arg(long, hide = true)]
     pub invocation_context: Option<String>,
-    /// The launching agent shell's command, forwarded so `orx up` can find the invoking tool part.
-    #[arg(skip)]
-    pub launch_command: Option<String>,
     /// Native agent CLI that launched this outside an OpenResearch chat (see [`agent_origin`]).
     #[arg(skip)]
     pub agent_origin: Option<String>,
-    /// A request forwarded to `orx up`: launch evidence comes only from the request, never
-    /// from the server process's own environment.
+    /// Forwarded to `orx up`: launch evidence comes from the request, never the server's own env.
     #[arg(skip)]
     pub forwarded: bool,
     #[arg(skip)]
     pub telemetry_suppressed: bool,
 }
 
-/// Markers the native agent CLIs export into their shell tools, verified in each shipped binary.
-/// Nested agents leave several markers, so the innermost is `unknown`. Antigravity exports none.
+/// Markers the native agent CLIs export into their shell tools. Nested agents leave several, so
+/// the innermost is `unknown`. Antigravity exports none.
 pub(crate) fn agent_origin(env: impl Fn(&str) -> Option<String>) -> Option<String> {
     let found: Vec<_> = [
         ("CLAUDECODE", "claude-code"),
@@ -607,9 +603,16 @@ impl ExpRunArgs {
             .invocation_context
             .clone()
             .or_else(|| self.launch_env("ORX_INVOCATION_CONTEXT"));
-        let identity: Option<crate::store::InvocationIdentity> = context
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?;
+        let identity: Option<crate::store::InvocationIdentity> = match context {
+            Some(json) => Some(serde_json::from_str(&json)?),
+            // Codex exports only its thread id; the thread's running turn is the invoking request.
+            None => self.launch_env("CODEX_THREAD_ID").and_then(|thread| {
+                crate::local::harness::codex::chat_thread_invoker(
+                    &self.launching_chat_session()?,
+                    &thread,
+                )
+            }),
+        };
         if let Some(identity) = &identity {
             identity.validate()?;
         }
@@ -624,15 +627,11 @@ impl ExpRunArgs {
     }
 
     pub fn launching_chat_session(&self) -> Option<String> {
-        self.chat_session_id
-            .clone()
-            .or_else(|| self.launch_env(crate::local::chat::CHAT_SESSION_ENV))
-    }
-
-    pub(crate) fn launching_tool_command(&self) -> Option<String> {
-        self.launch_command
-            .clone()
-            .or_else(|| self.launch_env("ORX_CHAT_TOOL_COMMAND"))
+        self.chat_session_id.clone().or_else(|| {
+            (!self.forwarded)
+                .then(crate::local::chat::launching_chat_session)
+                .flatten()
+        })
     }
 
     pub(crate) fn launching_agent_origin(&self) -> Option<String> {
