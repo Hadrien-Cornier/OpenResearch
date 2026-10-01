@@ -6996,8 +6996,6 @@ pub struct TurnCtx {
     #[cfg(test)]
     store_dir: Option<PathBuf>,
     usage_execution_id: String,
-    pub(crate) native_message_models: HashMap<String, crate::store::InvocationIdentity>,
-    pub(crate) native_usage_scopes: HashSet<String>,
     delivery_state: DeliveryState,
     attempt_count: i64,
     retry_owner: Option<String>,
@@ -7056,8 +7054,6 @@ fn turn_ctx_from_stored(
         #[cfg(test)]
         store_dir: None,
         usage_execution_id: uuid::Uuid::new_v4().to_string(),
-        native_message_models: HashMap::new(),
-        native_usage_scopes: HashSet::new(),
         delivery_state: DeliveryState::NotSent,
         attempt_count: turn.attempt_count,
         retry_owner: None,
@@ -7141,51 +7137,6 @@ impl TurnCtx {
         }
     }
 
-    pub(crate) fn record_cumulative_usage(
-        &self,
-        native_scope: &str,
-        native_turn: &str,
-        total: crate::store::TokenUsage,
-        last: crate::store::TokenUsage,
-    ) {
-        self.record_attributed_cumulative_usage(
-            native_scope,
-            native_turn,
-            crate::store::Attribution::Unresolved {
-                reason: crate::store::Missing::IdentityNotReported,
-            },
-            total,
-            last,
-        );
-    }
-
-    /// Cumulative native totals become complete deltas under `attribution`.
-    pub(crate) fn record_attributed_cumulative_usage(
-        &self,
-        native_scope: &str,
-        native_turn: &str,
-        attribution: crate::store::Attribution,
-        total: crate::store::TokenUsage,
-        last: crate::store::TokenUsage,
-    ) {
-        if !self.durable {
-            return;
-        }
-        if let Err(error) = Store::open().and_then(|store| {
-            store.record_cumulative_usage(
-                &self.usage_execution_id,
-                &self.harness,
-                native_scope,
-                native_turn,
-                &attribution,
-                &total,
-                &last,
-            )
-        }) {
-            eprintln!("orx up: could not persist cumulative usage: {error}");
-        }
-    }
-
     /// Native attribution for this turn's harness; see [`crate::store::Attribution::native`].
     pub(crate) fn native_attribution(
         &self,
@@ -7196,7 +7147,7 @@ impl TurnCtx {
         crate::store::Attribution::native(&self.harness, model, provider, missing)
     }
 
-    fn capture_store(&self) -> Result<Store> {
+    pub(crate) fn capture_store(&self) -> Result<Store> {
         #[cfg(test)]
         if let Some(dir) = &self.store_dir {
             return Store::open_at(dir.clone());
@@ -7284,30 +7235,6 @@ impl TurnCtx {
 
     pub(crate) fn attempt_count_for_usage(&self) -> i64 {
         self.attempt_count
-    }
-
-    pub(crate) fn record_native_usage(
-        &self,
-        sample_id: &str,
-        model: Option<&str>,
-        provider: Option<&str>,
-        usage: crate::store::TokenUsage,
-    ) {
-        if !self.durable {
-            return;
-        }
-        if let Err(error) = Store::open().and_then(|store| {
-            store.record_usage_sample(
-                &self.usage_execution_id,
-                sample_id,
-                &self.harness,
-                model,
-                provider,
-                &usage,
-            )
-        }) {
-            eprintln!("orx up: could not persist native token usage: {error}");
-        }
     }
 
     pub fn http(&self) -> &reqwest::Client {
@@ -7506,8 +7433,6 @@ impl TurnCtx {
             durable: false,
             store_dir: None,
             usage_execution_id: "test-execution".into(),
-            native_message_models: HashMap::new(),
-            native_usage_scopes: HashSet::new(),
             delivery_state: DeliveryState::NotSent,
             attempt_count: 0,
             retry_owner: None,

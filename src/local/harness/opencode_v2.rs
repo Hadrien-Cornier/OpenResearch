@@ -463,7 +463,7 @@ fn capture(sink: &dyn UsageSink, message: &Value, child: bool, captured: &mut Ca
         "opencode",
         message.pointer("/model/id").and_then(Value::as_str),
         message.pointer("/model/providerID").and_then(Value::as_str),
-        opencode_missing(child),
+        crate::store::Missing::unidentified(child),
     );
     if let Some(sample) = executed_usage(message) {
         captured.record(sink, id, attribution.clone(), sample);
@@ -523,7 +523,7 @@ async fn observe_retry(
             "opencode",
             message.pointer("/model/id").and_then(Value::as_str),
             message.pointer("/model/providerID").and_then(Value::as_str),
-            opencode_missing(child),
+            crate::store::Missing::unidentified(child),
         );
         captured.record(
             sink,
@@ -772,13 +772,6 @@ fn error_text(error: &Value) -> String {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| error.to_string())
-}
-
-fn wire_parts(message: &Value) -> Vec<WirePart> {
-    projected_parts(message)
-        .into_iter()
-        .map(|(part, _)| part)
-        .collect()
 }
 
 fn projected_parts(message: &Value) -> Vec<(WirePart, &Value)> {
@@ -2099,12 +2092,11 @@ mod tests {
             "opencode-background:unrecoverable",
             Missing::ChildModelUnknown,
         );
-        // An unknown owner never holds open work native already finished.
-        for (sessions, unknown, marker, recorded_samples) in [
-            (vec![main(true), child.clone()], false, Some(root_lost), 3),
-            (vec![main(false), child.clone()], true, None, 2),
-            (vec![child.clone()], false, Some(root_lost), 1),
-            (vec![main(false)], false, Some(child_lost), 2),
+        for (sessions, marker, recorded_samples) in [
+            (vec![main(true), child.clone()], Some(root_lost), 3),
+            (vec![main(false), child.clone()], None, 2),
+            (vec![child.clone()], Some(root_lost), 1),
+            (vec![main(false)], Some(child_lost), 2),
         ] {
             let path =
                 std::env::temp_dir().join(format!("orx-oc-v2db-{}.db", uuid::Uuid::new_v4()));
@@ -2112,20 +2104,11 @@ mod tests {
             let recorded = super::super::tests::Recorded::default();
             let scope = json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],
                 "prompt":"msg_prompt"});
-            let owner = || async move {
-                match unknown {
-                    true => super::super::Owner::Unknown,
-                    false => super::super::Owner::Gone,
-                }
-            };
+            let owner = || async { super::super::Owner::Gone };
             super::super::settle_stored(&recorded, &scope, &path, owner).await;
             let samples = recorded.samples.into_inner().unwrap();
             if let Some((marker, reason)) = marker {
-                assert_eq!(
-                    samples[marker].0,
-                    Unresolved { reason },
-                    "{marker} {unknown}"
-                );
+                assert_eq!(samples[marker].0, Unresolved { reason }, "{marker}");
             }
             assert_eq!(samples.len(), recorded_samples, "{samples:?}");
         }
@@ -2604,9 +2587,11 @@ mod tests {
     }
     #[test]
     fn projected_parts_and_form_values_preserve_native_shapes() {
-        let parts = wire_parts(
-            &json!({"id":"msg_one","content":[{"type":"text","text":"hello"},{"type":"tool","id":"call","name":"read","state":{"status":"completed","input":{},"content":[{"type":"text","text":"file"}]}}]}),
-        );
+        let message = json!({"id":"msg_one","content":[{"type":"text","text":"hello"},{"type":"tool","id":"call","name":"read","state":{"status":"completed","input":{},"content":[{"type":"text","text":"file"}]}}]});
+        let parts: Vec<WirePart> = projected_parts(&message)
+            .into_iter()
+            .map(|(part, _)| part)
+            .collect();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].text.as_deref(), Some("hello"));
         assert_eq!(

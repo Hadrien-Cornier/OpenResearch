@@ -1655,7 +1655,6 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     // Native plan exit is an ordinary `question.asked`; connect it to the
     // preceding `plan_exit` tool through the question's `tool.callID`.
     let mut plan_exit_calls: HashSet<String> = HashSet::new();
-    let mut tree = TreeState::default();
     let mut buf = String::new();
 
     let result: Result<()> = async {
@@ -1696,7 +1695,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                         )
                         .await?
                         {
-                            handle_event(ctx, &native_id, &event, &mut assistant_msgs, &mut sub_sessions, &mut tree);
+                            handle_event(ctx, &native_id, &event, &mut assistant_msgs, &mut sub_sessions);
                         }
                     }
                 }
@@ -1739,6 +1738,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         History::Server(ctx.http(), &base),
         vec![(native_id.clone(), None)],
         (turn_started_at, None),
+        None,
     )
     .await;
     ctx.host.opencode.untrack(&ctx.session_id);
@@ -1761,13 +1761,23 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 /// which can miss the final events, after an interrupt dropped the turn, and for background
 /// subagents that outlive it. `roots` pairs each session with the `WirePart.id` of the task part
 /// that spawned it (`None` for the chat's own session, bounded to `prompt`'s run when given).
+/// A watcher passes `(woken_only, owned)`: sessions read only for the runs its `owned` subagents'
+/// results natively woke, and the subagents it awaits.
 async fn capture_v1(
     sink: &impl UsageSink,
     history: History<'_>,
     roots: Vec<(String, Option<String>)>,
     (started_at, prompt): (i64, Option<&str>),
+    watched: Option<(&HashSet<String>, &HashSet<String>)>,
 ) -> V1Capture {
-    let mut pending = roots;
+    let (woken_only, owned) = watched.unzip();
+    // Woken-only sessions go first, so they are read last: a whole read of the same session wins.
+    let mut pending: Vec<_> = woken_only
+        .into_iter()
+        .flatten()
+        .map(|session| (session.clone(), None))
+        .chain(roots)
+        .collect();
     let mut captured = V1Capture::default();
     let mut tree = TreeState::default();
     while let Some((session, spawn)) = pending.pop() {
@@ -1784,25 +1794,30 @@ async fn capture_v1(
             }
         };
         let deliveries = v1_deliveries(&messages);
+        captured.delivered.extend(deliveries.values().cloned());
+        let woken_only = spawn.is_none() && woken_only.is_some_and(|set| set.contains(&session));
         let run = prompt
             .filter(|_| spawn.is_none())
             .map(|prompt| v1_prompt_run(&messages, prompt));
         for message in v1_turn_messages(&messages, started_at) {
-            if run.as_ref().is_some_and(|run| {
-                !run.contains(
-                    message
-                        .pointer("/info/id")
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                )
-            }) {
-                continue;
-            }
             // A run a background result woke natively belongs to the execution owning that subagent.
             let woken_by = v1_woken_by(message, &deliveries);
-            if woken_by.is_some_and(|child| !captured.background.iter().any(|(bg, _)| bg == child))
-            {
-                continue;
+            match woken_by.map(|child| {
+                owned.is_some_and(|owned| owned.contains(child))
+                    || captured.background.iter().any(|(bg, _)| bg == child)
+            }) {
+                Some(false) => continue,
+                Some(true) => {}
+                None if woken_only => continue,
+                None => {
+                    let id = message.pointer("/info/id").and_then(Value::as_str);
+                    if run
+                        .as_ref()
+                        .is_some_and(|run| !run.contains(id.unwrap_or("")))
+                    {
+                        continue;
+                    }
+                }
             }
             let identity = v1_identity(&message["info"]).map(|(_, identity)| identity);
             for part in message["parts"].as_array().into_iter().flatten() {
@@ -1814,9 +1829,10 @@ async fn capture_v1(
                 let Some(id) = part.get("id").and_then(Value::as_str) else {
                     continue;
                 };
-                let wire = match &spawn {
-                    Some(spawn) => format!("{spawn}:{id}"),
-                    None => id.to_string(),
+                // No transcript holds a woken run, so its parts keep their native ids (as evidence does).
+                let wire = match (&spawn, woken_by) {
+                    (Some(spawn), None) => format!("{spawn}:{id}"),
+                    _ => id.to_string(),
                 };
                 if let Some(child) = task_session(part) {
                     if part.pointer("/state/metadata/background") == Some(&json!(true)) {
@@ -1900,6 +1916,8 @@ struct V1Capture {
     background: Vec<(String, Option<String>)>,
     /// Sessions those subagents report their results to, natively waking a run there.
     parents: HashSet<String>,
+    /// Subagents whose results reached a session read.
+    delivered: HashSet<String>,
     /// Why a session's history could not be read.
     failed: Option<crate::error::Error>,
 }
@@ -1911,34 +1929,32 @@ async fn poll_v1_background(
     sink: &impl UsageSink,
     endpoint: &AgentEndpoint,
     (started_at, prompt): (i64, Option<&str>),
-    roots: &mut Vec<(String, Option<String>)>,
+    roots: &[(String, Option<String>)],
     parents: &mut HashSet<String>,
     owned: &mut HashSet<String>,
-    delivered: &mut HashSet<String>,
 ) -> Result<(Vec<String>, bool)> {
-    let (http, base) = (&endpoint.client, endpoint.base_url.as_str());
     // Read before capturing, so a session idle here has persisted everything captured below.
-    let busy: Value = http
-        .get(format!("{base}/session/status"))
+    let busy: Value = endpoint
+        .client
+        .get(format!("{}/session/status", endpoint.base_url))
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    for parent in parents.iter() {
-        let (seen, spawned) =
-            capture_v1_continuations(sink, http, base, parent, owned, started_at).await?;
-        delivered.extend(seen);
-        for (child, part, background) in spawned {
-            if background {
-                owned.insert(child.clone());
-            }
-            if !roots.iter().any(|(root, _)| *root == child) {
-                roots.push((child, Some(part)));
-            }
-        }
-    }
-    let captured = capture_v1(sink, endpoint.into(), roots.clone(), (started_at, prompt)).await;
+    let woken_only = parents
+        .iter()
+        .filter(|parent| !roots.iter().any(|(root, _)| root == *parent))
+        .cloned()
+        .collect();
+    let captured = capture_v1(
+        sink,
+        endpoint.into(),
+        roots.to_vec(),
+        (started_at, prompt),
+        Some((&woken_only, owned)),
+    )
+    .await;
     if let Some(error) = captured.failed {
         return Err(error);
     }
@@ -1952,67 +1968,14 @@ async fn poll_v1_background(
         .filter(|session| busy.get(session.as_str()).is_some())
         .cloned()
         .collect();
-    Ok((active, owned.iter().any(|child| !delivered.contains(child))))
+    let undelivered = owned
+        .iter()
+        .any(|child| !captured.delivered.contains(child));
+    Ok((active, undelivered))
 }
 
 /// How long an idle tree waits for a finished subagent's result to reach and wake its parent.
 const DELIVERY_GRACE_POLLS: usize = 15;
-
-/// The parent runs `owned` subagents' results woke: their steps, invokers and tool evidence (no
-/// transcript holds them), the results delivered so far, and subagents those runs spawned.
-async fn capture_v1_continuations(
-    sink: &impl UsageSink,
-    http: &reqwest::Client,
-    base: &str,
-    session: &str,
-    owned: &HashSet<String>,
-    started_at: i64,
-) -> Result<(HashSet<String>, Vec<(String, String, bool)>)> {
-    let messages = tokio::time::timeout(Duration::from_secs(10), async {
-        http.get(format!("{base}/session/{session}/message"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await
-    })
-    .await??;
-    let deliveries = v1_deliveries(&messages);
-    let delivered = deliveries
-        .values()
-        .filter(|child| owned.contains(*child))
-        .cloned()
-        .collect();
-    let mut spawned = Vec::new();
-    let mut tree = TreeState::default();
-    for message in v1_turn_messages(&messages, started_at) {
-        if !v1_woken_by(message, &deliveries).is_some_and(|child| owned.contains(child)) {
-            continue;
-        }
-        let identity = v1_identity(&message["info"]).map(|(_, identity)| identity);
-        for part in message["parts"].as_array().into_iter().flatten() {
-            let Some(id) = part.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if let Some(child) = task_session(part) {
-                let background = part.pointer("/state/metadata/background") == Some(&json!(true));
-                spawned.push((child.to_string(), id.to_string(), background));
-            }
-            if let Some(wire) = to_wire_part(part).filter(|wire| wire.kind == "tool") {
-                sink.tool_evidence(&wire);
-            }
-            record_v1_part(
-                sink,
-                part,
-                identity.as_ref(),
-                Some(id.to_string()),
-                false,
-                &mut tree,
-            );
-        }
-    }
-    Ok((delivered, spawned))
-}
 
 /// Native background-result deliveries in a V1 listing: user message id → the subagent session its
 /// synthetic `<task id="…">` part reports.
@@ -2139,7 +2102,7 @@ fn v1_step_sample(
         "opencode",
         identity.map(|identity| identity.model.as_str()),
         identity.and_then(|identity| identity.provider.as_deref()),
-        opencode_missing(child),
+        crate::store::Missing::unidentified(child),
     );
     let id = part.get("id")?.as_str()?;
     let message = part.get("messageID")?.as_str()?;
@@ -2198,9 +2161,6 @@ fn task_session(part: &Value) -> Option<&str> {
 struct TreeState {
     invokers: HashSet<String>,
     steps: HashMap<String, String>,
-    /// Live background-result deliveries (user message → subagent) and the runs they woke.
-    deliveries: HashMap<String, String>,
-    woken: HashMap<String, String>,
 }
 
 /// Destination for native usage evidence: the live turn, or its execution after an interrupt
@@ -2447,8 +2407,6 @@ enum Owner {
     Live(AgentEndpoint),
     /// The original server is gone, so the database holds all it wrote.
     Gone,
-    /// A scope persisted before its owner was recorded.
-    Unknown,
 }
 
 /// After a restart: the turn's original V1 server, reconnected read-only at its persisted endpoint
@@ -2458,7 +2416,7 @@ async fn persisted_owner(scope: &Value) -> Owner {
         return Owner::Gone;
     }
     let Some(base) = scope["endpoint"].as_str() else {
-        return Owner::Unknown;
+        return Owner::Gone;
     };
     let endpoint = AgentEndpoint {
         base_url: base.to_string(),
@@ -2500,7 +2458,7 @@ async fn settle_stored<F: std::future::Future<Output = Owner>>(
             let owner = owner().await;
             let active = match &owner {
                 Owner::Live(endpoint) => Some(active_sessions(endpoint).await?),
-                Owner::Gone | Owner::Unknown => None,
+                Owner::Gone => None,
             };
             let sessions: Vec<String> = if scope["v2"] == true {
                 v2::capture_tree(
@@ -2520,6 +2478,7 @@ async fn settle_stored<F: std::future::Future<Output = Owner>>(
                     history,
                     vec![(native.to_string(), None)],
                     (started_at, Some(prompt)),
+                    None,
                 )
                 .await;
                 if let Some(error) = capture.failed {
@@ -2532,10 +2491,9 @@ async fn settle_stored<F: std::future::Future<Output = Owner>>(
                     return Ok(Stored::Running);
                 }
             }
-            // V1 never resumes, so its history matters only when its owner is unknown.
-            let v2 = scope["v2"] == true;
-            let unfinished = if v2 || matches!(owner, Owner::Unknown) {
-                unfinished_session(database, sessions, v2, (native, prompt)).await?
+            // V1 never resumes: a settled V1 database is final.
+            let unfinished = if scope["v2"] == true {
+                unfinished_session(database, sessions, native).await?
             } else {
                 None
             };
@@ -2564,76 +2522,23 @@ async fn settle_stored<F: std::future::Future<Output = Owner>>(
     }
 }
 
-/// The first of `sessions` (the root first) whose native work is unfinished: a V2 execution claim,
-/// or V1 history whose run has not ended.
+/// The first of `sessions` (the root first) holding an unfinished V2 execution claim.
 async fn unfinished_session(
     database: &std::path::Path,
     mut sessions: Vec<String>,
-    v2: bool,
-    (native, prompt): (&str, &str),
+    native: &str,
 ) -> Result<Option<String>> {
     sessions.sort_by_key(|session| session != native);
-    let (path, native, prompt) = (
-        database.to_path_buf(),
-        native.to_string(),
-        prompt.to_string(),
-    );
+    let path = database.to_path_buf();
     tokio::task::spawn_blocking(move || {
         for session in sessions {
-            let unfinished = if v2 {
-                native_store::opencode_database::v2_unfinished(&path, &session)?
-            } else {
-                let messages = native_store::opencode_database::v1_history(&path, &session)?
-                    .ok_or_else(|| SessionGone(session.clone()))?;
-                !v1_finished(&messages, (session == native).then_some(prompt.as_str()))
-            };
-            if unfinished {
+            if native_store::opencode_database::v2_unfinished(&path, &session)? {
                 return Ok(Some(session));
             }
         }
         Ok(None)
     })
     .await?
-}
-
-/// Native V1's loop exit: the run's last message is an assistant step that errored, or finished
-/// without asking for another tool round. A root run ends at orx's next prompt.
-fn v1_finished(messages: &Value, prompt: Option<&str>) -> bool {
-    let all: Vec<&Value> = messages.as_array().into_iter().flatten().collect();
-    fn id(message: &Value) -> Option<&str> {
-        message.pointer("/info/id").and_then(Value::as_str)
-    }
-    let run = match prompt {
-        Some(prompt) => match all.iter().position(|message| id(message) == Some(prompt)) {
-            None => return true,
-            Some(at)
-                if all[at + 1..]
-                    .iter()
-                    .any(|m| id(m).is_some_and(|id| id.contains("-orx"))) =>
-            {
-                return true
-            }
-            Some(at) => &all[at + 1..],
-        },
-        None => &all[..],
-    };
-    run.last().is_some_and(|message| {
-        let info = &message["info"];
-        let tools = message["parts"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|part| {
-                part["type"] == "tool"
-                    && part.pointer("/metadata/providerExecuted") != Some(&json!(true))
-            });
-        info["role"] == "assistant"
-            && (info.get("error").is_some_and(|error| !error.is_null())
-                || info["finish"]
-                    .as_str()
-                    .is_some_and(|finish| !matches!(finish, "tool-calls" | "unknown"))
-                    && !tools)
-    })
 }
 
 /// Sessions the server is running now.
@@ -2727,7 +2632,7 @@ fn record_unrecoverable(sink: &impl UsageSink, why: &crate::error::Error, child:
             "opencode-root:unrecoverable"
         },
         crate::store::Attribution::Unresolved {
-            reason: opencode_missing(child),
+            reason: crate::store::Missing::unidentified(child),
         },
         crate::store::TokenUsage::default(),
         false,
@@ -2749,7 +2654,6 @@ enum WatchTree {
         /// Sessions the subagents report their results to.
         parents: HashSet<String>,
         owned: HashSet<String>,
-        delivered: HashSet<String>,
     },
     V2 {
         roots: Vec<(String, String)>,
@@ -2802,7 +2706,6 @@ impl Watch {
                     .map(str::to_string)
                     .collect(),
                 roots,
-                delivered: HashSet::new(),
             }
         };
         Ok(Self {
@@ -2824,7 +2727,6 @@ impl Watch {
                 prompt,
                 parents,
                 owned,
-                delivered,
             } => {
                 poll_v1_background(
                     sink,
@@ -2833,7 +2735,6 @@ impl Watch {
                     roots,
                     parents,
                     owned,
-                    delivered,
                 )
                 .await
             }
@@ -3014,6 +2915,7 @@ pub(crate) async fn capture_interrupted(
             endpoint.into(),
             vec![(turn.native_id.clone(), None)],
             (turn.started_at, None),
+            None,
         )
         .await
         .failed
@@ -3055,15 +2957,6 @@ fn hold_for_retry(store: &crate::store::Store, execution: &str) -> Result<Option
         .into_iter()
         .find_map(|(id, _, scope, _)| (id == execution).then_some(scope));
     Ok(scope.filter(|_| store.hold_usage_execution(execution).unwrap_or(false)))
-}
-
-/// An unidentified sub-agent never inherits its parent's model.
-fn opencode_missing(child: bool) -> crate::store::Missing {
-    if child {
-        crate::store::Missing::ChildModelUnknown
-    } else {
-        crate::store::Missing::IdentityNotReported
-    }
 }
 
 /// Native `tokens` as a sample that is complete when it measures the request's input and output.
@@ -3149,7 +3042,6 @@ fn handle_event(
     event: &Value,
     assistant_msgs: &mut HashSet<String>,
     sub_sessions: &mut HashMap<String, String>,
-    tree: &mut TreeState,
 ) {
     let props = event.get("properties").unwrap_or(&Value::Null);
     match event.get("type").and_then(Value::as_str) {
@@ -3194,17 +3086,6 @@ fn handle_event(
         // events stream into that row's `children`.
         Some("session.created") => {
             let info = props.get("info").unwrap_or(&Value::Null);
-            if info
-                .get("parentID")
-                .and_then(Value::as_str)
-                .is_some_and(|parent| {
-                    parent == native_id || ctx.native_usage_scopes.contains(parent)
-                })
-            {
-                if let Some(child) = info.get("id").and_then(Value::as_str) {
-                    ctx.native_usage_scopes.insert(child.to_string());
-                }
-            }
             if info.get("parentID").and_then(Value::as_str) == Some(native_id) {
                 if let Some(child_id) = info.get("id").and_then(Value::as_str) {
                     if let Some(spawn) = newest_task_part_id(&ctx.assistant.parts, sub_sessions) {
@@ -3233,23 +3114,7 @@ fn handle_event(
                     assistant_msgs.insert(id.to_string());
                 }
             }
-            if session == Some(native_id) {
-                if let (Some(id), Some(child)) = (
-                    info.get("id").and_then(Value::as_str),
-                    info.get("parentID")
-                        .and_then(Value::as_str)
-                        .and_then(|parent| tree.deliveries.get(parent)),
-                ) {
-                    tree.woken.insert(id.to_string(), child.clone());
-                }
-            }
-            let accountable = session == Some(native_id)
-                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session));
-            if accountable && info.get("role").and_then(Value::as_str) == Some("assistant") {
-                if let Some((id, identity)) = v1_identity(info) {
-                    ctx.native_message_models.insert(id, identity);
-                }
-            }
+            // Usage is recorded from native history once the turn ends (`capture_v1`).
             // Only the MAIN session's tokens drive the context meter; a
             // sub-agent's smaller counts must not overwrite it.
             if session == Some(native_id) && is_assistant {
@@ -3272,39 +3137,12 @@ fn handle_event(
                 .get("messageID")
                 .and_then(Value::as_str)
                 .is_some_and(|mid| assistant_msgs.contains(mid));
-            if session == Some(native_id)
-                || session.is_some_and(|session| ctx.native_usage_scopes.contains(session))
-            {
-                let tool_part = v1_tool_part_id(part, native_id, sub_sessions);
-                if let Some(child) = task_session(part) {
-                    ctx.native_usage_scopes.insert(child.to_string());
-                    // A grandchild nests under its parent's task row.
-                    if let Some(spawn) = &tool_part {
-                        sub_sessions
-                            .entry(child.to_string())
-                            .or_insert_with(|| spawn.clone());
-                    }
-                }
-                let message = part.get("messageID").and_then(Value::as_str);
-                if let (Some(message), Some(child)) = (message, v1_delivered_child(part)) {
-                    tree.deliveries
-                        .insert(message.to_string(), child.to_string());
-                }
-                // Another execution's subagent result woke this run; that execution accounts it.
-                let foreign = message
-                    .and_then(|message| tree.woken.get(message))
-                    .is_some_and(|child| !ctx.native_usage_scopes.contains(child));
-                let identity = message.and_then(|id| ctx.native_message_models.get(id));
-                if !foreign {
-                    record_v1_part(
-                        &*ctx,
-                        part,
-                        identity,
-                        tool_part,
-                        session != Some(native_id),
-                        tree,
-                    );
-                }
+            // A grandchild nests under its parent's task row.
+            if let (Some(child), Some(spawn)) = (
+                task_session(part),
+                v1_tool_part_id(part, native_id, sub_sessions),
+            ) {
+                sub_sessions.entry(child.to_string()).or_insert(spawn);
             }
             // A sub-agent's part (foreign sessionID we've registered) streams
             // into its owning `task` row's children, with a namespaced id — but
@@ -3598,7 +3436,6 @@ opencode/unknown
             &json!({"type":"message.part.updated","properties":{"part":{"id":"finish","messageID":"message","sessionID":"session","type":"step-finish","reason":"stop"}}}),
             &mut messages,
             &mut HashMap::new(),
-            &mut TreeState::default(),
         );
         assert_eq!(
             ctx.assistant.parts[0].phase,
@@ -3933,14 +3770,7 @@ opencode/unknown
                 "tokens": { "input": 1200, "output": 340, "reasoning": 50, "cache": { "read": 8000, "write": 200 } }
             }}
         });
-        handle_event(
-            &mut ctx,
-            "ses_x",
-            &event,
-            &mut msgs,
-            &mut HashMap::new(),
-            &mut TreeState::default(),
-        );
+        handle_event(&mut ctx, "ses_x", &event, &mut msgs, &mut HashMap::new());
         let usage = ctx.context_usage.expect("usage reported");
         assert_eq!(usage.used_tokens, 1200 + 340 + 50 + 8000 + 200);
         assert_eq!(usage.context_window, None);
@@ -3961,7 +3791,6 @@ opencode/unknown
             &no_tokens,
             &mut msgs,
             &mut HashMap::new(),
-            &mut TreeState::default(),
         );
         assert!(ctx.context_usage.is_none());
         // All-zero placeholder tokens must also be ignored.
@@ -3976,7 +3805,6 @@ opencode/unknown
             &zero_tokens,
             &mut msgs,
             &mut HashMap::new(),
-            &mut TreeState::default(),
         );
         assert!(ctx.context_usage.is_none());
     }
@@ -3994,14 +3822,7 @@ opencode/unknown
             json!({"type":"message.updated","properties":{"info":{"id":"answer","sessionID":"ses_x","role":"assistant"}}}),
             json!({"type":"message.part.updated","properties":{"part":{"id":"answer_text","messageID":"answer","sessionID":"ses_x","type":"text","text":"Run finished"}}}),
         ] {
-            handle_event(
-                &mut ctx,
-                "ses_x",
-                &event,
-                &mut messages,
-                &mut sessions,
-                &mut TreeState::default(),
-            );
+            handle_event(&mut ctx, "ses_x", &event, &mut messages, &mut sessions);
         }
         assert_eq!(ctx.delivery_state(), DeliveryState::Accepted);
         assert_eq!(ctx.assistant.parts.len(), 1);
@@ -4081,7 +3902,6 @@ opencode/unknown
             &json!({"type":"session.status","properties":{"sessionID":"ses_x","status":{"type":"idle"}}}),
             &mut messages,
             &mut sessions,
-            &mut TreeState::default(),
         );
         assert_eq!(ctx.delivery_state(), DeliveryState::Unknown);
         handle_event(
@@ -4090,7 +3910,6 @@ opencode/unknown
             &json!({"type":"session.status","properties":{"sessionID":"ses_x","status":{"type":"retry","attempt":1}}}),
             &mut messages,
             &mut sessions,
-            &mut TreeState::default(),
         );
         assert_eq!(ctx.delivery_state(), DeliveryState::Accepted);
     }
@@ -4110,7 +3929,6 @@ opencode/unknown
             &json!({"type":"message.updated","properties":{"info":{"id":"msg_1","sessionID":"ses_main","role":"assistant"}}}),
             &mut msgs,
             &mut subs,
-            &mut TreeState::default(),
         );
         handle_event(
             &mut ctx,
@@ -4120,7 +3938,6 @@ opencode/unknown
                 "state":{"status":"running","input":{"description":"analyze"}}}}}),
             &mut msgs,
             &mut subs,
-            &mut TreeState::default(),
         );
         // opencode announces the spawned child session (parentID = our session).
         handle_event(
@@ -4129,7 +3946,6 @@ opencode/unknown
             &json!({"type":"session.created","properties":{"info":{"id":"ses_child","parentID":"ses_main"}}}),
             &mut msgs,
             &mut subs,
-            &mut TreeState::default(),
         );
         assert_eq!(subs.get("ses_child").map(String::as_str), Some("prt_task"));
         handle_event(
@@ -4138,7 +3954,6 @@ opencode/unknown
             &json!({"type":"session.created","properties":{"info":{"id":"ses_grandchild","parentID":"ses_child"}}}),
             &mut msgs,
             &mut subs,
-            &mut TreeState::default(),
         );
         handle_event(
             &mut ctx,
@@ -4146,12 +3961,6 @@ opencode/unknown
             &json!({"type":"message.updated","properties":{"info":{"id":"msg_grandchild","sessionID":"ses_grandchild","role":"assistant","modelID":"child-model","providerID":"fixture"}}}),
             &mut msgs,
             &mut subs,
-            &mut TreeState::default(),
-        );
-        assert!(ctx.native_usage_scopes.contains("ses_grandchild"));
-        assert_eq!(
-            ctx.native_message_models["msg_grandchild"].model,
-            "child-model"
         );
         // The child session's assistant message + a tool part → nests under task.
         handle_event(
@@ -4160,7 +3969,6 @@ opencode/unknown
             &json!({"type":"message.updated","properties":{"info":{"id":"msg_c","sessionID":"ses_child","role":"assistant"}}}),
             &mut msgs,
             &mut subs,
-            &mut TreeState::default(),
         );
         handle_event(
             &mut ctx,
@@ -4170,7 +3978,6 @@ opencode/unknown
                 "state":{"status":"completed","input":{"command":"ls"},"output":"a.rs"}}}}),
             &mut msgs,
             &mut subs,
-            &mut TreeState::default(),
         );
         // Only the task row is top-level; the sub bash nested under it (namespaced).
         assert_eq!(ctx.assistant.parts.len(), 1, "{:?}", ctx.assistant.parts);
@@ -4396,16 +4203,15 @@ opencode/unknown
         assert!(calls.load(Ordering::SeqCst) > late);
     }
 
-    /// Without a live original server nothing waits on other database holders: a gone server leaves
-    /// a final snapshot, and a scope with no recorded owner marks its unfinished run explicitly.
+    /// Without a live original server nothing waits on other database holders: a gone server (or a
+    /// scope with no recorded owner) leaves a final snapshot.
     #[tokio::test]
     async fn v1_recovery_never_waits_without_a_live_original_server() {
-        use crate::store::{Attribution::Unresolved, Missing};
         const PROMPT: &str = "msg_0f4a81d5e000-orxabcdefghij";
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let gone = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        for (endpoint, marked) in [(Some(gone), false), (None, true)] {
+        for endpoint in [Some(gone), None] {
             let path = v1_unfinished_run(PROMPT);
             // Another holder keeps the database open throughout.
             let _holder = rusqlite::Connection::open(&path).unwrap();
@@ -4420,13 +4226,10 @@ opencode/unknown
             .expect("no live owner, no wait");
             let samples = recorded.samples.into_inner().unwrap();
             assert!(samples.contains_key("msg_a_1"));
-            let marker = samples
-                .get("opencode-root:unrecoverable")
-                .map(|sample| &sample.0);
-            let unavailable = Unresolved {
-                reason: Missing::IdentityNotReported,
-            };
-            assert_eq!(marker, marked.then_some(&unavailable), "{scope}");
+            assert!(
+                !samples.contains_key("opencode-root:unrecoverable"),
+                "{scope}"
+            );
         }
     }
 
@@ -4721,6 +4524,7 @@ opencode/unknown
             History::Server(&http, &base),
             vec![("ses_main".to_string(), None)],
             (150, None),
+            None,
         )
         .await;
         server.abort();
@@ -4741,39 +4545,41 @@ opencode/unknown
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         let mut ctx = TurnCtx::test_stub();
-        let (mut messages, mut subs, mut tree) =
-            (HashSet::new(), HashMap::new(), TreeState::default());
+        let (mut messages, mut subs) = (HashSet::new(), HashMap::new());
         for event in &events {
-            handle_event(&mut ctx, MAIN, event, &mut messages, &mut subs, &mut tree);
+            handle_event(&mut ctx, MAIN, event, &mut messages, &mut subs);
         }
         assert_eq!(subs.get(CHILD).map(String::as_str), Some(TASK));
-        assert!(ctx.native_usage_scopes.contains(CHILD));
-        assert_eq!(
-            tree.invokers,
-            HashSet::from([
-                "prt_0f3cf7e3f001MTz4d5J06KbOBZ".to_string(),
-                TASK.to_string(),
-                format!("{TASK}:prt_0f3cf9941001wZ3V6C7leaXefR"),
-            ])
-        );
+        // Each part's message model, as native history reports it.
+        let models: HashMap<String, crate::store::InvocationIdentity> = events
+            .iter()
+            .filter(|event| event["type"] == "message.updated")
+            .filter_map(|event| v1_identity(&event["properties"]["info"]))
+            .collect();
         let recorded = Recorded::default();
         let mut replay = TreeState::default();
         for part in events
             .iter()
             .filter_map(|event| event.pointer("/properties/part"))
         {
-            let identity = part["messageID"]
-                .as_str()
-                .and_then(|id| ctx.native_message_models.get(id));
+            let identity = part["messageID"].as_str().and_then(|id| models.get(id));
             record_v1_part(
                 &recorded,
                 part,
                 identity,
-                None,
+                v1_tool_part_id(part, MAIN, &subs),
                 part["sessionID"] != MAIN,
                 &mut replay,
             );
         }
+        assert_eq!(
+            replay.invokers,
+            HashSet::from([
+                "prt_0f3cf7e3f001MTz4d5J06KbOBZ".to_string(),
+                TASK.to_string(),
+                format!("{TASK}:prt_0f3cf9941001wZ3V6C7leaXefR"),
+            ])
+        );
         // Five steps (three parent, two child): identity and tokens share one sample each.
         let samples = recorded.samples.into_inner().unwrap();
         assert_eq!(samples.len(), 5);
@@ -4862,6 +4668,7 @@ opencode/unknown
             History::Server(&reqwest::Client::new(), &base),
             vec![(MAIN.to_string(), None)],
             (started_at, None),
+            None,
         )
         .await;
         server.abort();
@@ -4932,6 +4739,7 @@ opencode/unknown
             History::Server(&reqwest::Client::new(), &base),
             vec![(main, None)],
             (started_at, None),
+            None,
         )
         .await;
         server.abort();
@@ -5001,6 +4809,7 @@ opencode/unknown
             History::Server(&reqwest::Client::new(), &base),
             vec![(main, None)],
             (started_at, None),
+            None,
         )
         .await;
         server.abort();
@@ -5163,6 +4972,7 @@ opencode/unknown
             History::Server(&http, &base),
             vec![("ses_main".into(), None)],
             (10, None),
+            None,
         )
         .await;
         assert_eq!(turn_a.parents, HashSet::from(["ses_child".to_string()]));
@@ -5174,6 +4984,7 @@ opencode/unknown
             History::Server(&http, &base),
             vec![("ses_main".into(), None)],
             (20, None),
+            None,
         )
         .await;
         let later = later.samples.into_inner().unwrap();

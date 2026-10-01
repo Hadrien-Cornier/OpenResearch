@@ -1947,11 +1947,7 @@ fn message_sample(
     if model.is_none() && usage.is_none() {
         return None;
     }
-    let missing = if parent.is_some() {
-        crate::store::Missing::ChildModelUnknown
-    } else {
-        crate::store::Missing::IdentityNotReported
-    };
+    let missing = crate::store::Missing::unidentified(parent.is_some());
     let usage = usage.map_or_else(Default::default, |usage| {
         let field = |key| usage.get(key).and_then(Value::as_u64);
         crate::store::TokenUsage {

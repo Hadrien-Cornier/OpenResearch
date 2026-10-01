@@ -1026,20 +1026,12 @@ impl Ledger<'_> {
             .native_invocation_identity("antigravity", &key)
             .ok()
             .flatten();
-        let attribution = match &identity {
-            Some(identity) => crate::store::Attribution::native(
-                "antigravity",
-                Some(&identity.model),
-                None,
-                crate::store::Missing::IdentityNotReported,
-            ),
-            None if child => crate::store::Attribution::Unresolved {
-                reason: crate::store::Missing::ChildModelUnknown,
-            },
-            None => crate::store::Attribution::Unresolved {
-                reason: crate::store::Missing::IdentityNotReported,
-            },
-        };
+        let attribution = crate::store::Attribution::native(
+            "antigravity",
+            identity.as_ref().map(|identity| identity.model.as_str()),
+            None,
+            crate::store::Missing::unidentified(child),
+        );
         self.sample(&key, &attribution);
         identity
     }

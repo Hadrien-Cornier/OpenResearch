@@ -69,6 +69,17 @@ pub(crate) enum Missing {
     ExternalAgent,
 }
 
+impl Missing {
+    /// An unidentified sub-agent never inherits its parent's model.
+    pub(crate) fn unidentified(child: bool) -> Self {
+        if child {
+            Self::ChildModelUnknown
+        } else {
+            Self::IdentityNotReported
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "attribution", rename_all = "snake_case")]
 pub(crate) enum Attribution {
@@ -165,6 +176,14 @@ struct LaunchCandidate {
     printed_run: bool,
 }
 
+fn normalized_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
 /// Tool parts that may have launched `run_id`. Nested parts belong to sub-agents.
 fn run_launch_candidates(
     parts: &[serde_json::Value],
@@ -184,11 +203,7 @@ fn run_launch_candidates(
         ) else {
             continue;
         };
-        let command = crate::local::chat::tool_command(input)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_ascii_lowercase();
+        let command = normalized_command(crate::local::chat::tool_command(input));
         let launches = command.contains("orx exp run");
         let hinted = if hint.is_empty() {
             launches
@@ -231,14 +246,11 @@ struct CumulativeBaseline {
 impl TokenUsage {
     pub fn validate(&self) -> Result<()> {
         const MAX: u64 = 9_007_199_254_740_991;
-        let counters = [
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_tokens,
-            self.cache_write_tokens,
-            self.reasoning_tokens,
-        ];
-        if counters.into_iter().flatten().any(|value| value > MAX)
+        if self
+            .counters()
+            .into_iter()
+            .flatten()
+            .any(|value| value > MAX)
             || self.total().is_some_and(|total| total > MAX)
             || self.input_tokens.is_some_and(|input| {
                 self.cache_read_tokens.unwrap_or(0) + self.cache_write_tokens.unwrap_or(0) > input
@@ -254,6 +266,16 @@ impl TokenUsage {
 
     pub fn total(&self) -> Option<u64> {
         self.input_tokens?.checked_add(self.output_tokens?)
+    }
+
+    fn counters(&self) -> [Option<u64>; 5] {
+        [
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+            self.reasoning_tokens,
+        ]
     }
 }
 
@@ -471,12 +493,7 @@ impl Store {
                 parts.push(serde_json::from_str(&json)?);
             }
         }
-        let hint = link
-            .command
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_ascii_lowercase();
+        let hint = normalized_command(&link.command);
         let mut candidates = Vec::new();
         run_launch_candidates(
             &parts,
@@ -889,14 +906,7 @@ impl Store {
                 ),
             };
             let usage: TokenUsage = serde_json::from_str(&json)?;
-            let measured = [
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_read_tokens,
-                usage.cache_write_tokens,
-                usage.reasoning_tokens,
-            ]
-            .map(|counter| counter.is_some());
+            let measured = usage.counters().map(|counter| counter.is_some());
             rows.push((
                 sample_id,
                 (attribution, model, provider, measured),
@@ -944,17 +954,9 @@ impl Store {
                 reason: Missing::SyntheticModel,
             }) => {
                 only_group
-                    || samples.iter().any(|(usage, _)| {
-                        [
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.cache_read_tokens,
-                            usage.cache_write_tokens,
-                            usage.reasoning_tokens,
-                        ]
+                    || samples
                         .iter()
-                        .any(|counter| counter.unwrap_or(0) > 0)
-                    })
+                        .any(|(usage, _)| usage.counters().iter().any(|n| n.unwrap_or(0) > 0))
             }
             _ => true,
         });
@@ -1008,26 +1010,18 @@ impl Store {
             };
             properties["totalTokens"] = serde_json::json!(usage.total());
             properties["outcome"] = serde_json::json!(outcome);
-            properties["coverage"] = serde_json::json!(if [
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_read_tokens,
-                usage.cache_write_tokens,
-                usage.reasoning_tokens
-            ]
-            .iter()
-            .all(Option::is_none)
-            {
-                "missing"
-            } else if identity_complete
-                && samples.iter().all(|(usage, complete)| *complete
-                    && usage.input_tokens.is_some()
-                    && usage.output_tokens.is_some())
-            {
-                "complete"
-            } else {
-                "partial"
-            });
+            properties["coverage"] =
+                serde_json::json!(if usage.counters().iter().all(Option::is_none) {
+                    "missing"
+                } else if identity_complete
+                    && samples.iter().all(|(usage, complete)| *complete
+                        && usage.input_tokens.is_some()
+                        && usage.output_tokens.is_some())
+                {
+                    "complete"
+                } else {
+                    "partial"
+                });
             reports.push(properties);
         }
         Ok(reports)

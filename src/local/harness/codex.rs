@@ -177,24 +177,14 @@ impl NativeRecord {
     }
 
     fn apply(self, ctx: &TurnCtx) {
-        match self {
-            Self::Identity(sample_id, attribution) => ctx.record_attributed_usage(
-                &sample_id,
-                attribution,
-                crate::store::TokenUsage::default(),
-                false,
-            ),
-            Self::Cumulative {
-                thread,
-                turn,
-                attribution,
-                total,
-                last,
-            } => ctx.record_attributed_cumulative_usage(&thread, &turn, attribution, total, last),
-            Self::Request(sample_id, attribution, usage) => {
-                ctx.record_attributed_usage(&sample_id, attribution, usage, true)
-            }
-            Self::Invoker(part_id, model) => ctx.record_tool_invoker(&part_id, &model, None),
+        let Some(execution) = ctx.usage_execution_id() else {
+            return;
+        };
+        if let Err(error) = ctx
+            .capture_store()
+            .and_then(|store| self.record(&store, execution, &ctx.session_id))
+        {
+            eprintln!("orx up: could not persist codex usage: {error}");
         }
     }
 }
@@ -492,11 +482,7 @@ impl NativeTurnModels {
             }
             _ => return records,
         };
-        let missing = if sub_agent {
-            crate::store::Missing::ChildModelUnknown
-        } else {
-            crate::store::Missing::IdentityNotReported
-        };
+        let missing = crate::store::Missing::unidentified(sub_agent);
         let attribution =
             crate::store::Attribution::native("codex", model.as_deref(), None, missing);
         // One marker per model that produced output in the turn, so a rerouted-away model stays.
@@ -2124,13 +2110,7 @@ pub(crate) async fn flush_late_usage(client: &CodexClient, retiring: bool) -> bo
     let mut models = client.native.lock().await;
     let late = models.drain_late().await;
     record_late(&models.session, late);
-    for execution in models.releasable(retiring) {
-        if let Err(error) =
-            Store::open().and_then(|store| store.release_usage_execution(&execution))
-        {
-            eprintln!("orx up: could not close held codex usage: {error}");
-        }
-    }
+    release_held(&mut models, retiring);
     models.watching = !models.held.is_empty();
     models.watching
 }
@@ -2167,14 +2147,18 @@ async fn settle_turn_usage(
     }
     record_late(&models.session, std::mem::take(&mut models.foreign));
     models.hold_live(ctx, &live);
-    for execution in models.releasable(false) {
+    release_held(models, false);
+    watch_late_usage(client, models);
+}
+
+fn release_held(models: &mut NativeTurnModels, all: bool) {
+    for execution in models.releasable(all) {
         if let Err(error) =
             Store::open().and_then(|store| store.release_usage_execution(&execution))
         {
             eprintln!("orx up: could not close held codex usage: {error}");
         }
     }
-    watch_late_usage(client, models);
 }
 
 /// A turn's own requests from its thread rollout after the last total already recorded: the
@@ -2190,37 +2174,23 @@ fn record_turn_rollout(
         .cumulative_usage_total(execution, thread)?
         .and_then(|usage| usage.total())
         .unwrap_or(0);
-    let (mut in_turn, mut model) = (false, None);
-    for record in read_rollout(path, &mut 0) {
-        match record {
-            RolloutRecord::Context {
-                turn: context,
-                model: context_model,
-            } => {
-                in_turn = context.as_deref() == Some(turn);
-                if in_turn {
-                    model = context_model;
-                }
-            }
-            RolloutRecord::Tokens { total, last }
-                if in_turn && total.total().is_some_and(|total| total > seen) =>
-            {
-                store.record_cumulative_usage(
-                    execution,
-                    "codex",
-                    thread,
-                    turn,
-                    &crate::store::Attribution::native(
-                        "codex",
-                        model.as_deref(),
-                        None,
-                        crate::store::Missing::IdentityNotReported,
-                    ),
-                    &total,
-                    &last,
-                )?;
-            }
-            _ => {}
+    for (context, model, total, last) in rollout_requests(path) {
+        if context == turn && total.total().is_some_and(|total| total > seen) {
+            let attribution = crate::store::Attribution::native(
+                "codex",
+                model.as_deref(),
+                None,
+                crate::store::Missing::IdentityNotReported,
+            );
+            store.record_cumulative_usage(
+                execution,
+                "codex",
+                thread,
+                turn,
+                &attribution,
+                &total,
+                &last,
+            )?;
         }
     }
     Ok(())
@@ -2235,43 +2205,53 @@ fn record_child_rollout(
     start: u64,
     end: Option<u64>,
 ) -> Result<()> {
+    for (turn, model, totals, last) in rollout_requests(path) {
+        let Some(total) = totals.total() else {
+            continue;
+        };
+        if total > start && end.is_none_or(|end| total <= end) {
+            store.record_attributed_sample(
+                execution,
+                &format!("{thread}:{turn}:request:{total}"),
+                "codex",
+                &crate::store::Attribution::native(
+                    "codex",
+                    model.as_deref(),
+                    None,
+                    crate::store::Missing::ChildModelUnknown,
+                ),
+                &last,
+                true,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Each request in a whole rollout, with the turn and model of the `turn_context` before it.
+fn rollout_requests(
+    path: &Path,
+) -> Vec<(
+    String,
+    Option<String>,
+    crate::store::TokenUsage,
+    crate::store::TokenUsage,
+)> {
     let (mut turn, mut model) = (String::new(), None);
+    let mut requests = Vec::new();
     for record in read_rollout(path, &mut 0) {
         match record {
             RolloutRecord::Context {
                 turn: context,
                 model: context_model,
-            } => {
-                turn = context.unwrap_or_default();
-                model = context_model;
-            }
-            RolloutRecord::Tokens {
-                total: totals,
-                last,
-            } => {
-                let Some(total) = totals.total() else {
-                    continue;
-                };
-                if total > start && end.is_none_or(|end| total <= end) {
-                    store.record_attributed_sample(
-                        execution,
-                        &format!("{thread}:{turn}:request:{total}"),
-                        "codex",
-                        &crate::store::Attribution::native(
-                            "codex",
-                            model.as_deref(),
-                            None,
-                            crate::store::Missing::ChildModelUnknown,
-                        ),
-                        &last,
-                        true,
-                    )?;
-                }
+            } => (turn, model) = (context.unwrap_or_default(), context_model),
+            RolloutRecord::Tokens { total, last } => {
+                requests.push((turn.clone(), model.clone(), total, last))
             }
             RolloutRecord::Task { .. } => {}
         }
     }
-    Ok(())
+    requests
 }
 
 /// At startup, before recovery closes them: finish reading the rollouts of executions a dead
@@ -2343,21 +2323,15 @@ pub(crate) async fn record_interrupted_invokers(
     items: &[Value],
 ) {
     let mut models = client.native.lock().await;
-    for record in recovered_item_records(&mut models, thread_id, turn_id, items).await {
-        let NativeRecord::Invoker(part_id, model) = record else {
-            continue;
-        };
-        let identity = crate::store::InvocationIdentity {
-            harness: "codex".into(),
-            model,
-            provider: None,
-        };
-        if let Err(error) = Store::open()
-            .and_then(|store| store.record_native_invocation(&part_id, &identity, Some(session_id)))
-        {
-            eprintln!("orx up: could not capture native tool identity: {error}");
-        }
-    }
+    let invokers = recovered_item_records(&mut models, thread_id, turn_id, items)
+        .await
+        .into_iter()
+        .filter(|record| matches!(record, NativeRecord::Invoker(..)));
+    // Invokers key on the session; no execution is involved.
+    record_late(
+        session_id,
+        invokers.map(|record| (String::new(), record)).collect(),
+    );
 }
 
 pub(crate) fn reconcile_interrupted_items(
