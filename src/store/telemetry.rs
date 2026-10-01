@@ -237,6 +237,8 @@ impl Store {
                 serde_json::to_string(total)?
             );
             self.record_usage_sample(execution_id, &sample_id, harness, model, None, &delta)?;
+            // A delta of two native totals covers its requests whole when both counters are known.
+            tx.execute("UPDATE chat_usage_samples SET complete = ?3 WHERE execution_id = ?1 AND sample_id = ?2", params![execution_id, sample_id, delta.input_tokens.is_some() && delta.output_tokens.is_some()])?;
         }
         let baseline = CumulativeBaseline {
             usage: total.clone(),
@@ -391,6 +393,9 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for (execution_id, harness, report_id, suppressed) in rows {
+            // One write lock from reading samples to closing, so a hook's concurrent sample is
+            // either in this report or rejected as late.
+            let tx = self.begin_immediate()?;
             let mut samples = self.conn.prepare("SELECT s.model, s.provider, s.usage_json, s.complete, n.identity_json FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 ORDER BY s.sample_id")?;
             let mut grouped = std::collections::BTreeMap::<
                 (Option<String>, Option<String>, [bool; 5]),
@@ -516,25 +521,26 @@ impl Store {
                     }
                 }
             }
+            drop(samples);
             self.finalize_usage_execution(&execution_id, outcome, reports)?;
+            tx.commit()?;
         }
         Ok(())
     }
 
+    /// Callers hold a write transaction.
     fn finalize_usage_execution(
         &self,
         execution_id: &str,
         outcome: &str,
         reports: Vec<(String, serde_json::Value)>,
     ) -> Result<()> {
-        let tx = self.begin_immediate()?;
-        let suppressed: Option<bool> = tx.query_row("UPDATE chat_usage_executions SET outcome = ?2 WHERE execution_id = ?1 AND outcome IS NULL RETURNING suppressed", params![execution_id, outcome], |row| row.get(0)).optional()?;
+        let suppressed: Option<bool> = self.conn.query_row("UPDATE chat_usage_executions SET outcome = ?2 WHERE execution_id = ?1 AND outcome IS NULL RETURNING suppressed", params![execution_id, outcome], |row| row.get(0)).optional()?;
         if suppressed == Some(false) {
             for (id, payload) in reports {
                 self.stage_telemetry(&id, &payload)?;
             }
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -1316,6 +1322,27 @@ mod tests {
             serde_json::from_str::<TokenUsage>(&usage).unwrap(),
             measured
         );
+        // A native cumulative delta with both counters covers its requests whole.
+        store
+            .record_cumulative_usage(
+                "e",
+                "codex",
+                "th",
+                "tu",
+                Some("gpt-6-sol"),
+                &measured,
+                &measured,
+            )
+            .unwrap();
+        let complete: bool = store
+            .conn
+            .query_row(
+                "SELECT complete FROM chat_usage_samples WHERE sample_id LIKE 'th:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(complete);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

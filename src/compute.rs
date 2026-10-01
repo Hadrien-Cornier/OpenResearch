@@ -1014,7 +1014,7 @@ fn not_ready(detail: impl Into<String>) -> Preflight {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1085,7 +1085,7 @@ mod tests {
         }
     }
 
-    fn tinker_args() -> crate::ExpRunArgs {
+    pub(crate) fn tinker_args() -> crate::ExpRunArgs {
         crate::ExpRunArgs {
             exp_id: "exp".into(),
             disk: None,
@@ -1103,6 +1103,7 @@ mod tests {
             chat_session_id: None,
             invocation_context: None,
             agent_origin: None,
+            forwarded: false,
             telemetry_suppressed: false,
         }
     }

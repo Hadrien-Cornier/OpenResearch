@@ -2252,6 +2252,7 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
         force: req.force,
         chat_session_id: req.chat_session_id,
         agent_origin: req.agent_origin,
+        forwarded: true,
     };
     crate::compute::validate_run_args(&args).map_err(bad_request)?;
     let run = crate::compute::submit(&args).await.map_err(bad_request)?;

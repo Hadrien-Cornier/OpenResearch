@@ -8913,6 +8913,30 @@ mod session_env_tests {
         assert!(in_local_session());
     }
 
+    /// `orx up` handling a caller's run reads launch evidence only from the request, never from
+    /// its own environment.
+    #[test]
+    fn forwarded_runs_ignore_the_servers_launch_environment() {
+        let _guard = EnvGuard::new(&[CHAT_SESSION_ENV, "ORX_INVOCATION_CONTEXT"]);
+        std::env::set_var(CHAT_SESSION_ENV, "server-session");
+        std::env::set_var(
+            "ORX_INVOCATION_CONTEXT",
+            r#"{"harness":"codex","model":"gpt-6-sol","provider":null}"#,
+        );
+        let local = crate::compute::tests::tinker_args();
+        assert_eq!(
+            local.launching_chat_session().as_deref(),
+            Some("server-session")
+        );
+        assert!(local.invocation_identity().unwrap().is_some());
+        let forwarded = crate::ExpRunArgs {
+            forwarded: true,
+            ..crate::compute::tests::tinker_args()
+        };
+        assert_eq!(forwarded.launching_chat_session(), None);
+        assert!(forwarded.invocation_identity().unwrap().is_none());
+    }
+
     #[test]
     fn empty_local_marker_is_not_a_local_session() {
         let _guard = EnvGuard::new(&[CHAT_SESSION_ENV, LOCAL_SESSION_ENV]);

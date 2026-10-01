@@ -257,17 +257,23 @@ async fn merge_projection(
     Ok(answered)
 }
 
-/// A finished native step's own model and tokens (a sub-agent's included), once.
+/// A native step's own model (a sub-agent's included) once output proves it ran, and its tokens
+/// once it completes; each state is recorded once.
 fn record_message_usage(ctx: &TurnCtx, message: &Value, recorded: &mut HashSet<String>) {
-    let (Some(id), Some(_)) = (
-        message["id"].as_str(),
-        message
-            .pointer("/time/completed")
-            .filter(|time| !time.is_null()),
-    ) else {
+    let Some(id) = message["id"].as_str() else {
         return;
     };
-    if !recorded.insert(id.to_string()) {
+    let completed = message
+        .pointer("/time/completed")
+        .is_some_and(|time| !time.is_null());
+    let ran = completed
+        || message
+            .pointer("/time/streamed")
+            .is_some_and(|time| !time.is_null())
+        || message["content"]
+            .as_array()
+            .is_some_and(|content| !content.is_empty());
+    if !ran || !recorded.insert(format!("{id}:{completed}")) {
         return;
     }
     ctx.record_native_usage(
@@ -276,6 +282,7 @@ fn record_message_usage(ctx: &TurnCtx, message: &Value, recorded: &mut HashSet<S
         message.pointer("/model/providerID").and_then(Value::as_str),
         message
             .get("tokens")
+            .filter(|_| completed)
             .map(opencode_native_usage)
             .unwrap_or_default(),
     );

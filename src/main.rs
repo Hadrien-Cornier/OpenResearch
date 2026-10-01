@@ -568,6 +568,9 @@ pub struct ExpRunArgs {
     /// The native agent CLI whose shell ran `orx exp run`, read once in that process.
     #[arg(skip)]
     pub agent_origin: Option<String>,
+    /// Handled by `orx up` for a caller: launch evidence comes only from the request.
+    #[arg(skip)]
+    pub forwarded: bool,
     #[arg(skip)]
     pub telemetry_suppressed: bool,
 }
@@ -599,7 +602,7 @@ impl ExpRunArgs {
         let context = self
             .invocation_context
             .clone()
-            .or_else(|| std::env::var("ORX_INVOCATION_CONTEXT").ok());
+            .or_else(|| (!self.forwarded).then(|| std::env::var("ORX_INVOCATION_CONTEXT").ok())?);
         let identity: Option<crate::store::InvocationIdentity> = context
             .map(|json| serde_json::from_str(&json))
             .transpose()?;
@@ -610,9 +613,11 @@ impl ExpRunArgs {
     }
 
     pub fn launching_chat_session(&self) -> Option<String> {
-        self.chat_session_id
-            .clone()
-            .or_else(crate::local::chat::launching_chat_session)
+        self.chat_session_id.clone().or_else(|| {
+            (!self.forwarded)
+                .then(crate::local::chat::launching_chat_session)
+                .flatten()
+        })
     }
 }
 
