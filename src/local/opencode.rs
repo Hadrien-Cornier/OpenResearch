@@ -609,16 +609,6 @@ impl AgentHost {
             .map_or(true, |retired| retired.contains(session_id))
     }
 
-    /// PIDs of the OpenCode servers this process runs.
-    pub(crate) async fn child_pids(&self) -> Vec<u32> {
-        self.inner
-            .lock()
-            .await
-            .values()
-            .filter_map(|agent| agent.child.id())
-            .collect()
-    }
-
     pub(crate) async fn endpoint_for(&self, session_id: &str) -> Option<AgentEndpoint> {
         let mut guard = self.inner.lock().await;
         let agent = guard.get_mut(session_id)?;

@@ -1632,7 +1632,8 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let turn_started_at = crate::store::now_ms();
     persist_scope(
         ctx,
-        json!({"native": native_id, "startedAt": turn_started_at, "roots": [], "prompt": prompt_id}),
+        json!({"native": native_id, "startedAt": turn_started_at, "roots": [], "prompt": prompt_id,
+            "endpoint": base}),
     );
     track_turn(ctx, &native_id, turn_started_at);
     let send = ctx
@@ -2415,19 +2416,16 @@ async fn watch_held(
             record_unrecoverable(&sink, &SessionGone(native).into(), false);
             return sink.release();
         };
-        let live = || async {
-            let endpoint = agent.endpoint_for(session).await?;
-            (Some(&endpoint.base_url) == original.as_ref()).then_some(endpoint)
+        let owner = || async {
+            let Some(original) = &original else {
+                return persisted_owner(&scope).await;
+            };
+            match agent.endpoint_for(session).await {
+                Some(endpoint) if endpoint.base_url == *original => Owner::Live(endpoint),
+                _ => Owner::Gone,
+            }
         };
-        let held = || async {
-            let (path, own) = (database.path.clone(), agent.child_pids().await);
-            tokio::task::spawn_blocking(move || {
-                native_store::opencode_database::held_elsewhere(&path, &own)
-            })
-            .await
-            .map_or(true, |held| held.unwrap_or(true))
-        };
-        settle_stored(&sink, &scope, &database.path, live, held).await;
+        settle_stored(&sink, &scope, &database.path, owner).await;
     } else {
         let endpoint = |missing| background_endpoint(&agent, &sink.session_id, &scope, missing);
         settle_watch(&sink, &scope, endpoint).await;
@@ -2441,22 +2439,52 @@ enum Stored {
     Settled { unfinished: Option<String> },
     /// The turn's own server still runs its tree.
     Running,
-    /// Another process holds the database and native work is unfinished, so it may still run.
-    Held,
+}
+
+/// Who can still run a root scope's native work.
+enum Owner {
+    /// The turn's original server: its status says when the tree settled.
+    Live(AgentEndpoint),
+    /// The original server is gone, so the database holds all it wrote.
+    Gone,
+    /// A scope persisted before its owner was recorded.
+    Unknown,
+}
+
+/// After a restart: the turn's original V1 server, reconnected read-only at its persisted endpoint
+/// (a refused connection: gone). V2 servers exit with orx once their stdin closes.
+async fn persisted_owner(scope: &Value) -> Owner {
+    if scope["v2"] == true {
+        return Owner::Gone;
+    }
+    let Some(base) = scope["endpoint"].as_str() else {
+        return Owner::Unknown;
+    };
+    let endpoint = AgentEndpoint {
+        base_url: base.to_string(),
+        client: reqwest::Client::new(),
+        protocol: crate::local::opencode::Protocol::V1,
+        legacy_v2_api: false,
+    };
+    match endpoint
+        .client
+        .get(format!("{base}/session/status"))
+        .send()
+        .await
+    {
+        Err(error) if error.is_connect() => Owner::Gone,
+        _ => Owner::Live(endpoint),
+    }
 }
 
 /// Captures a root scope's prompt run and descendants from its native database until native
 /// evidence says it ended; work no process can finish seals it with a partial marker.
-async fn settle_stored<F, G>(
+async fn settle_stored<F: std::future::Future<Output = Owner>>(
     sink: &impl UsageSink,
     scope: &Value,
     database: &std::path::Path,
-    live: impl Fn() -> F,
-    held: impl Fn() -> G,
-) where
-    F: std::future::Future<Output = Option<AgentEndpoint>>,
-    G: std::future::Future<Output = bool>,
-{
+    owner: impl Fn() -> F,
+) {
     let (Some(native), Some(started_at), Some(prompt)) = (
         scope["native"].as_str(),
         scope["startedAt"].as_i64(),
@@ -2469,11 +2497,11 @@ async fn settle_stored<F, G>(
     loop {
         let polled: Result<Stored> = async {
             // Read before capturing, so a tree found idle has persisted everything captured below.
-            let active = match live().await {
-                Some(endpoint) => Some(active_sessions(&endpoint).await?),
-                None => None,
+            let owner = owner().await;
+            let active = match &owner {
+                Owner::Live(endpoint) => Some(active_sessions(endpoint).await?),
+                Owner::Gone | Owner::Unknown => None,
             };
-            let held = active.is_none() && held().await;
             let sessions: Vec<String> = if scope["v2"] == true {
                 v2::capture_tree(
                     sink,
@@ -2504,17 +2532,14 @@ async fn settle_stored<F, G>(
                     return Ok(Stored::Running);
                 }
             }
-            // V1 never resumes, so its history only matters while another process may still write.
+            // V1 never resumes, so its history matters only when its owner is unknown.
             let v2 = scope["v2"] == true;
-            let unfinished = if v2 || held {
+            let unfinished = if v2 || matches!(owner, Owner::Unknown) {
                 unfinished_session(database, sessions, v2, (native, prompt)).await?
             } else {
                 None
             };
-            Ok(match unfinished {
-                Some(_) if held => Stored::Held,
-                unfinished => Stored::Settled { unfinished },
-            })
+            Ok(Stored::Settled { unfinished })
         }
         .await;
         match polled {
@@ -2527,7 +2552,7 @@ async fn settle_stored<F, G>(
                 }
                 return;
             }
-            Ok(Stored::Held | Stored::Running) => {}
+            Ok(Stored::Running) => {}
             Err(error) => match error.downcast_ref::<SessionGone>() {
                 Some(SessionGone(session)) => {
                     return record_unrecoverable(sink, &error, session != native)
@@ -4305,44 +4330,104 @@ opencode/unknown
         }
     }
 
-    /// Another process (a surviving V1 server) still runs the prompt's run: recovery keeps reading
-    /// past the old grace and settles, unmarked, once native history shows the run ended.
-    #[tokio::test]
-    async fn v1_recovery_captures_work_a_holder_writes_after_the_grace() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        const PROMPT: &str = "msg_0f4a81d5e000-orxabcdefghij";
-        let step = |id: &str, model: &str, finish: &str| {
-            json!({"info":{"id":id,"sessionID":"ses_main","role":"assistant","modelID":model,
-                "providerID":"p","finish":finish,"time":{"created":13,"completed":14}},
-                "parts":[{"id":format!("{id}_1"),"messageID":id,"sessionID":"ses_main","type":"step-start"}]})
-        };
+    /// A V1 database holding a prompt whose run stopped after a `tool-calls` step.
+    fn v1_unfinished_run(prompt: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("orx-oc-v1db-{}.db", uuid::Uuid::new_v4()));
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY); CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT); INSERT INTO session VALUES ('ses_main');").unwrap();
-        let prompt = json!({"info":{"id":PROMPT,"sessionID":"ses_main","role":"user",
+        let prompt = json!({"info":{"id":prompt,"sessionID":"ses_main","role":"user",
             "time":{"created":12}},"parts":[]});
         insert_v1(
             &db,
             "ses_main",
-            vec![prompt, step("msg_a", "root-model", "tool-calls")],
+            vec![prompt, v1_step("msg_a", "tool-calls")],
         );
-        let polls = AtomicUsize::new(0);
-        let late = 2 * DELIVERY_GRACE_POLLS;
-        let held = || {
-            // The holder writes the run's last step well after the old grace.
-            if polls.fetch_add(1, Ordering::SeqCst) == late {
-                insert_v1(&db, "ses_main", vec![step("msg_b", "late-model", "stop")]);
-            }
-            async { true }
-        };
+        path
+    }
+
+    fn v1_step(id: &str, finish: &str) -> Value {
+        json!({"info":{"id":id,"sessionID":"ses_main","role":"assistant","modelID":"m",
+            "providerID":"p","finish":finish,"time":{"created":13,"completed":14}},
+            "parts":[{"id":format!("{id}_1"),"messageID":id,"sessionID":"ses_main","type":"step-start"}]})
+    }
+
+    /// After a restart the turn's surviving V1 server is reconnected at its persisted endpoint: while
+    /// it runs the prompt's tree, recovery keeps reading past the old grace, then settles unmarked.
+    #[tokio::test]
+    async fn v1_recovery_reads_the_live_original_server_past_the_grace() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const PROMPT: &str = "msg_0f4a81d5e000-orxabcdefghij";
+        let path = v1_unfinished_run(PROMPT);
+        // Each poll probes and then reads the status; the run ends well after the old grace.
+        let late = 4 * DELIVERY_GRACE_POLLS;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/session/status",
+            get({
+                let (calls, path) = (calls.clone(), path.clone());
+                move || {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    if call == late {
+                        let db = rusqlite::Connection::open(&path).unwrap();
+                        insert_v1(&db, "ses_main", vec![v1_step("msg_b", "stop")]);
+                    }
+                    async move {
+                        Json(if call < late {
+                            json!({"ses_main":{"type":"busy"}})
+                        } else {
+                            json!({})
+                        })
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let recorded = Recorded::default();
-        let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":PROMPT});
-        settle_stored(&recorded, &scope, &path, || async { None }, held).await;
-        let samples = recorded.samples.into_inner().unwrap();
-        let mut ids: Vec<_> = samples.keys().cloned().collect();
+        let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":PROMPT,
+            "endpoint":base});
+        settle_stored(&recorded, &scope, &path, || persisted_owner(&scope)).await;
+        server.abort();
+        let mut ids: Vec<_> = recorded.samples.into_inner().unwrap().into_keys().collect();
         ids.sort();
         assert_eq!(ids, ["msg_a_1", "msg_b_1"]);
-        assert_eq!(polls.load(Ordering::SeqCst), late + 1);
+        assert!(calls.load(Ordering::SeqCst) > late);
+    }
+
+    /// Without a live original server nothing waits on other database holders: a gone server leaves
+    /// a final snapshot, and a scope with no recorded owner marks its unfinished run explicitly.
+    #[tokio::test]
+    async fn v1_recovery_never_waits_without_a_live_original_server() {
+        use crate::store::{Attribution::Unresolved, Missing};
+        const PROMPT: &str = "msg_0f4a81d5e000-orxabcdefghij";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gone = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        for (endpoint, marked) in [(Some(gone), false), (None, true)] {
+            let path = v1_unfinished_run(PROMPT);
+            // Another holder keeps the database open throughout.
+            let _holder = rusqlite::Connection::open(&path).unwrap();
+            let recorded = Recorded::default();
+            let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":PROMPT,
+                "endpoint":endpoint});
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                settle_stored(&recorded, &scope, &path, || persisted_owner(&scope)),
+            )
+            .await
+            .expect("no live owner, no wait");
+            let samples = recorded.samples.into_inner().unwrap();
+            assert!(samples.contains_key("msg_a_1"));
+            let marker = samples
+                .get("opencode-root:unrecoverable")
+                .map(|sample| &sample.0);
+            let unavailable = Unresolved {
+                reason: Missing::IdentityNotReported,
+            };
+            assert_eq!(marker, marked.then_some(&unavailable), "{scope}");
+        }
     }
 
     /// A cancellation whose native read failed keeps its persisted scope and holds the execution, so
@@ -4418,11 +4503,11 @@ opencode/unknown
         let (store, db) = usage_store();
         let sink = StoreSink(Mutex::new(store));
         let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":PROMPT});
-        let (live, held) = (|| async { None }, || async { false });
-        settle_stored(&sink, &scope, &database, live, held).await;
+        let owner = || async { Owner::Gone };
+        settle_stored(&sink, &scope, &database, owner).await;
         appear.await.unwrap();
         let first = ledger(&db);
-        settle_stored(&sink, &scope, &database, live, held).await;
+        settle_stored(&sink, &scope, &database, owner).await;
         assert_eq!(ledger(&db), first);
         let models: Vec<(String, crate::store::Attribution)> = first
             .into_iter()

@@ -650,15 +650,6 @@ fn check_integrity(path: &Path) -> Result<()> {
 }
 
 fn ensure_no_external_users(database: &Path) -> Result<()> {
-    if held_elsewhere(database, &[])? {
-        return Err(anyhow!("OpenCode database is open in another process. Close other OpenCode processes and retry."));
-    }
-    Ok(())
-}
-
-/// Whether a process other than this one and `own` (its OpenCode servers) holds `database` open.
-/// Windows cannot name the holders, so any holder counts.
-pub(crate) fn held_elsewhere(database: &Path, own: &[u32]) -> Result<bool> {
     let paths = [
         database.to_path_buf(),
         sidecar(database, "-wal"),
@@ -680,25 +671,24 @@ pub(crate) fn held_elsewhere(database: &Path, own: &[u32]) -> Result<bool> {
             ));
         }
         let own_pid = std::process::id();
-        Ok(String::from_utf8_lossy(&output.stdout)
+        if String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| line.strip_prefix('p'))
             .filter_map(|pid| pid.parse::<u32>().ok())
-            .any(|pid| pid != own_pid && !own.contains(&pid)))
+            .any(|pid| pid != own_pid)
+        {
+            return Err(anyhow!("OpenCode database is open in another process. Close other OpenCode processes and retry."));
+        }
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        let _ = own;
-        Ok(paths.iter().filter(|path| path.exists()).any(|path| {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .share_mode(0)
-                .open(path)
-                .is_err()
-        }))
+        for path in paths.iter().filter(|path| path.exists()) {
+            OpenOptions::new().read(true).write(true).share_mode(0).open(path)
+                .map_err(|error| anyhow!("OpenCode database is open in another process. Close other OpenCode processes and retry: {error}"))?;
+        }
     }
+    Ok(())
 }
 
 fn referenced_sessions(database: &Path) -> Result<BTreeSet<String>> {

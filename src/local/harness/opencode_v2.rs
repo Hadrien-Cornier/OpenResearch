@@ -2038,11 +2038,11 @@ mod tests {
         let sink = super::super::tests::StoreSink(std::sync::Mutex::new(store));
         let scope =
             json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_prompt"});
-        let (live, held) = (|| async { None }, || async { false });
-        super::super::settle_stored(&sink, &scope, &database, live, held).await;
+        let owner = || async { super::super::Owner::Gone };
+        super::super::settle_stored(&sink, &scope, &database, owner).await;
         appear.await.unwrap();
         let first = super::super::tests::ledger(&db);
-        super::super::settle_stored(&sink, &scope, &database, live, held).await;
+        super::super::settle_stored(&sink, &scope, &database, owner).await;
         assert_eq!(super::super::tests::ledger(&db), first);
         let rows: Vec<(String, crate::store::Attribution, crate::store::TokenUsage)> = first
             .into_iter()
@@ -2099,8 +2099,8 @@ mod tests {
             "opencode-background:unrecoverable",
             Missing::ChildModelUnknown,
         );
-        // A holder alone never seals work native already finished.
-        for (sessions, held, marker, recorded_samples) in [
+        // An unknown owner never holds open work native already finished.
+        for (sessions, unknown, marker, recorded_samples) in [
             (vec![main(true), child.clone()], false, Some(root_lost), 3),
             (vec![main(false), child.clone()], true, None, 2),
             (vec![child.clone()], false, Some(root_lost), 1),
@@ -2112,61 +2112,23 @@ mod tests {
             let recorded = super::super::tests::Recorded::default();
             let scope = json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],
                 "prompt":"msg_prompt"});
-            super::super::settle_stored(
-                &recorded,
-                &scope,
-                &path,
-                || async { None },
-                || async { held },
-            )
-            .await;
+            let owner = || async move {
+                match unknown {
+                    true => super::super::Owner::Unknown,
+                    false => super::super::Owner::Gone,
+                }
+            };
+            super::super::settle_stored(&recorded, &scope, &path, owner).await;
             let samples = recorded.samples.into_inner().unwrap();
             if let Some((marker, reason)) = marker {
-                assert_eq!(samples[marker].0, Unresolved { reason }, "{marker} {held}");
+                assert_eq!(
+                    samples[marker].0,
+                    Unresolved { reason },
+                    "{marker} {unknown}"
+                );
             }
             assert_eq!(samples.len(), recorded_samples, "{samples:?}");
         }
-    }
-
-    /// Another process still runs the claimed turn: recovery keeps reading past the old grace and
-    /// settles, unmarked, once native releases the claim, with every step written meanwhile.
-    #[tokio::test]
-    async fn stored_recovery_captures_work_a_holder_writes_after_the_grace() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let path = std::env::temp_dir().join(format!("orx-oc-v2db-{}.db", uuid::Uuid::new_v4()));
-        let root = step("msg_root", "ses_main", "root-model", 13, json!([]));
-        v2_database(
-            &path,
-            &[("ses_main", None, true, vec![user("msg_prompt", 12), root])],
-        );
-        let polls = AtomicUsize::new(0);
-        let late = 2 * super::super::DELIVERY_GRACE_POLLS;
-        let held = || {
-            // The holder finishes the turn well after the old grace.
-            if polls.fetch_add(1, Ordering::SeqCst) == late {
-                let db = rusqlite::Connection::open(&path).unwrap();
-                let step = step("msg_late", "ses_main", "late-model", 14, json!([]));
-                let data = json!({"model": step["model"], "content": [], "tokens": step["tokens"],
-                    "time": step["time"]});
-                db.execute(
-                    "INSERT INTO session_message VALUES ('msg_late', 'ses_main', 'assistant', 9, ?1)",
-                    [data.to_string()],
-                )
-                .unwrap();
-                db.execute("UPDATE session_v2 SET time_suspended = NULL", [])
-                    .unwrap();
-            }
-            async { true }
-        };
-        let recorded = super::super::tests::Recorded::default();
-        let scope =
-            json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_prompt"});
-        super::super::settle_stored(&recorded, &scope, &path, || async { None }, held).await;
-        let samples = recorded.samples.into_inner().unwrap();
-        let mut ids: Vec<_> = samples.keys().cloned().collect();
-        ids.sort();
-        assert_eq!(ids, ["msg_late", "msg_root"]);
-        assert_eq!(polls.load(Ordering::SeqCst), late + 1);
     }
 
     /// A cancellation whose native history read failed reports the failure, so its caller keeps the
@@ -2198,7 +2160,7 @@ mod tests {
     }
 
     /// While the turn's own server still runs its tree, recovery waits for it rather than sealing;
-    /// that server, not the database's other holders, says when the work settled.
+    /// that server says when the work settled.
     #[tokio::test]
     async fn stored_recovery_waits_for_the_turns_own_server() {
         use axum::{routing::get, Json, Router};
@@ -2233,11 +2195,11 @@ mod tests {
         let recorded = super::super::tests::Recorded::default();
         let scope =
             json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_prompt"});
-        let live = || {
+        let owner = || {
             let endpoint = endpoint.clone();
-            async move { Some(endpoint) }
+            async move { super::super::Owner::Live(endpoint) }
         };
-        super::super::settle_stored(&recorded, &scope, &path, live, || async { true }).await;
+        super::super::settle_stored(&recorded, &scope, &path, owner).await;
         server.abort();
         assert_eq!(polls.load(Ordering::SeqCst), 3);
         let samples = recorded.samples.into_inner().unwrap();
