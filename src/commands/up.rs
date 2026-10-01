@@ -219,8 +219,16 @@ pub async fn run(args: UpArgs) -> Result<()> {
         if let Some(warning) = crate::local::bash::missing_toolchain() {
             eprintln!("orx up: warning: {warning}");
         }
-        if !args.no_browser {
+        if args.no_browser {
+            // The caller opens the dashboard itself.
+        } else if browser::has_display() {
             browser::open_browser(&url);
+        } else {
+            eprintln!(
+                "orx up: no display here, so no browser opened. Open {url} in a browser on \
+                 this machine, or forward it from your computer: \
+                 ssh -N -L {actual_port}:localhost:{actual_port} <user@host>"
+            );
         }
     }
 

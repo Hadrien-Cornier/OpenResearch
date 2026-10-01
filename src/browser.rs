@@ -20,6 +20,17 @@ pub fn open_browser(url: &str) {
     }
 }
 
+/// Whether a browser could appear here. Linux outside WSL needs an X or Wayland
+/// display; without one `xdg-open` falls back to a text browser in our terminal.
+pub fn has_display() -> bool {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    if !is_wsl() {
+        return std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    }
+    true
+}
+
 /// The open commands to try, in order. On WSL the URL goes to the Windows
 /// host's browser through interop; `xdg-open` stays last for distros with a
 /// Linux browser or wslu wired into it.
