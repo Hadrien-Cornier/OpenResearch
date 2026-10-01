@@ -3,7 +3,7 @@
 //! the Codex TUI/IDE use; `jsonrpc` field omitted on the wire, requests flow
 //! in BOTH directions — the server sends us approval requests we must answer
 //! by id). Mirrors `AgentHost` (opencode.rs): spawn on demand, reap on read,
-//! kill on session delete / shutdown.
+//! release when idle (`agent_lifecycle`), kill on session delete / shutdown.
 //!
 //! Wire shapes were pinned against codex-cli 0.144.0 via
 //! `codex app-server generate-json-schema` plus a live spike (see the fixture
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +26,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{anyhow, Result};
+use crate::local::agent_lifecycle::{IdlePolicy, REAPER_INTERVAL};
 use crate::local::harness::codex::{ensure_orx_data_dir, find_codex_required};
 use crate::local::native_store::{self, NativeStore};
 
@@ -210,6 +211,9 @@ pub struct CodexClient {
     /// child (crash/restart replacement) — the DB signal covers that case.
     last_collab_mode: std::sync::Mutex<Option<&'static str>>,
     native_store: NativeStore,
+    /// Last time this child was handed out, reported thread work, or ended a
+    /// turn — the idle reaper's clock.
+    last_active: std::sync::Mutex<Instant>,
 }
 
 impl CodexClient {
@@ -379,6 +383,21 @@ impl CodexClient {
         }
     }
 
+    fn touch(&self) {
+        *self.last_active.lock().unwrap() = Instant::now();
+    }
+
+    /// When this child was last used, or `None` while a turn or request is in flight.
+    fn idle_since(&self) -> Option<Instant> {
+        if self.terminated.load(Ordering::Acquire)
+            || self.turn.lock().unwrap().is_some()
+            || !self.pending.lock().unwrap().is_empty()
+        {
+            return None;
+        }
+        Some(*self.last_active.lock().unwrap())
+    }
+
     /// The thread this child has already started/resumed, if any.
     pub fn resumed_thread(&self) -> Option<String> {
         self.resumed_thread.lock().unwrap().clone()
@@ -482,6 +501,7 @@ impl Drop for TurnRoute {
             *turn = None;
             drop(turn);
             *self.client.active_turn.lock().unwrap() = None;
+            self.client.touch();
         }
     }
 }
@@ -493,11 +513,13 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
     while let Ok(Some(line)) = lines.next_line().await {
         match classify_line(&line) {
             Line::Response { id, result } => {
+                client.touch();
                 if let Some(tx) = client.pending.lock().unwrap().remove(&id) {
                     let _ = tx.send(result);
                 }
             }
             Line::Request { id, method, params } => {
+                client.touch();
                 let kind = server_req_kind(&method);
                 client
                     .unanswered
@@ -533,6 +555,10 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
                 }
             }
             Line::Notification { method, params } => {
+                // Thread work (incl. sub-agent tails) is activity; account/status chatter is not.
+                if params.get("threadId").is_some() {
+                    client.touch();
+                }
                 // Codex settled a request itself (approval deadline, answer
                 // raced): the id is no longer answerable — drop it from the
                 // pending set so the stale-answer guard stays truthful.
@@ -662,6 +688,7 @@ async fn spawn_client(
         thread_model: std::sync::Mutex::new(None),
         last_collab_mode: std::sync::Mutex::new(None),
         native_store,
+        last_active: std::sync::Mutex::new(Instant::now()),
     });
     tokio::spawn(read_loop(client.clone(), stdout));
     Ok(client)
@@ -755,6 +782,7 @@ impl CodexHost {
                 if client.native_store() == native_store
                     && matches!(client.child.lock().await.try_wait(), Ok(None))
                 {
+                    client.touch();
                     return Ok(client.clone());
                 }
             }
@@ -805,6 +833,7 @@ impl CodexHost {
         let mut guard = self.inner.lock().await;
         let client = guard.get(session_id)?;
         if matches!(client.child.lock().await.try_wait(), Ok(None)) {
+            client.touch();
             return Some(client.clone());
         }
         let dead = guard.remove(session_id)?;
@@ -842,6 +871,77 @@ impl CodexHost {
         items
     }
 
+    pub fn start_reaper(self: &Arc<Self>) {
+        let host = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(REAPER_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(host) = host.upgrade() else {
+                    break;
+                };
+                host.reap_idle_at(Instant::now(), IdlePolicy::current())
+                    .await;
+            }
+        });
+    }
+
+    /// Release children idle past the policy's timeout or over its idle limit;
+    /// the next turn respawns and `thread/resume`s.
+    async fn reap_idle_at(&self, now: Instant, policy: IdlePolicy) {
+        let idle = self
+            .inner
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(session_id, client)| {
+                let idle_since = client.idle_since()?;
+                Some((session_id.clone(), client.clone(), idle_since))
+            })
+            .collect::<Vec<_>>();
+        let idle_for = idle
+            .iter()
+            .map(|(_, _, idle_since)| now.duration_since(*idle_since))
+            .collect::<Vec<_>>();
+        let (expired, warm): (Vec<usize>, Vec<usize>) =
+            (0..idle.len()).partition(|&index| idle_for[index] >= policy.idle_timeout);
+        let warm_idle_for = warm
+            .iter()
+            .map(|&index| idle_for[index])
+            .collect::<Vec<_>>();
+        let doomed = expired
+            .into_iter()
+            .map(|index| (index, "idle-expired"))
+            .chain(
+                policy
+                    .over_limit(&warm_idle_for)
+                    .into_iter()
+                    .map(|index| (warm[index], "idle-limit")),
+            )
+            .collect::<Vec<_>>();
+        for (index, reason) in doomed {
+            let (session_id, client, idle_since) = &idle[index];
+            let removed = {
+                // Atomic with the touch in `ensure`/`client_for`: a child handed out since
+                // the snapshot is spared.
+                let mut guard = self.inner.lock().await;
+                let untouched = guard
+                    .get(session_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, client))
+                    && client.idle_since() == Some(*idle_since);
+                untouched.then(|| guard.remove(session_id)).flatten()
+            };
+            if let Some(client) = removed {
+                eprintln!(
+                    "orx up: stopping codex app-server session={session_id} reason={reason} idle_s={}",
+                    idle_for[index].as_secs()
+                );
+                client.terminate().await;
+            }
+        }
+    }
+
     /// Kill and reap one session's child (on session delete).
     pub async fn kill_session(&self, session_id: &str) {
         if let Some(client) = self.inner.lock().await.remove(session_id) {
@@ -860,6 +960,78 @@ impl CodexHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn idle_test_client(last_active: Instant) -> Arc<CodexClient> {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 600"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group_id = child.id().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        Arc::new(CodexClient {
+            child: Mutex::new(child),
+            process_group_id,
+            terminated: AtomicBool::new(false),
+            stdin: Mutex::new(stdin),
+            next_id: AtomicI64::new(1),
+            pending: std::sync::Mutex::new(HashMap::new()),
+            turn: std::sync::Mutex::new(None),
+            unanswered: std::sync::Mutex::new(HashMap::new()),
+            active_turn: std::sync::Mutex::new(None),
+            resumed_thread: std::sync::Mutex::new(None),
+            thread_model: std::sync::Mutex::new(None),
+            last_collab_mode: std::sync::Mutex::new(None),
+            native_store: NativeStore::Isolated,
+            last_active: std::sync::Mutex::new(last_active),
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_releases_idle_children_and_spares_busy_ones() {
+        let now = Instant::now();
+        let host = CodexHost::new();
+        let expired = idle_test_client(now - IdlePolicy::DEFAULT.idle_timeout);
+        let recent = idle_test_client(now - Duration::from_secs(60));
+        let newest = idle_test_client(now - Duration::from_secs(40));
+        let in_turn = idle_test_client(now - Duration::from_secs(3600));
+        let in_request = idle_test_client(now - Duration::from_secs(3600));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _route = in_turn.register_turn(tx);
+        let (request_tx, _request_rx) = oneshot::channel();
+        in_request.pending.lock().unwrap().insert(1, request_tx);
+        for (session_id, client) in [
+            ("expired", &expired),
+            ("recent", &recent),
+            ("newest", &newest),
+            ("in-turn", &in_turn),
+            ("in-request", &in_request),
+        ] {
+            host.inner
+                .lock()
+                .await
+                .insert(session_id.to_string(), client.clone());
+        }
+
+        host.reap_idle_at(now, IdlePolicy::DEFAULT).await;
+
+        let mut live = host.inner.lock().await.keys().cloned().collect::<Vec<_>>();
+        live.sort();
+        assert_eq!(live, ["in-request", "in-turn", "newest", "recent"]);
+        assert!(expired.terminated.load(Ordering::Acquire));
+
+        host.reap_idle_at(now, IdlePolicy::LOW_MEMORY).await;
+        assert!(recent.terminated.load(Ordering::Acquire));
+        assert!(!newest.terminated.load(Ordering::Acquire));
+        assert!(!in_request.terminated.load(Ordering::Acquire));
+        assert!(!in_turn.terminated.load(Ordering::Acquire));
+        host.shutdown().await;
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -892,6 +1064,7 @@ mod tests {
             thread_model: std::sync::Mutex::new(None),
             last_collab_mode: std::sync::Mutex::new(None),
             native_store: NativeStore::Isolated,
+            last_active: std::sync::Mutex::new(Instant::now()),
         };
 
         client.terminate().await;

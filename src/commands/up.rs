@@ -108,6 +108,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     let codex = Arc::new(local::codex::CodexHost::new());
     let claude = Arc::new(local::claude::ClaudeHost::new());
     claude.start_reaper();
+    codex.start_reaper();
     let remote_instance_id = persistent_host.then(|| uuid::Uuid::new_v4().to_string());
     let stopping = Arc::new(AtomicBool::new(false));
     let state = AppState {
