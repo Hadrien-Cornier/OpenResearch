@@ -392,8 +392,13 @@ impl Store {
         let properties = &mut payload["events"][0]["properties"];
         if properties["attributionReason"] == "invoker_not_linked" {
             let (attribution, active) = match self.printed_run_invoker(run_id)? {
-                Some(attribution) => (Some(attribution), false),
-                None => self.native_run_invoker(run_id)?,
+                Some(exact @ Attribution::Exact { .. }) => (Some(exact), false),
+                // A printed part with no captured identity (its hook ran before the planner row
+                // flushed) defers to native records, which name each planner's own model.
+                printed => {
+                    let (native, active) = self.native_run_invoker(run_id)?;
+                    (native.or(printed), active)
+                }
             };
             match attribution {
                 Some(attribution) => attribution.apply(properties)?,

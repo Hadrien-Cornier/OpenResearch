@@ -1616,6 +1616,17 @@ mod tests {
             "child.jsonl",
             &[(0, "SYSTEM_MESSAGE"), (1, "PLANNER_RESPONSE")],
         );
+        // Planner 1's hook ran before its transcript row flushed: kept apart, never guessed onto a step.
+        let unflushed = transcript("unflushed.jsonl", &[]);
+        crate::commands::mcp_gate::record_invocation(
+            &store,
+            &unflushed,
+            "conv",
+            1,
+            "test-session",
+            Some("test-execution"),
+        )
+        .unwrap();
         crate::commands::mcp_gate::record_invocation(
             &store,
             &child,
@@ -1691,6 +1702,38 @@ mod tests {
             native_run_invokers_in(&store, &dir, "test-session", "conv", "7f3a-run").unwrap(),
             [crate::store::Attribution::Exact {
                 model: "gemini-3.8-flash-high".into(),
+                provider: None
+            }]
+        );
+        // The parent's run came from planner 1, whose hook never reached a step key: its own
+        // native generation record still names it exactly.
+        let parent_logs = dir.join("brain/conv/.system_generated/logs");
+        std::fs::create_dir_all(&parent_logs).unwrap();
+        std::fs::write(
+            parent_logs.join("transcript.jsonl"),
+            [
+                json!({"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"orx exp run e\""}}]}),
+                json!({"step_index": 2, "type": "GENERIC", "content": "Run 5d2e-run started"}),
+            ]
+            .map(|row| row.to_string())
+            .join("\n"),
+        )
+        .unwrap();
+        let hooked = |key: &str| {
+            store
+                .native_invocation_identity("antigravity", key)
+                .unwrap()
+                .map(|identity| identity.model)
+        };
+        assert_eq!(
+            hooked("antigravity:conv:invocation:1").as_deref(),
+            Some("gemini-3.8-flash-high")
+        );
+        assert_eq!(hooked("antigravity:conv:step:1"), None);
+        assert_eq!(
+            native_run_invokers_in(&store, &dir, "test-session", "conv", "5d2e-run").unwrap(),
+            [crate::store::Attribution::Exact {
+                model: "gemini-3.8-flash".into(),
                 provider: None
             }]
         );
