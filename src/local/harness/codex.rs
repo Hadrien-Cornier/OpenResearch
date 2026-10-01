@@ -388,9 +388,8 @@ pub(crate) fn find_codex_required() -> Result<PathBuf> {
 /// every session store. Codex has no system-prompt flag, so `system` leads the
 /// message.
 ///
-/// Any failure — spawn, non-zero exit, timeout, garbage output — returns `None`
-/// and the caller keeps its fallback.
-async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
+/// A failed turn's error event becomes the error; stderr is only Codex's own logging.
+async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
     let effort = match request.quality {
         OneShotQuality::Cheap => "low",
         OneShotQuality::Standard => "medium",
@@ -420,27 +419,53 @@ async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
         prepare_env(&mut cmd);
         cmd.env(
             "CODEX_HOME",
-            native_store::prepare_codex(NativeStore::Isolated).ok()?,
+            native_store::prepare_codex(NativeStore::Isolated)?,
         );
         // Plain text only — an ANSI-colorizing CLI (or a synced FORCE_COLOR)
         // would otherwise write escape codes straight into the reply.
         cmd.env("NO_COLOR", "1");
-        let mut child = cmd.spawn().ok()?;
-        let mut lines = BufReader::new(child.stdout.take()?).lines();
+        let mut child = cmd.spawn()?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let mut lines = BufReader::new(stdout).lines();
         // Keep the last agent message: a chatty run may narrate before it
         // answers, and the reply is what it settled on.
         let mut last = None;
+        let mut error = None;
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(text) = exec_line_agent_message(&line) {
                 last = Some(text);
+            } else if let Some(message) = exec_line_error(&line) {
+                error = Some(message);
             }
         }
-        if !child.wait().await.ok()?.success() {
-            return None;
+        let status = child.wait().await?;
+        match (status.success(), last, error) {
+            (true, Some(text), _) => Ok(text),
+            (_, _, Some(message)) => Err(anyhow!("{message}")),
+            (true, None, None) => Err(anyhow!("returned no reply")),
+            (false, _, None) => Err(anyhow!("{status}")),
         }
-        last
     };
-    tokio::time::timeout(request.timeout, fut).await.ok()?
+    tokio::time::timeout(request.timeout, fut)
+        .await
+        .map_err(|_| anyhow!("timed out after {}s", request.timeout.as_secs()))?
+}
+
+/// A `codex exec --json` line's turn error, with the provider's message
+/// unwrapped from the JSON body Codex embeds in it.
+fn exec_line_error(line: &str) -> Option<String> {
+    let event = serde_json::from_str::<Value>(line).ok()?;
+    let message = match event.get("type").and_then(Value::as_str)? {
+        "error" => event.get("message"),
+        "turn.failed" => event.get("error").and_then(|error| error.get("message")),
+        _ => None,
+    }?
+    .as_str()?;
+    let nested = serde_json::from_str::<Value>(message).ok();
+    let inner = nested
+        .as_ref()
+        .and_then(|body| body.get("error")?.get("message")?.as_str());
+    Some(inner.unwrap_or(message).to_string())
 }
 
 /// One `codex exec --json` stdout line → its agent message text, if it carries
@@ -776,8 +801,9 @@ impl Harness for Codex {
             .map_err(|error| TurnFailure::adapter(error, ctx.delivery_state()))
     }
 
-    async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        codex_one_shot(&find_codex()?, request).await
+    async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
+        let bin = find_codex().ok_or_else(|| anyhow!("{} is not installed", self.name()))?;
+        codex_one_shot(&bin, request).await
     }
 
     fn options(&self) -> HarnessOptions {
@@ -5201,6 +5227,28 @@ requires_openai_auth = false
         ] {
             assert!(exec_line_agent_message(line).is_none(), "line: {line}");
         }
+    }
+
+    #[test]
+    fn exec_line_error_unwraps_the_provider_message() {
+        let unsupported =
+            "The 'gpt-x' model is not supported when using Codex with a ChatGPT account.";
+        assert_eq!(
+            exec_line_error(
+                r#"{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-x' model is not supported when using Codex with a ChatGPT account.\"}}"}}"#
+            )
+            .as_deref(),
+            Some(unsupported)
+        );
+        assert_eq!(
+            exec_line_error(r#"{"type":"error","message":"stream disconnected"}"#).as_deref(),
+            Some("stream disconnected")
+        );
+        // A metadata warning rides an item, not a turn error.
+        assert!(exec_line_error(
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata not found"}}"#
+        )
+        .is_none());
     }
 
     #[test]

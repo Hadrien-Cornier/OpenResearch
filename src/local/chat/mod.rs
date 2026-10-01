@@ -1726,6 +1726,7 @@ impl ChatHost {
                 timeout: COMPACT_SUMMARY_TIMEOUT,
             })
             .await
+            .ok()
             .filter(|summary| !summary.trim().is_empty())
             .ok_or_else(|| anyhow!("{} could not summarize this chat", session.harness))?;
         Ok(format!(

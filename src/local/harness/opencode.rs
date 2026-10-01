@@ -416,12 +416,8 @@ impl Harness for OpenCode {
         }
     }
 
-    async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        opencode_one_shot(
-            &crate::local::opencode::resolve_binary().await.ok()?,
-            request,
-        )
-        .await
+    async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
+        opencode_one_shot(&crate::local::opencode::resolve_binary().await?, request).await
     }
 
     async fn detect(&self) -> Option<HarnessInfo> {
@@ -815,9 +811,8 @@ async fn opencode_models(bin: PathBuf) -> (Vec<super::ModelInfo>, HashSet<String
 /// longer retitles parent sessions itself (only sub-agent child sessions get
 /// task-description titles), so titles run through here like the
 /// claude/codex one-shot children. opencode has no system-prompt flag, so
-/// `system` leads the message. Any failure lands on `None` and the caller
-/// keeps its fallback.
-async fn opencode_one_shot(binary: &ResolvedBinary, request: OneShot<'_>) -> Option<String> {
+/// `system` leads the message.
+async fn opencode_one_shot(binary: &ResolvedBinary, request: OneShot<'_>) -> Result<String> {
     let message = format!("{}\n\n{}", request.system, request.prompt);
     if binary.protocol == crate::local::opencode::Protocol::V2 {
         return v2::generate(
@@ -826,13 +821,23 @@ async fn opencode_one_shot(binary: &ResolvedBinary, request: OneShot<'_>) -> Opt
             message,
             request.timeout,
         )
-        .await
-        .ok();
+        .await;
     }
-    let out = opencode_child(binary, request.model, &message, request.timeout).await?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    let out = opencode_child(binary, request.model, &message, request.timeout)
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "could not run (setup failed or timed out after {}s)",
+                request.timeout.as_secs()
+            )
+        })?;
+    if !out.status.success() {
+        return Err(super::one_shot_exit_error(
+            out.status,
+            &[&out.stderr, &out.stdout],
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Run one unattended `opencode run` to completion, or `None` if it could

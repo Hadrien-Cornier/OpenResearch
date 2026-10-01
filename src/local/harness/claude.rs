@@ -509,10 +509,9 @@ fn has_api_credential() -> bool {
 /// the throwaway request unrecorded.
 ///
 /// `--model haiku`/`sonnet` are CLI model aliases of the kind we already pass
-/// through from the catalog; a CLI too old to know them exits non-zero, which
-/// lands on `None`. Every other failure (spawn, timeout, garbage output)
-/// degrades the same silent way.
-async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
+/// through from the catalog; a CLI too old to know them exits non-zero, and
+/// the error carries what it printed.
+async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
     let model = match request.quality {
         OneShotQuality::Cheap => "haiku",
         OneShotQuality::Standard => "sonnet",
@@ -543,7 +542,7 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
-    .stderr(Stdio::null())
+    .stderr(Stdio::piped())
     .kill_on_drop(true)
     // Hermetic: run outside any repo so the child doesn't ingest the server
     // cwd's CLAUDE.md / settings into a request that carries its own context.
@@ -551,7 +550,7 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     prepare_env(&mut cmd);
     cmd.env(
         "CLAUDE_CONFIG_DIR",
-        native_store::prepare_claude(NativeStore::Isolated).ok()?,
+        native_store::prepare_claude(NativeStore::Isolated)?,
     );
     cmd.env(
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
@@ -563,12 +562,15 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     let fut = cmd.output();
     let out = tokio::time::timeout(request.timeout, fut)
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| anyhow!("timed out after {}s", request.timeout.as_secs()))??;
     if !out.status.success() {
-        return None;
+        // `-p` prints request failures (bad model, signed out) on stdout; stderr is diagnostics.
+        return Err(super::one_shot_exit_error(
+            out.status,
+            &[&out.stdout, &out.stderr],
+        ));
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// `claude` on PATH, then the common install drop locations, in preference order.
@@ -783,8 +785,9 @@ impl Harness for ClaudeCode {
             .map_err(|error| TurnFailure::adapter(error, ctx.delivery_state()))
     }
 
-    async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        claude_one_shot(&find_claude()?, request).await
+    async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
+        let bin = find_claude().ok_or_else(|| anyhow!("{} is not installed", self.name()))?;
+        claude_one_shot(&bin, request).await
     }
 
     fn one_shot_honours_model(&self) -> bool {

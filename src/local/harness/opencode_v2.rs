@@ -760,7 +760,7 @@ pub(super) async fn generate(
             body["model"] = json!({"providerID":provider,"id":model});
         }
         let result = tokio::time::timeout(timeout, async {
-            let response: Value = endpoint
+            let response = endpoint
                 .client
                 .post(format!(
                     "{}{}",
@@ -769,18 +769,25 @@ pub(super) async fn generate(
                 ))
                 .json(&body)
                 .send()
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            let status = response.status();
+            if !status.is_success() {
+                // The body carries the provider's reason; the URL is a throwaway local port.
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "{status}: {}",
+                    crate::local::harness::one_line(&body, 300)
+                ));
+            }
+            let response: Value = response.json().await?;
             response
                 .pointer("/data/text")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .ok_or_else(|| anyhow!("OpenCode generation returned no text"))
+                .ok_or_else(|| anyhow!("returned no reply"))
         })
         .await
-        .map_err(|_| anyhow!("OpenCode generation timed out"))
+        .map_err(|_| anyhow!("timed out after {}s", timeout.as_secs()))
         .and_then(|result| result);
         let _ = child.kill().await;
         let _ = child.wait().await;
