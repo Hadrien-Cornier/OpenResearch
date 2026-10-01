@@ -784,6 +784,11 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn clear_native_scope(&self, execution_id: &str, prefix: &str) -> Result<()> {
+        self.conn.execute("UPDATE native_usage_baselines SET totals_json = NULL WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, prefix])?;
+        Ok(())
+    }
+
     /// Native scopes under `prefix`, flagged when their execution is open and no live process
     /// holds it (a dead process left it). Call before recovery closes them.
     pub(crate) fn native_scopes(

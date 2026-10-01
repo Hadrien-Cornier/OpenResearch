@@ -146,6 +146,95 @@ fn table_has_session(connection: &Connection, table: &str, id: &str) -> Result<b
     )?)
 }
 
+/// A V2 session's info and messages straight from its database, in the shapes its HTTP API returns
+/// (row `data` plus `id`/`type`); `None` once the session is gone.
+pub(crate) fn v2_history(path: &Path, id: &str) -> Result<Option<serde_json::Value>> {
+    let connection = open_readonly(path)?;
+    let Some(parent) = connection
+        .query_row(
+            "SELECT parent_id FROM session_v2 WHERE id = ?1",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut query = connection
+        .prepare("SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq")?;
+    let messages = query
+        .query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .map(|row| {
+            let (id, kind, data) = row?;
+            let mut message: serde_json::Value = serde_json::from_str(&data)?;
+            message["id"] = id.into();
+            message["type"] = kind.into();
+            Ok(message)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(
+        serde_json::json!({"data":{"info":{"id":id,"parentID":parent},"messages":messages}}),
+    ))
+}
+
+/// Whether native V2 still claims an unfinished turn in the session (only a terminal event
+/// releases the claim).
+pub(crate) fn v2_unfinished(path: &Path, id: &str) -> Result<bool> {
+    let connection = open_readonly(path)?;
+    if !has_columns(&connection, "session_v2", &["time_suspended"])? {
+        return Ok(false);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT time_suspended IS NOT NULL FROM session_v2 WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// A V1 session's `GET /session/{id}/message` straight from its database; `None` once it is gone.
+pub(crate) fn v1_history(path: &Path, id: &str) -> Result<Option<serde_json::Value>> {
+    let connection = open_readonly(path)?;
+    if !table_has_session(&connection, "session", id)? {
+        return Ok(None);
+    }
+    let triples = |sql: &str| -> Result<Vec<(String, String, String)>> {
+        let mut query = connection.prepare(sql)?;
+        let rows = query.query_map([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    };
+    let mut parts = std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
+    for (part, message, data) in triples(
+        "SELECT id, message_id, data FROM part WHERE session_id = ?1 ORDER BY message_id, id",
+    )? {
+        let mut data: serde_json::Value = serde_json::from_str(&data)?;
+        data["id"] = part.into();
+        data["messageID"] = message.clone().into();
+        data["sessionID"] = id.into();
+        parts.entry(message).or_default().push(data);
+    }
+    let messages = triples(
+        "SELECT id, session_id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id",
+    )?
+    .into_iter()
+    .map(|(message, _, data)| {
+        let mut info: serde_json::Value = serde_json::from_str(&data)?;
+        info["id"] = message.clone().into();
+        info["sessionID"] = id.into();
+        Ok(serde_json::json!({"info": info, "parts": parts.remove(&message).unwrap_or_default()}))
+    })
+    .collect::<Result<Vec<_>>>()?;
+    Ok(Some(messages.into()))
+}
+
 pub(super) fn has_session(path: &Path, id: &str) -> Result<bool> {
     let state = inspect(path)?;
     if state == DatabaseState::Empty {
@@ -561,6 +650,15 @@ fn check_integrity(path: &Path) -> Result<()> {
 }
 
 fn ensure_no_external_users(database: &Path) -> Result<()> {
+    if held_elsewhere(database, &[])? {
+        return Err(anyhow!("OpenCode database is open in another process. Close other OpenCode processes and retry."));
+    }
+    Ok(())
+}
+
+/// Whether a process other than this one and `own` (its OpenCode servers) holds `database` open.
+/// Windows cannot name the holders, so any holder counts.
+pub(crate) fn held_elsewhere(database: &Path, own: &[u32]) -> Result<bool> {
     let paths = [
         database.to_path_buf(),
         sidecar(database, "-wal"),
@@ -582,24 +680,25 @@ fn ensure_no_external_users(database: &Path) -> Result<()> {
             ));
         }
         let own_pid = std::process::id();
-        if String::from_utf8_lossy(&output.stdout)
+        Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| line.strip_prefix('p'))
             .filter_map(|pid| pid.parse::<u32>().ok())
-            .any(|pid| pid != own_pid)
-        {
-            return Err(anyhow!("OpenCode database is open in another process. Close other OpenCode processes and retry."));
-        }
+            .any(|pid| pid != own_pid && !own.contains(&pid)))
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        for path in paths.iter().filter(|path| path.exists()) {
-            OpenOptions::new().read(true).write(true).share_mode(0).open(path)
-                .map_err(|error| anyhow!("OpenCode database is open in another process. Close other OpenCode processes and retry: {error}"))?;
-        }
+        let _ = own;
+        Ok(paths.iter().filter(|path| path.exists()).any(|path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(path)
+                .is_err()
+        }))
     }
-    Ok(())
 }
 
 fn referenced_sessions(database: &Path) -> Result<BTreeSet<String>> {

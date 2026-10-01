@@ -4,9 +4,12 @@ use crate::local::opencode::AgentEndpoint;
 use futures::future::{BoxFuture, FutureExt};
 
 async fn get(endpoint: &AgentEndpoint, path: &str) -> Result<Value> {
-    Ok(endpoint
-        .client
-        .get(format!("{}{path}", endpoint.base_url))
+    fetch(&endpoint.client, &endpoint.base_url, path).await
+}
+
+async fn fetch(client: &reqwest::Client, base: &str, path: &str) -> Result<Value> {
+    Ok(client
+        .get(format!("{base}{path}"))
         .send()
         .await?
         .error_for_status()?
@@ -23,6 +26,38 @@ async fn post(endpoint: &AgentEndpoint, path: &str, body: &Value) -> Result<()> 
         .await?
         .error_for_status()?;
     Ok(())
+}
+
+/// A session's export shape from its message list: native export drops unsettled steps (no
+/// `time.completed`), which an OpenCode restart leaves unsettled for good.
+async fn transcript(history: History<'_>, session: &str) -> Result<Value> {
+    let (client, base) = match history {
+        History::Server(client, base) => (client, base),
+        History::Database(path) => {
+            return stored(path, session, native_store::opencode_database::v2_history).await
+        }
+    };
+    // Info first, so the messages read after it are at least as new as its outcome.
+    let info = fetch(client, base, &format!("/api/session/{session}")).await?;
+    let mut messages = Vec::new();
+    let mut page = "order=asc".to_owned();
+    loop {
+        let list = fetch(
+            client,
+            base,
+            &format!("/api/session/{session}/message?limit=200&{page}"),
+        )
+        .await?;
+        let items = list["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("OpenCode V2 message list is invalid"))?;
+        messages.extend(items.iter().cloned());
+        match list.pointer("/cursor/next").and_then(Value::as_str) {
+            Some(cursor) if items.len() == 200 => page = format!("cursor={cursor}"),
+            _ => break,
+        }
+    }
+    Ok(json!({"data":{"info":info["data"],"messages":messages}}))
 }
 
 pub(super) async fn run_turn(
@@ -87,7 +122,7 @@ pub(super) async fn run_turn(
     if let Some(model) = model {
         post(&endpoint, &format!("{path}/model"), &json!({"model":model})).await?;
     }
-    let before = get(&endpoint, &endpoint.v2_export_path(&native_id)).await?;
+    let before = transcript((&endpoint).into(), &native_id).await?;
     let previous: HashSet<String> = messages(&before)?
         .iter()
         .filter_map(|m| m["id"].as_str().map(str::to_owned))
@@ -95,6 +130,11 @@ pub(super) async fn run_turn(
     let prompt_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let started_at = crate::store::now_ms();
     let mut captured = Captured::default();
+    persist_scope(
+        ctx,
+        json!({"v2": true, "native": native_id, "startedAt": started_at, "roots": [],
+            "prompt": prompt_id}),
+    );
     track_turn(ctx, &native_id, started_at);
     ctx.persist_delivery(DeliveryState::Unknown)?;
     // A transport failure can follow durable admission. Never replay this POST.
@@ -111,8 +151,8 @@ pub(super) async fn run_turn(
     let mut was_idle = false;
     let result: Result<()> = async {
         loop {
-            // ponytail: full projected history polling; switch to paged durable log if long chats make this costly.
-            let projection = get(&endpoint, &endpoint.v2_export_path(&native_id)).await?;
+            // ponytail: full history (200-message pages) each poll; switch to the durable event log if long chats make this costly.
+            let projection = transcript((&endpoint).into(), &native_id).await?;
             let current = messages(&projection)?;
             let delivered = current.iter().any(|m| m["id"].as_str() == Some(&prompt_id));
             merge_projection(
@@ -153,7 +193,7 @@ pub(super) async fn run_turn(
             }
             let running = active.contains_key(&native_id);
             if observed_idle(&mut was_idle, queued, running) {
-                let final_projection = get(&endpoint, &endpoint.v2_export_path(&native_id)).await?;
+                let final_projection = transcript((&endpoint).into(), &native_id).await?;
                 let final_messages = messages(&final_projection)?;
                 let delivered = delivered
                     || final_messages
@@ -197,12 +237,16 @@ pub(super) async fn run_turn(
         .iter()
         .filter_map(|child| Some((child.clone(), captured.descendants.get(child)?.clone())))
         .collect();
-    if !roots.is_empty() {
-        hold_and_watch(
-            ctx,
-            json!({"v2": true, "native": native_id, "startedAt": started_at, "roots": roots}),
-        );
-    }
+    // A failed turn may have missed root steps: keep watching the prompt's run.
+    let root = result.is_err();
+    hold_and_watch(
+        ctx,
+        (root || !roots.is_empty()).then(|| {
+            json!({"v2": true, "native": native_id, "startedAt": started_at, "roots": roots,
+                "prompt": root.then_some(&prompt_id)})
+        }),
+        &endpoint.base_url,
+    );
     result
 }
 
@@ -274,9 +318,15 @@ async fn merge_projection(
         let mut parts = projected_parts(message);
         for (part, content) in &mut parts {
             if let Some(child) = subagent_session(content, native_id, captured) {
-                part.children =
-                    subagent_children(&*ctx, endpoint, native_id, child, started_at, captured)
-                        .await?;
+                part.children = subagent_children(
+                    &*ctx,
+                    endpoint.into(),
+                    native_id,
+                    child,
+                    started_at,
+                    captured,
+                )
+                .await?;
             }
         }
         for (part, _) in parts {
@@ -309,7 +359,7 @@ impl Captured {
         }
     }
 
-    fn sessions(&self, native_id: &str) -> Vec<String> {
+    pub(super) fn sessions(&self, native_id: &str) -> Vec<String> {
         std::iter::once(native_id.to_string())
             .chain(self.descendants.keys().cloned())
             .collect()
@@ -329,7 +379,7 @@ impl Captured {
     }
 }
 
-/// The session a settled `subagent` tool part of `parent` ran, noting a background one.
+/// The session a `subagent` tool part of `parent` runs, noting a background one.
 fn subagent_session<'a>(
     content: &'a Value,
     parent: &str,
@@ -342,7 +392,10 @@ fn subagent_session<'a>(
     captured
         .descendants
         .insert(child.to_owned(), parent.to_owned());
-    if content.pointer("/state/metadata/status") == Some(&json!("running")) {
+    // A foreground subagent's part also reports `running` until the part itself settles.
+    if content.pointer("/state/status") != Some(&json!("running"))
+        && content.pointer("/state/metadata/status") == Some(&json!("running"))
+    {
         captured.background.insert(child.to_owned());
     }
     Some(child)
@@ -352,14 +405,14 @@ fn subagent_session<'a>(
 /// depth. A continued subagent session also holds earlier turns' messages.
 fn subagent_children<'a>(
     sink: &'a dyn UsageSink,
-    endpoint: &'a AgentEndpoint,
+    history: History<'a>,
     parent_id: &'a str,
     child_id: &'a str,
     started_at: i64,
     captured: &'a mut Captured,
 ) -> BoxFuture<'a, Result<Vec<WirePart>>> {
     async move {
-        let child = get(endpoint, &endpoint.v2_export_path(child_id)).await?;
+        let child = transcript(history, child_id).await?;
         if child.pointer("/data/info/parentID").and_then(Value::as_str) != Some(parent_id) {
             return Err(anyhow!("OpenCode returned an unrelated subagent session"));
         }
@@ -386,7 +439,7 @@ fn subagent_children<'a>(
                     .flatten()
                 {
                     part.children = subagent_children(
-                        sink, endpoint, child_id, grandchild, started_at, captured,
+                        sink, history, child_id, grandchild, started_at, captured,
                     )
                     .await?;
                 }
@@ -491,7 +544,16 @@ pub(super) async fn capture_interrupted(
 ) {
     let mut captured = Captured::default();
     wait_idle(endpoint, &[native_id.to_string()]).await;
-    let _ = capture_tree(sink, endpoint, native_id, started_at, &mut captured, false).await;
+    let _ = capture_tree(
+        sink,
+        endpoint.into(),
+        native_id,
+        started_at,
+        &mut captured,
+        false,
+        None,
+    )
+    .await;
     let background: Vec<String> = captured.background.iter().cloned().collect();
     if !background.is_empty() {
         for session in &background {
@@ -511,7 +573,16 @@ pub(super) async fn capture_interrupted(
         )
         .await;
         wait_idle(endpoint, &captured.sessions(native_id)).await;
-        let _ = capture_tree(sink, endpoint, native_id, started_at, &mut captured, false).await;
+        let _ = capture_tree(
+            sink,
+            endpoint.into(),
+            native_id,
+            started_at,
+            &mut captured,
+            false,
+            None,
+        )
+        .await;
     }
     for session in captured.sessions(native_id) {
         observe_retry(
@@ -531,7 +602,7 @@ pub(super) async fn capture_interrupted(
 pub(super) async fn poll_background(
     sink: &dyn UsageSink,
     endpoint: &AgentEndpoint,
-    native_id: &str,
+    (native_id, prompt): (&str, Option<&str>),
     roots: &[(String, String)],
     started_at: i64,
     captured: &mut Captured,
@@ -539,7 +610,7 @@ pub(super) async fn poll_background(
     // Read before capturing, so a session idle here has settled everything captured below.
     let active = get(endpoint, "/api/session/active").await?;
     for (child, parent) in roots {
-        subagent_children(sink, endpoint, parent, child, started_at, captured).await?;
+        subagent_children(sink, endpoint.into(), parent, child, started_at, captured).await?;
     }
     let parents: HashSet<String> = std::iter::once(native_id.to_string())
         .chain(
@@ -551,7 +622,19 @@ pub(super) async fn poll_background(
         .collect();
     let mut delivered = HashSet::new();
     for parent in &parents {
-        delivered.extend(capture_tree(sink, endpoint, parent, started_at, captured, true).await?);
+        let prompt = prompt.filter(|_| parent == native_id);
+        delivered.extend(
+            capture_tree(
+                sink,
+                endpoint.into(),
+                parent,
+                started_at,
+                captured,
+                true,
+                prompt,
+            )
+            .await?,
+        );
     }
     let busy = parents
         .iter()
@@ -590,6 +673,18 @@ fn woken_runs(messages: &[Value]) -> HashMap<String, String> {
     woken
 }
 
+/// Message ids of `prompt`'s own run: everything after it until the next prompt, or the native
+/// idle marker that closes the turn.
+fn prompt_run<'a>(messages: &'a [Value], prompt: &str) -> HashSet<&'a str> {
+    messages
+        .iter()
+        .skip_while(|message| message["id"] != prompt)
+        .skip(1)
+        .take_while(|message| !matches!(message["type"].as_str(), Some("user" | "idle")))
+        .filter_map(|message| message["id"].as_str())
+        .collect()
+}
+
 fn woken_deliveries(messages: &[Value]) -> impl Iterator<Item = String> + '_ {
     messages
         .iter()
@@ -606,31 +701,37 @@ fn foreign_run(message: &Value, woken: &HashMap<String, String>, captured: &Capt
 }
 
 /// `woken_only`: after the turn, only runs its own subagents' results woke (later turns' own
-/// messages belong to them). Returns the subagents whose results `native_id` received.
-async fn capture_tree(
+/// messages belong to them), plus `prompt`'s own run if given. Returns the subagents whose results
+/// `native_id` received.
+pub(super) async fn capture_tree(
     sink: &dyn UsageSink,
-    endpoint: &AgentEndpoint,
+    history: History<'_>,
     native_id: &str,
     started_at: i64,
     captured: &mut Captured,
     woken_only: bool,
+    prompt: Option<&str>,
 ) -> Result<HashSet<String>> {
-    let projection = get(endpoint, &endpoint.v2_export_path(native_id)).await?;
+    let projection = transcript(history, native_id).await?;
     let all = messages(&projection)?;
     let woken = woken_runs(all);
+    let run = prompt
+        .map(|prompt| prompt_run(all, prompt))
+        .unwrap_or_default();
     for message in all.iter().filter(|m| {
         m.pointer("/time/created")
             .and_then(Value::as_i64)
             .is_some_and(|created| created >= started_at)
     }) {
-        let is_woken = woken.contains_key(message["id"].as_str().unwrap_or_default());
-        if foreign_run(message, &woken, captured) || (woken_only && !is_woken) {
+        let id = message["id"].as_str().unwrap_or_default();
+        let owned = woken.contains_key(id) || run.contains(id);
+        if foreign_run(message, &woken, captured) || (woken_only && !owned) {
             continue;
         }
         capture(sink, message, false, captured);
         for content in message["content"].as_array().into_iter().flatten() {
             if let Some(child) = subagent_session(content, native_id, captured) {
-                subagent_children(sink, endpoint, native_id, child, started_at, captured).await?;
+                subagent_children(sink, history, native_id, child, started_at, captured).await?;
             }
         }
     }
@@ -1215,7 +1316,6 @@ mod tests {
     /// its real child export plus an earlier turn's step from a continued subagent session.
     #[tokio::test]
     async fn native_v2_turn_captures_each_step_once_and_only_this_turns_child_steps() {
-        use axum::{routing::get, Json, Router};
         let fixture: Value =
             serde_json::from_str(include_str!("fixtures/opencode-v2-export.json")).unwrap();
         let main = messages(&fixture["main"]).unwrap().clone();
@@ -1228,13 +1328,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .insert(0, earlier);
-        let app = Router::new().route(
-            "/api/session/{id}/export",
-            get(move || {
-                let child = child.clone();
-                async move { Json(child) }
-            }),
-        );
+        let app = transcripts(move |_| child.clone(), json!({"data":[]}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = AgentEndpoint {
             base_url: format!("http://{}", listener.local_addr().unwrap()),
@@ -1345,6 +1439,41 @@ mod tests {
         }
     }
 
+    /// Serves `export(session)` as V2's session info and message list; a newest-first read (as
+    /// [`observe_retry`] makes) gets `latest`.
+    fn transcripts(
+        export: impl Fn(&str) -> Value + Clone + Send + Sync + 'static,
+        latest: Value,
+    ) -> axum::Router {
+        use axum::{
+            extract::{Path, Query},
+            routing::get,
+            Json, Router,
+        };
+        let info = export.clone();
+        Router::new()
+            .route(
+                "/api/session/{id}",
+                get(move |Path(id): Path<String>| {
+                    let data = info(&id)["data"]["info"].clone();
+                    async move { Json(json!({"data": data})) }
+                }),
+            )
+            .route(
+                "/api/session/{id}/message",
+                get(
+                    move |Path(id): Path<String>, Query(query): Query<HashMap<String, String>>| {
+                        let page = if query.get("order").map(String::as_str) == Some("desc") {
+                            latest.clone()
+                        } else {
+                            json!({"data": export(&id)["data"]["messages"], "cursor": {}})
+                        };
+                        async move { Json(page) }
+                    },
+                ),
+            )
+    }
+
     /// A fake V2 server over fixed session exports. `active` answers `/api/session/active` in turn
     /// (the last repeats); interrupts are logged.
     async fn fake_v2(
@@ -1356,25 +1485,11 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
     ) {
-        use axum::{extract::Path, routing::get, routing::post, Json, Router};
+        use axum::{extract::Path, routing::get, routing::post, Json};
         let interrupts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = interrupts.clone();
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let app = Router::new()
-            .route(
-                "/api/session/{id}/export",
-                get(move |Path(id): Path<String>| {
-                    let export = exports[&id].clone();
-                    async move { Json(export) }
-                }),
-            )
-            .route(
-                "/api/session/{id}/message",
-                get(move || {
-                    let latest = latest.clone();
-                    async move { Json(latest) }
-                }),
-            )
+        let app = transcripts(move |id| exports[id].clone(), latest)
             .route(
                 "/api/session/active",
                 get(move || {
@@ -1555,9 +1670,17 @@ mod tests {
         .await;
         let recorded = super::super::tests::Recorded::default();
         let mut captured = Captured::default();
-        capture_tree(&recorded, &endpoint, main, started_at, &mut captured, false)
-            .await
-            .unwrap();
+        capture_tree(
+            &recorded,
+            (&endpoint).into(),
+            main,
+            started_at,
+            &mut captured,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         server.abort();
         assert_eq!(
             captured.descendants["ses_f0c08d898ffeAtB9QwOBElycQc"],
@@ -1587,9 +1710,17 @@ mod tests {
         .await;
         let recorded = super::super::tests::Recorded::default();
         let mut captured = Captured::default();
-        capture_tree(&recorded, &endpoint, main, started_at, &mut captured, false)
-            .await
-            .unwrap();
+        capture_tree(
+            &recorded,
+            (&endpoint).into(),
+            main,
+            started_at,
+            &mut captured,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         server.abort();
         assert_eq!(
             captured.background,
@@ -1614,11 +1745,12 @@ mod tests {
         let later = super::super::tests::Recorded::default();
         capture_tree(
             &later,
-            &endpoint,
+            (&endpoint).into(),
             main,
             1790799270000,
             &mut Captured::default(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1681,7 +1813,7 @@ mod tests {
     /// the same watcher retries and captures the step that finishes once the server answers again.
     #[tokio::test]
     async fn background_watch_retries_a_failed_status_read_until_the_tree_is_quiet() {
-        use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+        use axum::{http::StatusCode, routing::get, Json, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let polls = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = polls.clone();
@@ -1699,9 +1831,8 @@ mod tests {
                     }
                 }),
             )
-            .route(
-                "/api/session/{id}/export",
-                get(move |Path(id): Path<String>| {
+            .merge(transcripts(
+                move |id| {
                     // The step settles only after the status outage.
                     let mut bg = step("msg_bg", "ses_bg", "bg-model", 13, json!([]));
                     if seen.load(Ordering::SeqCst) < 3 {
@@ -1709,15 +1840,14 @@ mod tests {
                     }
                     let delivery = json!({"id":"msg_d","type":"synthetic","time":{"created":20},
                         "metadata":{"source":"subagent","childID":"ses_bg"}});
-                    async move {
-                        Json(if id == "ses_bg" {
-                            export("ses_bg", Some("ses_main"), vec![bg])
-                        } else {
-                            export("ses_main", None, vec![delivery])
-                        })
+                    if id == "ses_bg" {
+                        export("ses_bg", Some("ses_main"), vec![bg])
+                    } else {
+                        export("ses_main", None, vec![delivery])
                     }
-                }),
-            );
+                },
+                json!({"data":[]}),
+            ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = AgentEndpoint {
             base_url: format!("http://{}", listener.local_addr().unwrap()),
@@ -1739,6 +1869,468 @@ mod tests {
         assert_eq!(samples["msg_bg"].1.input_tokens, Some(10));
         assert!(samples["msg_bg"].2);
         assert!(!samples.contains_key("opencode-background:unrecoverable"));
+    }
+
+    /// Real beta-19271 restart: a background child's streamed step never settles, so it is read from
+    /// the message list; replays record it once, a never-sent step nothing, failed reads retry.
+    #[tokio::test]
+    async fn restart_recovers_an_unsettled_background_step() {
+        use axum::{routing::get, Json};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const CHILD: &str = "ses_f0b57ccd6ffeJEVH5aWpJ2tsh8";
+        const PARENT: &str = "ses_f0b60a09effeOCZeRrax8lxEZt";
+        const STEP: &str = "msg_0f4a8337e001Nn559YxJ92dNZD";
+        let unsettled = json!({"id":STEP,"sessionID":CHILD,"type":"assistant","agent":"general",
+            "model":{"id":"big-pickle","providerID":"opencode","variant":"default"},
+            "content":[{"type":"text","text":"I'll run the sleep once."},
+                {"type":"tool","id":"call_function_ihoznrnawkj1_1","name":"shell","executed":false,
+                "state":{"status":"running","input":{"command":"sleep 180","timeout":200000},"metadata":{}},
+                "time":{"created":1790811060749i64,"ran":1790811060800i64}}],
+            "time":{"created":1790811060567i64,"streamed":1790811060802i64}});
+        let unsent = json!({"id":"msg_unsent","sessionID":CHILD,"type":"assistant",
+            "model":{"id":"other-model","providerID":"opencode"},"content":[],
+            "time":{"created":1790811060900i64}});
+        let scope = json!({"v2": true, "native": PARENT, "startedAt": 1790811053399i64,
+            "roots": [[CHILD, PARENT]]});
+        let mut replays = Vec::new();
+        for _ in 0..2 {
+            let reads = std::sync::Arc::new(AtomicUsize::new(0));
+            let (unsettled, unsent) = (unsettled.clone(), unsent.clone());
+            let app = transcripts(
+                move |id| {
+                    if id != CHILD {
+                        return export(PARENT, None, vec![]);
+                    }
+                    // Info, then the first message-list read, which fails.
+                    if reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                        return Value::Null;
+                    }
+                    export(CHILD, Some(PARENT), vec![unsettled.clone(), unsent.clone()])
+                },
+                json!({"data":[]}),
+            )
+            .route(
+                "/api/session/active",
+                get(|| async { Json(json!({"data":{}})) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = AgentEndpoint {
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                client: reqwest::Client::new(),
+                protocol: crate::local::opencode::Protocol::V2,
+                legacy_v2_api: false,
+            };
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let recorded = super::super::tests::Recorded::default();
+            super::super::settle_watch(&recorded, &scope, super::super::tests::live(endpoint))
+                .await;
+            server.abort();
+            assert_eq!(
+                recorded.invokers.into_inner().unwrap()[&format!("{STEP}:1")],
+                "big-pickle"
+            );
+            assert!(recorded
+                .evidence
+                .into_inner()
+                .unwrap()
+                .iter()
+                .any(|part| part.id == format!("{STEP}:1")));
+            replays.push(json!(recorded.samples.into_inner().unwrap()));
+        }
+        let exact = crate::store::Attribution::Exact {
+            model: "big-pickle".into(),
+            provider: Some("opencode".into()),
+        };
+        let expected = json!({STEP: [exact, crate::store::TokenUsage::default(), false]});
+        assert_eq!(replays, [expected.clone(), expected]);
+    }
+
+    /// A native V2 database at `path` holding `sessions` (id, parent, claimed, messages).
+    fn v2_database(path: &std::path::Path, sessions: &[(&str, Option<&str>, bool, Vec<Value>)]) {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, time_suspended INTEGER); CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, data TEXT);").unwrap();
+        for (id, parent, claimed, messages) in sessions {
+            let claimed = claimed.then_some(1);
+            db.execute(
+                "INSERT INTO session_v2 VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, parent, claimed],
+            )
+            .unwrap();
+            for (seq, message) in messages.iter().enumerate() {
+                let mut data = message.clone();
+                let data_map = data.as_object_mut().unwrap();
+                let (message_id, kind) = (
+                    data_map.remove("id").unwrap(),
+                    data_map.remove("type").unwrap(),
+                );
+                db.execute(
+                    "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        message_id.as_str(),
+                        id,
+                        kind.as_str(),
+                        seq as i64,
+                        data.to_string()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn user(id: &str, created: i64) -> Value {
+        json!({"id":id,"type":"user","text":"t","time":{"created":created}})
+    }
+
+    /// V2 crash recovery reads the native database, starting no server: the prompt's unsettled run
+    /// and its child only; an unreadable database retries and replays add no counters.
+    #[tokio::test]
+    async fn restart_recovers_the_prompt_run_from_the_native_database() {
+        let mut root = step(
+            "msg_root",
+            "ses_main",
+            "root-model",
+            13,
+            json!([subagent("ses_child", "completed")]),
+        );
+        root["tokens"] = Value::Null;
+        root["time"]["completed"] = Value::Null;
+        let main = vec![
+            user("msg_older", 5),
+            step("msg_old", "ses_main", "old-model", 11, json!([])),
+            user("msg_prompt", 12),
+            root,
+            json!({"id":"msg_d","type":"synthetic","time":{"created":14},
+                "metadata":{"source":"subagent","childID":"ses_earlier_bg"}}),
+            step("msg_foreign", "ses_main", "foreign-model", 15, json!([])),
+            json!({"id":"msg_idle","type":"idle","outcome":"succeeded","time":{"created":16}}),
+            step("msg_after_idle", "ses_main", "idle-model", 17, json!([])),
+            user("msg_later", 20),
+            step("msg_later_step", "ses_main", "later-model", 21, json!([])),
+        ];
+        let child = vec![step("msg_child", "ses_child", "child-model", 13, json!([]))];
+        let measured = opencode_sample(Some(&child[0]["tokens"])).0;
+        let dir = std::env::temp_dir().join(format!("orx-oc-v2db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (staged, database) = (dir.join("staged.db"), dir.join("opencode.db"));
+        v2_database(
+            &staged,
+            &[
+                ("ses_main", None, false, main),
+                ("ses_child", Some("ses_main"), false, child),
+            ],
+        );
+        // The database is unreadable until it appears.
+        let appear = tokio::spawn({
+            let database = database.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::fs::rename(staged, database).unwrap();
+            }
+        });
+        let (store, db) = super::super::tests::usage_store();
+        let sink = super::super::tests::StoreSink(std::sync::Mutex::new(store));
+        let scope =
+            json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_prompt"});
+        let (live, held) = (|| async { None }, || async { false });
+        super::super::settle_stored(&sink, &scope, &database, live, held).await;
+        appear.await.unwrap();
+        let first = super::super::tests::ledger(&db);
+        super::super::settle_stored(&sink, &scope, &database, live, held).await;
+        assert_eq!(super::super::tests::ledger(&db), first);
+        let rows: Vec<(String, crate::store::Attribution, crate::store::TokenUsage)> = first
+            .into_iter()
+            .map(|(id, attribution, usage)| {
+                let attribution = serde_json::from_str(&attribution).unwrap();
+                (id, attribution, serde_json::from_str(&usage).unwrap())
+            })
+            .collect();
+        let exact = |model: &str| crate::store::Attribution::Exact {
+            model: model.into(),
+            provider: Some("p".into()),
+        };
+        assert_eq!(
+            rows,
+            [
+                ("msg_child".to_string(), exact("child-model"), measured),
+                (
+                    "msg_root".to_string(),
+                    exact("root-model"),
+                    crate::store::TokenUsage::default()
+                ),
+            ]
+        );
+    }
+
+    /// Recovery never seals partial work as complete: an unfinished native turn, a database another
+    /// process holds past the grace, or a lost session each leave that session's own marker.
+    #[tokio::test]
+    async fn stored_recovery_marks_partial_work_with_the_lost_sessions_reason() {
+        use crate::store::{Attribution::Unresolved, Missing};
+        let root = step(
+            "msg_root",
+            "ses_main",
+            "root-model",
+            13,
+            json!([subagent("ses_child", "completed")]),
+        );
+        let child = (
+            "ses_child",
+            Some("ses_main"),
+            false,
+            vec![step("msg_child", "ses_child", "child-model", 13, json!([]))],
+        );
+        let main = |claimed| {
+            (
+                "ses_main",
+                None,
+                claimed,
+                vec![user("msg_prompt", 12), root.clone()],
+            )
+        };
+        let root_lost = ("opencode-root:unrecoverable", Missing::IdentityNotReported);
+        let child_lost = (
+            "opencode-background:unrecoverable",
+            Missing::ChildModelUnknown,
+        );
+        for (sessions, held, (marker, reason), recorded_samples) in [
+            (vec![main(true), child.clone()], false, root_lost, 3),
+            (vec![main(false), child.clone()], true, root_lost, 3),
+            (vec![child.clone()], false, root_lost, 1),
+            (vec![main(false)], false, child_lost, 2),
+        ] {
+            let path =
+                std::env::temp_dir().join(format!("orx-oc-v2db-{}.db", uuid::Uuid::new_v4()));
+            v2_database(&path, &sessions);
+            let recorded = super::super::tests::Recorded::default();
+            let scope = json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],
+                "prompt":"msg_prompt"});
+            super::super::settle_stored(
+                &recorded,
+                &scope,
+                &path,
+                || async { None },
+                || async { held },
+            )
+            .await;
+            let samples = recorded.samples.into_inner().unwrap();
+            assert_eq!(samples[marker].0, Unresolved { reason }, "{marker} {held}");
+            assert_eq!(samples.len(), recorded_samples, "{samples:?}");
+        }
+    }
+
+    /// While the turn's own server still runs its tree, recovery waits for it rather than sealing;
+    /// that server, not the database's other holders, says when the work settled.
+    #[tokio::test]
+    async fn stored_recovery_waits_for_the_turns_own_server() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = std::env::temp_dir().join(format!("orx-oc-v2db-{}.db", uuid::Uuid::new_v4()));
+        let root = step("msg_root", "ses_main", "root-model", 13, json!([]));
+        v2_database(
+            &path,
+            &[("ses_main", None, false, vec![user("msg_prompt", 12), root])],
+        );
+        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = polls.clone();
+        let app = Router::new().route(
+            "/api/session/active",
+            get(move || async move {
+                let busy = seen.fetch_add(1, Ordering::SeqCst) < 2;
+                Json(if busy {
+                    json!({"data":{"ses_main":{}}})
+                } else {
+                    json!({"data":{}})
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = AgentEndpoint {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            client: reqwest::Client::new(),
+            protocol: crate::local::opencode::Protocol::V2,
+            legacy_v2_api: false,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let recorded = super::super::tests::Recorded::default();
+        let scope =
+            json!({"v2":true,"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_prompt"});
+        let live = || {
+            let endpoint = endpoint.clone();
+            async move { Some(endpoint) }
+        };
+        super::super::settle_stored(&recorded, &scope, &path, live, || async { true }).await;
+        server.abort();
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        let samples = recorded.samples.into_inner().unwrap();
+        assert_eq!(samples.keys().collect::<Vec<_>>(), ["msg_root"]);
+    }
+
+    /// A 404 on a session's info read is confirmed natively and ends the watch once with that
+    /// session's reason; a 404 on the active list names no session and is retried.
+    #[tokio::test]
+    async fn a_missing_session_ends_the_watch_with_its_own_reason() {
+        use crate::store::{Attribution::Unresolved, Missing};
+        use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (gone, marker) in [
+            (
+                "ses_main",
+                Some(("opencode-root:unrecoverable", Missing::IdentityNotReported)),
+            ),
+            (
+                "ses_bg",
+                Some((
+                    "opencode-background:unrecoverable",
+                    Missing::ChildModelUnknown,
+                )),
+            ),
+            ("active", None),
+        ] {
+            let actives = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route(
+                    "/api/session/active",
+                    get(move || async move {
+                        if gone == "active" && actives.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(StatusCode::NOT_FOUND)
+                        } else {
+                            Ok(Json(json!({"data":{}})))
+                        }
+                    }),
+                )
+                .route(
+                    "/api/session/{id}",
+                    get(move |Path(id): Path<String>| async move {
+                        let parent = (id == "ses_bg").then_some("ses_main");
+                        if id == gone {
+                            Err(StatusCode::NOT_FOUND)
+                        } else {
+                            Ok(Json(json!({"data":{"id":id,"parentID":parent}})))
+                        }
+                    }),
+                )
+                .route(
+                    "/api/session/{id}/message",
+                    get(|| async { Json(json!({"data":[],"cursor":{}})) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = AgentEndpoint {
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                client: reqwest::Client::new(),
+                protocol: crate::local::opencode::Protocol::V2,
+                legacy_v2_api: false,
+            };
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let confirmed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = super::super::tests::Recorded::default();
+            let scope = json!({"v2":true,"native":"ses_main","startedAt":10,
+                "roots":[["ses_bg","ses_main"]],"prompt":"msg_prompt"});
+            let endpoint = |missing: Option<String>| {
+                let (endpoint, confirmed) = (endpoint.clone(), confirmed.clone());
+                async move {
+                    match missing {
+                        Some(session) => {
+                            confirmed.lock().unwrap().push(session.clone());
+                            Err(anyhow!("OpenCode session {session} no longer exists"))
+                        }
+                        None => Ok(Some(endpoint)),
+                    }
+                }
+            };
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                super::super::settle_watch(&recorded, &scope, endpoint),
+            )
+            .await
+            .expect("a confirmed 404 ends the watch");
+            server.abort();
+            let samples = recorded.samples.into_inner().unwrap();
+            match marker {
+                Some((marker, reason)) => {
+                    assert_eq!(*confirmed.lock().unwrap(), [gone]);
+                    assert_eq!(samples[marker].0, Unresolved { reason });
+                    assert_eq!(samples.len(), 1);
+                }
+                None => assert!(samples.is_empty() && confirmed.lock().unwrap().is_empty()),
+            }
+        }
+    }
+
+    /// Histories past one page follow native's `cursor.next` (never combined with `order`) until a
+    /// short page, oldest first; a full last page ends on the empty page after it.
+    #[tokio::test]
+    async fn transcript_pages_through_long_histories() {
+        use axum::{
+            extract::{Path, Query},
+            http::StatusCode,
+            routing::get,
+            Json, Router,
+        };
+        for total in [450, 400] {
+            let all: Vec<Value> = (0..total)
+                .map(|i| json!({"id":format!("msg_{i:03}"),"type":"user"}))
+                .collect();
+            let pages = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let served = pages.clone();
+            let app = Router::new()
+                .route(
+                    "/api/session/{id}",
+                    get(|Path(id): Path<String>| async move { Json(json!({"data":{"id":id}})) }),
+                )
+                .route(
+                    "/api/session/{id}/message",
+                    get(move |Query(query): Query<HashMap<String, String>>| {
+                        served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Native: the first page needs `order=asc` (default desc), a cursor excludes it.
+                        let start = match (query.get("cursor"), query.get("order")) {
+                            (Some(cursor), None) => cursor[2..].parse::<usize>().unwrap() + 1,
+                            (None, Some(order)) if order == "asc" => 0,
+                            _ => return std::future::ready(Err(StatusCode::BAD_REQUEST)),
+                        };
+                        let limit: usize = query["limit"].parse().unwrap();
+                        assert!(limit <= 200);
+                        let page = &all[start.min(all.len())..(start + limit).min(all.len())];
+                        let next = page.last().map(|_| format!("c:{}", start + page.len() - 1));
+                        std::future::ready(Ok(Json(json!({"data":page,"cursor":{"next":next}}))))
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = AgentEndpoint {
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                client: reqwest::Client::new(),
+                protocol: crate::local::opencode::Protocol::V2,
+                legacy_v2_api: false,
+            };
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let got = transcript((&endpoint).into(), "ses_long").await.unwrap();
+            server.abort();
+            let ids: Vec<String> = messages(&got)
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_owned())
+                .collect();
+            let expected: Vec<String> = (0..total).map(|i| format!("msg_{i:03}")).collect();
+            assert_eq!(ids, expected);
+            assert_eq!(got.pointer("/data/info/id"), Some(&json!("ses_long")));
+            assert_eq!(pages.load(std::sync::atomic::Ordering::SeqCst), 3);
+        }
+    }
+
+    /// A foreground subagent's part reports `running` until it settles; only a settled part whose
+    /// subagent still runs is a background one.
+    #[test]
+    fn only_a_settled_spawn_is_background() {
+        let mut captured = Captured::default();
+        let mut running = subagent("ses_fg", "running");
+        running["state"]["status"] = json!("running");
+        assert_eq!(
+            subagent_session(&running, "ses_main", &mut captured),
+            Some("ses_fg")
+        );
+        subagent_session(&subagent("ses_bg", "running"), "ses_main", &mut captured);
+        assert_eq!(captured.background, HashSet::from(["ses_bg".to_string()]));
+        assert_eq!(captured.descendants.len(), 2);
     }
 
     /// A run a background grandchild's result woke in a continued child session belongs to the turn
@@ -1810,9 +2402,17 @@ mod tests {
         // Turn B (started at 20) continues the child session: the woken run is not its own.
         let later = super::super::tests::Recorded::default();
         let mut captured = Captured::default();
-        capture_tree(&later, &endpoint, "ses_main", 20, &mut captured, false)
-            .await
-            .unwrap();
+        capture_tree(
+            &later,
+            (&endpoint).into(),
+            "ses_main",
+            20,
+            &mut captured,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         let mut ids: Vec<_> = later.samples.into_inner().unwrap().into_keys().collect();
         ids.sort();
         assert_eq!(ids, ["msg_b", "msg_child_b"]);

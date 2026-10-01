@@ -1627,7 +1627,13 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     if let Some(variant) = opencode_variant(ctx.reasoning_level.as_deref()) {
         body["variant"] = json!(variant);
     }
+    let prompt_id = v1_prompt_id();
+    body["messageID"] = json!(prompt_id);
     let turn_started_at = crate::store::now_ms();
+    persist_scope(
+        ctx,
+        json!({"native": native_id, "startedAt": turn_started_at, "roots": [], "prompt": prompt_id}),
+    );
     track_turn(ctx, &native_id, turn_started_at);
     let send = ctx
         .http()
@@ -1729,20 +1735,23 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     .await;
     let captured = capture_v1(
         &*ctx,
-        ctx.http(),
-        &base,
+        History::Server(ctx.http(), &base),
         vec![(native_id.clone(), None)],
-        turn_started_at,
+        (turn_started_at, None),
     )
     .await;
     ctx.host.opencode.untrack(&ctx.session_id);
-    if !captured.background.is_empty() {
-        hold_and_watch(
-            ctx,
+    // A failed turn or read may have missed root steps: keep watching the prompt's run.
+    let root = result.is_err() || captured.failed.is_some();
+    hold_and_watch(
+        ctx,
+        (root || !captured.background.is_empty()).then(|| {
             json!({"native": native_id, "startedAt": turn_started_at,
-                "roots": captured.background, "parents": captured.parents}),
-        );
-    }
+                "roots": captured.background, "parents": captured.parents,
+                "prompt": root.then_some(&prompt_id)})
+        }),
+        &base,
+    );
     result
 }
 
@@ -1750,13 +1759,12 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 /// subagent session a `task` part names (grandchildren included). Runs after the live stream,
 /// which can miss the final events, after an interrupt dropped the turn, and for background
 /// subagents that outlive it. `roots` pairs each session with the `WirePart.id` of the task part
-/// that spawned it (`None` for the chat's own session).
+/// that spawned it (`None` for the chat's own session, bounded to `prompt`'s run when given).
 async fn capture_v1(
     sink: &impl UsageSink,
-    http: &reqwest::Client,
-    base: &str,
+    history: History<'_>,
     roots: Vec<(String, Option<String>)>,
-    started_at: i64,
+    (started_at, prompt): (i64, Option<&str>),
 ) -> V1Capture {
     let mut pending = roots;
     let mut captured = V1Capture::default();
@@ -1766,26 +1774,29 @@ async fn capture_v1(
         if !captured.visited.insert(session.clone()) {
             continue;
         }
-        let request = http.get(format!("{base}/session/{session}/message")).send();
-        let messages = match tokio::time::timeout(Duration::from_secs(10), async {
-            request.await?.error_for_status()?.json::<Value>().await
-        })
-        .await
-        {
-            Ok(Ok(messages)) => messages,
-            Ok(Err(error)) => {
+        let messages = match v1_history(history, &session).await {
+            Ok(messages) => messages,
+            Err(error) => {
                 eprintln!("orx up: could not reconcile OpenCode usage for {session}: {error}");
-                captured.failed = Some(error.into());
-                continue;
-            }
-            Err(_) => {
-                eprintln!("orx up: timed out reconciling OpenCode usage for {session}");
-                captured.failed = Some(anyhow!("timed out reading OpenCode session {session}"));
+                captured.failed = Some(error);
                 continue;
             }
         };
         let deliveries = v1_deliveries(&messages);
+        let run = prompt
+            .filter(|_| spawn.is_none())
+            .map(|prompt| v1_prompt_run(&messages, prompt));
         for message in v1_turn_messages(&messages, started_at) {
+            if run.as_ref().is_some_and(|run| {
+                !run.contains(
+                    message
+                        .pointer("/info/id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                )
+            }) {
+                continue;
+            }
             // A run a background result woke natively belongs to the execution owning that subagent.
             let woken_by = v1_woken_by(message, &deliveries);
             if woken_by.is_some_and(|child| !captured.background.iter().any(|(bg, _)| bg == child))
@@ -1829,6 +1840,58 @@ async fn capture_v1(
     captured
 }
 
+/// Where native history is read: a session's server, or its database when no server may run.
+#[derive(Clone, Copy)]
+pub(super) enum History<'a> {
+    Server(&'a reqwest::Client, &'a str),
+    Database(&'a std::path::Path),
+}
+
+impl<'a> From<&'a AgentEndpoint> for History<'a> {
+    fn from(endpoint: &'a AgentEndpoint) -> Self {
+        Self::Server(&endpoint.client, &endpoint.base_url)
+    }
+}
+
+/// A session its native database no longer holds.
+#[derive(Debug)]
+struct SessionGone(String);
+
+impl std::fmt::Display for SessionGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpenCode session {} no longer exists", self.0)
+    }
+}
+
+impl std::error::Error for SessionGone {}
+
+/// Reads a session's history from its native database off the async runtime.
+async fn stored(
+    database: &std::path::Path,
+    session: &str,
+    read: fn(&std::path::Path, &str) -> Result<Option<Value>>,
+) -> Result<Value> {
+    let (path, id) = (database.to_path_buf(), session.to_string());
+    tokio::task::spawn_blocking(move || read(&path, &id))
+        .await??
+        .ok_or_else(|| SessionGone(session.to_string()).into())
+}
+
+async fn v1_history(history: History<'_>, session: &str) -> Result<Value> {
+    let (http, base) = match history {
+        History::Server(http, base) => (http, base),
+        History::Database(path) => {
+            return stored(path, session, native_store::opencode_database::v1_history).await
+        }
+    };
+    let request = http.get(format!("{base}/session/{session}/message")).send();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        Ok(request.await?.error_for_status()?.json::<Value>().await?)
+    })
+    .await
+    .map_err(|_| anyhow!("timed out reading OpenCode session {session}"))?
+}
+
 #[derive(Default)]
 struct V1Capture {
     visited: HashSet<String>,
@@ -1846,7 +1909,7 @@ struct V1Capture {
 async fn poll_v1_background(
     sink: &impl UsageSink,
     endpoint: &AgentEndpoint,
-    started_at: i64,
+    (started_at, prompt): (i64, Option<&str>),
     roots: &mut Vec<(String, Option<String>)>,
     parents: &mut HashSet<String>,
     owned: &mut HashSet<String>,
@@ -1874,7 +1937,7 @@ async fn poll_v1_background(
             }
         }
     }
-    let captured = capture_v1(sink, http, base, roots.clone(), started_at).await;
+    let captured = capture_v1(sink, endpoint.into(), roots.clone(), (started_at, prompt)).await;
     if let Some(error) = captured.failed {
         return Err(error);
     }
@@ -2005,6 +2068,27 @@ fn v1_turn_messages(messages: &Value, started_at: i64) -> impl Iterator<Item = &
                     .and_then(Value::as_i64)
                     .is_some_and(|created| created >= started_at)
         })
+}
+
+/// A V1 prompt id orx submits: native's ascending time prefix, then a `-` native ids never hold.
+fn v1_prompt_id() -> String {
+    let time = (crate::store::now_ms() as u64).wrapping_mul(0x1000) & 0xffff_ffff_ffff;
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    format!("msg_{time:012x}-orx{}", &random[..10])
+}
+
+/// Message ids of `prompt`'s run: everything after it until orx's next prompt. Native's own user
+/// messages (compaction, subtask summaries, result deliveries) stay inside the run.
+fn v1_prompt_run<'a>(messages: &'a Value, prompt: &str) -> HashSet<&'a str> {
+    messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.pointer("/info/id")?.as_str())
+        .skip_while(|id| *id != prompt)
+        .skip(1)
+        .take_while(|id| !id.contains("-orx"))
+        .collect()
 }
 
 /// The native model OpenCode ran an assistant message on (`modelID`/`providerID`).
@@ -2204,11 +2288,13 @@ impl UsageSink for ExecutionSink {
 }
 
 impl ExecutionSink {
-    /// Closes a held execution now if its turn already ended.
+    /// Closes a held execution now if its turn already ended; its tree is read, so a restart has
+    /// nothing left to adopt.
     fn release(&self) {
-        if let Err(error) = crate::store::Store::open()
-            .and_then(|store| store.release_usage_execution(&self.execution_id))
-        {
+        if let Err(error) = crate::store::Store::open().and_then(|store| {
+            store.clear_native_scope(&self.execution_id, BACKGROUND_SCOPE)?;
+            store.release_usage_execution(&self.execution_id)
+        }) {
             eprintln!("orx up: could not release OpenCode usage: {error}");
         }
     }
@@ -2224,14 +2310,39 @@ fn execution_sink(ctx: &TurnCtx) -> Option<ExecutionSink> {
     })
 }
 
-/// Holds this turn's execution open past the turn for its background subagents and watches them;
-/// the watcher releases it once they settle, and the shared finalize closes it with the turn's
-/// outcome. The persisted scope lets a restart finish reading their history.
-fn hold_and_watch(ctx: &TurnCtx, mut scope: Value) {
+/// Persists what a restart adopts to finish this turn's capture; written before submission, so a
+/// crash at any point leaves it.
+fn persist_scope(ctx: &TurnCtx, mut scope: Value) -> Value {
+    scope["session"] = json!(ctx.session_id);
+    scope["model"] = json!(ctx.model);
+    if let Err(error) = execution_sink(ctx)
+        .ok_or_else(|| anyhow!("no open usage execution"))
+        .and_then(|sink| {
+            crate::store::Store::open()?.set_native_scope(
+                &sink.execution_id,
+                BACKGROUND_SCOPE,
+                &scope,
+            )
+        })
+    {
+        eprintln!("orx up: could not persist OpenCode scope: {error}");
+    }
+    scope
+}
+
+/// Holds and watches this turn's execution while `scope` has native history left to read; the
+/// watcher releases it once settled. `None` clears the scope: the turn captured everything.
+fn hold_and_watch(ctx: &TurnCtx, scope: Option<Value>, original: &str) {
     let Some(sink) = execution_sink(ctx) else {
         return;
     };
     let Ok(store) = crate::store::Store::open() else {
+        return;
+    };
+    let Some(scope) = scope else {
+        if let Err(error) = store.clear_native_scope(&sink.execution_id, BACKGROUND_SCOPE) {
+            eprintln!("orx up: could not clear OpenCode scope: {error}");
+        }
         return;
     };
     if !store
@@ -2240,12 +2351,9 @@ fn hold_and_watch(ctx: &TurnCtx, mut scope: Value) {
     {
         return;
     }
-    scope["session"] = json!(ctx.session_id);
-    scope["model"] = json!(ctx.model);
-    if let Err(error) = store.set_native_scope(&sink.execution_id, BACKGROUND_SCOPE, &scope) {
-        eprintln!("orx up: could not persist OpenCode background scope: {error}");
-    }
-    tokio::spawn(watch_held(ctx.host.opencode.clone(), sink, scope));
+    let scope = persist_scope(ctx, scope);
+    let original = Some(original.to_string());
+    tokio::spawn(watch_held(ctx.host.opencode.clone(), sink, scope, original));
 }
 
 const BACKGROUND_SCOPE: &str = "opencode-background";
@@ -2276,18 +2384,187 @@ pub(crate) fn recover_adopted_background(agent: std::sync::Arc<crate::local::ope
             execution_id,
             session_id: scope["session"].as_str().unwrap_or_default().to_string(),
         };
-        tokio::spawn(watch_held(agent.clone(), sink, scope));
+        tokio::spawn(watch_held(agent.clone(), sink, scope, None));
     }
 }
 
+/// `original`: the base URL of the server that ran the turn, when this process started it.
 async fn watch_held(
     agent: std::sync::Arc<crate::local::opencode::AgentHost>,
     sink: ExecutionSink,
     scope: Value,
+    original: Option<String>,
 ) {
-    let endpoint = |missing| background_endpoint(&agent, &sink.session_id, &scope, missing);
-    settle_watch(&sink, &scope, endpoint).await;
+    if scope["prompt"].is_string() && scope["roots"].as_array().is_some_and(Vec::is_empty) {
+        // Starting a server would resume native work, so a root scope reads the native database.
+        let session = sink.session_id.as_str();
+        let native = scope["native"].as_str().unwrap_or_default().to_string();
+        let database = loop {
+            let id = native.clone();
+            match tokio::task::spawn_blocking(move || native_store::opencode_session(&id))
+                .await
+                .map_err(crate::error::Error::from)
+                .and_then(|found| found)
+            {
+                Ok(location) => break location,
+                Err(error) => eprintln!("orx up: retrying OpenCode root capture: {error}"),
+            }
+            tokio::time::sleep(BACKGROUND_POLL).await;
+        };
+        let Some(database) = database else {
+            record_unrecoverable(&sink, &SessionGone(native).into(), false);
+            return sink.release();
+        };
+        let live = || async {
+            let endpoint = agent.endpoint_for(session).await?;
+            (Some(&endpoint.base_url) == original.as_ref()).then_some(endpoint)
+        };
+        let held = || async {
+            let (path, own) = (database.path.clone(), agent.child_pids().await);
+            tokio::task::spawn_blocking(move || {
+                native_store::opencode_database::held_elsewhere(&path, &own)
+            })
+            .await
+            .map_or(true, |held| held.unwrap_or(true))
+        };
+        settle_stored(&sink, &scope, &database.path, live, held).await;
+    } else {
+        let endpoint = |missing| background_endpoint(&agent, &sink.session_id, &scope, missing);
+        settle_watch(&sink, &scope, endpoint).await;
+    }
     sink.release();
+}
+
+/// How a root scope's native work stood at one read of its database.
+enum Stored {
+    /// Nothing more will run; `unfinished`: native never finished the turn.
+    Settled { unfinished: bool },
+    /// The turn's own server still runs its tree.
+    Running,
+    /// Another process holds the database, so work may continue unseen.
+    Held,
+}
+
+/// Captures a root scope's prompt run and descendants from its native database until it settles;
+/// work left unfinished, or a holder outlasting the grace, seals it with a partial marker.
+async fn settle_stored<F, G>(
+    sink: &impl UsageSink,
+    scope: &Value,
+    database: &std::path::Path,
+    live: impl Fn() -> F,
+    held: impl Fn() -> G,
+) where
+    F: std::future::Future<Output = Option<AgentEndpoint>>,
+    G: std::future::Future<Output = bool>,
+{
+    let (Some(native), Some(started_at), Some(prompt)) = (
+        scope["native"].as_str(),
+        scope["startedAt"].as_i64(),
+        scope["prompt"].as_str(),
+    ) else {
+        return record_unrecoverable(sink, &anyhow!("invalid OpenCode scope"), false);
+    };
+    let history = History::Database(database);
+    let mut captured = v2::Captured::default();
+    let mut waited = 0;
+    loop {
+        let polled: Result<Stored> = async {
+            // Read before capturing, so a tree found idle has persisted everything captured below.
+            let active = match live().await {
+                Some(endpoint) => Some(active_sessions(&endpoint).await?),
+                None => None,
+            };
+            let held = active.is_none() && held().await;
+            let sessions: Vec<String> = if scope["v2"] == true {
+                v2::capture_tree(
+                    sink,
+                    history,
+                    native,
+                    started_at,
+                    &mut captured,
+                    true,
+                    Some(prompt),
+                )
+                .await?;
+                captured.sessions(native)
+            } else {
+                let capture = capture_v1(
+                    sink,
+                    history,
+                    vec![(native.to_string(), None)],
+                    (started_at, Some(prompt)),
+                )
+                .await;
+                if let Some(error) = capture.failed {
+                    return Err(error);
+                }
+                capture.visited.into_iter().collect()
+            };
+            Ok(match active {
+                Some(active) if sessions.iter().any(|session| active.contains(session)) => {
+                    Stored::Running
+                }
+                _ if held => Stored::Held,
+                _ => Stored::Settled {
+                    unfinished: scope["v2"] == true && {
+                        let (path, id) = (database.to_path_buf(), native.to_string());
+                        tokio::task::spawn_blocking(move || {
+                            native_store::opencode_database::v2_unfinished(&path, &id)
+                        })
+                        .await??
+                    },
+                },
+            })
+        }
+        .await;
+        match polled {
+            Ok(Stored::Settled { unfinished }) => {
+                if unfinished {
+                    let why = anyhow!(
+                        "OpenCode left the turn unfinished; resumed work is not this execution's"
+                    );
+                    record_unrecoverable(sink, &why, false);
+                }
+                return;
+            }
+            Ok(Stored::Held) if waited >= DELIVERY_GRACE_POLLS => {
+                let why = anyhow!("another process still holds the OpenCode database");
+                return record_unrecoverable(sink, &why, false);
+            }
+            Ok(Stored::Held) => waited += 1,
+            Ok(Stored::Running) => {}
+            Err(error) => match error.downcast_ref::<SessionGone>() {
+                Some(SessionGone(session)) => {
+                    return record_unrecoverable(sink, &error, session != native)
+                }
+                None => eprintln!("orx up: retrying OpenCode root capture: {error}"),
+            },
+        }
+        tokio::time::sleep(BACKGROUND_POLL).await;
+    }
+}
+
+/// Sessions the server is running now.
+async fn active_sessions(endpoint: &AgentEndpoint) -> Result<HashSet<String>> {
+    let (path, pointer) = match endpoint.protocol {
+        crate::local::opencode::Protocol::V1 => ("/session/status", ""),
+        crate::local::opencode::Protocol::V2 => ("/api/session/active", "/data"),
+    };
+    let status: Value = endpoint
+        .client
+        .get(format!("{}{path}", endpoint.base_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(status
+        .pointer(pointer)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("OpenCode session status is invalid"))?
+        .keys()
+        .cloned()
+        .collect())
 }
 
 /// Watches until the tree settles. Native failures retry on the next poll; history that is gone for
@@ -2298,12 +2575,14 @@ async fn settle_watch<F: std::future::Future<Output = Result<Option<AgentEndpoin
     scope: &Value,
     endpoint: impl Fn(Option<String>) -> F,
 ) {
+    let mut confirming = None;
     let watched = async {
         let mut watch = Watch::from_scope(scope)?;
         let mut waited = 0;
         let mut missing = None;
         loop {
-            if let Some(endpoint) = endpoint(missing.take()).await? {
+            confirming = missing.take();
+            if let Some(endpoint) = endpoint(confirming.clone()).await? {
                 match watch.poll(sink, &endpoint).await {
                     Ok((busy, undelivered))
                         if busy.is_empty() && (!undelivered || waited >= DELIVERY_GRACE_POLLS) =>
@@ -2321,7 +2600,12 @@ async fn settle_watch<F: std::future::Future<Output = Result<Option<AgentEndpoin
         }
     };
     if let Err(gone) = watched.await {
-        record_unrecoverable(sink, &gone);
+        // The turn's own history is lost only while its prompt's run was still to read.
+        let root = scope["prompt"].is_string()
+            && confirming
+                .as_deref()
+                .is_none_or(|session| Some(session) == scope["native"].as_str());
+        record_unrecoverable(sink, &gone, !root);
     }
 }
 
@@ -2333,19 +2617,25 @@ fn not_found_session(error: &crate::error::Error) -> Option<String> {
     }
     let mut segments = error.url()?.path_segments()?;
     segments.find(|segment| *segment == "session")?;
-    let session = segments.next()?;
     // `…/session/status` and `…/session/active` name no session.
-    segments.next()?;
-    Some(session.to_string())
+    segments
+        .next()
+        .filter(|session| !matches!(*session, "status" | "active"))
+        .map(str::to_string)
 }
 
-/// Stands in for the background requests whose native history could not be read.
-fn record_unrecoverable(sink: &impl UsageSink, why: &crate::error::Error) {
-    eprintln!("orx up: OpenCode background usage is unrecoverable: {why}");
+/// Stands in for the requests whose native history could not be read: the turn's own (`child`
+/// false) or its subagents'.
+fn record_unrecoverable(sink: &impl UsageSink, why: &crate::error::Error, child: bool) {
+    eprintln!("orx up: OpenCode usage is unrecoverable: {why}");
     sink.sample(
-        "opencode-background:unrecoverable",
+        if child {
+            "opencode-background:unrecoverable"
+        } else {
+            "opencode-root:unrecoverable"
+        },
         crate::store::Attribution::Unresolved {
-            reason: crate::store::Missing::ChildModelUnknown,
+            reason: opencode_missing(child),
         },
         crate::store::TokenUsage::default(),
         false,
@@ -2363,6 +2653,7 @@ enum WatchTree {
     V1 {
         /// Sessions captured whole, each with the `WirePart.id` of the task part that spawned it.
         roots: Vec<(String, Option<String>)>,
+        prompt: Option<String>,
         /// Sessions the subagents report their results to.
         parents: HashSet<String>,
         owned: HashSet<String>,
@@ -2371,6 +2662,8 @@ enum WatchTree {
     V2 {
         roots: Vec<(String, String)>,
         captured: v2::Captured,
+        /// The turn's submitted prompt, when its own run is still to capture.
+        prompt: Option<String>,
     },
 }
 
@@ -2386,6 +2679,7 @@ impl Watch {
         let pairs = roots
             .iter()
             .filter_map(|root| Some((root.get(0)?.as_str()?.to_string(), root.get(1)?)));
+        let prompt = scope["prompt"].as_str().map(str::to_string);
         let tree = if scope["v2"] == true {
             let roots: Vec<(String, String)> = pairs
                 .filter_map(|(child, parent)| Some((child, parent.as_str()?.to_string())))
@@ -2393,13 +2687,20 @@ impl Watch {
             WatchTree::V2 {
                 captured: v2::Captured::watching(&roots),
                 roots,
+                prompt,
             }
         } else {
-            let roots: Vec<(String, Option<String>)> = pairs
+            let mut roots: Vec<(String, Option<String>)> = pairs
                 .map(|(child, spawn)| (child, spawn.as_str().map(str::to_string)))
                 .collect();
+            let owned = roots.iter().map(|(child, _)| child.clone()).collect();
+            // The chat session itself: its prompt's run, which `capture_v1` bounds by `prompt`.
+            if prompt.is_some() {
+                roots.push((native_id.to_string(), None));
+            }
             WatchTree::V1 {
-                owned: roots.iter().map(|(child, _)| child.clone()).collect(),
+                prompt,
+                owned,
                 parents: scope["parents"]
                     .as_array()
                     .into_iter()
@@ -2428,6 +2729,7 @@ impl Watch {
         match &mut self.tree {
             WatchTree::V1 {
                 roots,
+                prompt,
                 parents,
                 owned,
                 delivered,
@@ -2435,7 +2737,7 @@ impl Watch {
                 poll_v1_background(
                     sink,
                     endpoint,
-                    self.started_at,
+                    (self.started_at, prompt.as_deref()),
                     roots,
                     parents,
                     owned,
@@ -2443,11 +2745,15 @@ impl Watch {
                 )
                 .await
             }
-            WatchTree::V2 { roots, captured } => {
+            WatchTree::V2 {
+                roots,
+                captured,
+                prompt,
+            } => {
                 v2::poll_background(
                     sink,
                     endpoint,
-                    &self.native_id,
+                    (&self.native_id, prompt.as_deref()),
                     roots,
                     self.started_at,
                     captured,
@@ -2613,16 +2919,21 @@ pub(crate) async fn capture_interrupted(
         crate::local::opencode::Protocol::V1 => {
             capture_v1(
                 &turn.sink,
-                &endpoint.client,
-                &endpoint.base_url,
+                endpoint.into(),
                 vec![(turn.native_id.clone(), None)],
-                turn.started_at,
+                (turn.started_at, None),
             )
             .await;
         }
         crate::local::opencode::Protocol::V2 => {
             v2::capture_interrupted(endpoint, &turn.sink, &turn.native_id, turn.started_at).await
         }
+    }
+    // The interrupt stopped the whole tree, so a restart has nothing left to adopt.
+    if let Err(error) = crate::store::Store::open()
+        .and_then(|store| store.clear_native_scope(&turn.sink.execution_id, BACKGROUND_SCOPE))
+    {
+        eprintln!("orx up: could not clear OpenCode scope: {error}");
     }
 }
 
@@ -3812,6 +4123,163 @@ opencode/unknown
         }
     }
 
+    /// Records into execution `exec` of a real store, as [`ExecutionSink`] does.
+    pub(super) struct StoreSink(pub(super) Mutex<crate::store::Store>);
+
+    impl UsageSink for StoreSink {
+        fn sample(
+            &self,
+            id: &str,
+            attribution: crate::store::Attribution,
+            usage: crate::store::TokenUsage,
+            complete: bool,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .record_attributed_sample("exec", id, "opencode", &attribution, &usage, complete)
+                .unwrap();
+        }
+        fn invoker(&self, _: &str, _: &str, _: Option<&str>) {}
+    }
+
+    /// An open execution `exec` in a fresh store, and a connection to read its ledger rows.
+    pub(super) fn usage_store() -> (crate::store::Store, rusqlite::Connection) {
+        let dir = std::env::temp_dir().join(format!("orx-oc-usage-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::Store::open_at(dir.clone()).unwrap();
+        let db = rusqlite::Connection::open(dir.join("orx.db")).unwrap();
+        db.execute_batch("INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('turn', 'session', 'message', 'c', 'h', '', '{}', 'running', 'accepted', 1, 1);").unwrap();
+        store
+            .begin_usage_execution("exec", "turn", "opencode")
+            .unwrap();
+        (store, db)
+    }
+
+    /// Each ledger row of `exec`: sample id → (attribution, usage), as reports read them.
+    pub(super) fn ledger(db: &rusqlite::Connection) -> Vec<(String, String, String)> {
+        db.prepare("SELECT sample_id, attribution_json, usage_json FROM chat_usage_samples WHERE execution_id = 'exec' ORDER BY sample_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// A scope persisted before submission is never held, so a crash leaves it adoptable; a turn that
+    /// captured everything clears it.
+    #[test]
+    fn a_pre_submission_scope_is_adoptable_until_cleared() {
+        let (store, _db) = usage_store();
+        let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":"msg_p"});
+        store
+            .set_native_scope("exec", BACKGROUND_SCOPE, &scope)
+            .unwrap();
+        assert_eq!(
+            store.native_scopes(BACKGROUND_SCOPE).unwrap(),
+            [("exec".into(), BACKGROUND_SCOPE.into(), scope, true)]
+        );
+        store.clear_native_scope("exec", BACKGROUND_SCOPE).unwrap();
+        assert!(store.native_scopes(BACKGROUND_SCOPE).unwrap().is_empty());
+    }
+
+    /// V1 crash recovery reads the native database, starting no server: the prompt's run (across
+    /// native compaction) and its child only; an unreadable database retries, replays add nothing.
+    #[tokio::test]
+    async fn v1_restart_recovers_the_prompt_run_from_the_native_database() {
+        const PROMPT: &str = "msg_0f4a81d5e000-orxabcdefghij";
+        let step = |session: &str, id: &str, model: &str, created: i64, tool: Option<Value>| {
+            let mut parts = vec![
+                json!({"id":format!("{id}_1"),"messageID":id,"sessionID":session,"type":"step-start"}),
+            ];
+            parts.extend(tool);
+            parts.push(json!({"id":format!("{id}_9"),"messageID":id,"sessionID":session,"type":"step-finish",
+                "tokens":{"input":7,"output":3,"reasoning":0,"cache":{"read":0,"write":0}}}));
+            json!({"info":{"id":id,"sessionID":session,"role":"assistant","modelID":model,"providerID":"p",
+                "time":{"created":created}},"parts":parts})
+        };
+        let user = |id: &str, created: i64| json!({"info":{"id":id,"sessionID":"ses_main","role":"user","time":{"created":created}},"parts":[]});
+        let task = json!({"id":"msg_root_5","type":"tool","tool":"task","state":{"status":"completed",
+            "input":{},"output":"","metadata":{"sessionId":"ses_child","background":false}}});
+        let main = vec![
+            user("msg_0f4a00000000-orxolderolder", 5),
+            step("ses_main", "msg_old", "old-model", 11, None),
+            user(PROMPT, 12),
+            step("ses_main", "msg_root", "root-model", 13, Some(task)),
+            user("msg_0f4a81d5e0011NativeCompac", 14),
+            step("ses_main", "msg_compacted", "compact-model", 15, None),
+            user("msg_0f4a81d5f000-orxlaterlater", 20),
+            step("ses_main", "msg_later", "later-model", 21, None),
+        ];
+        let child = vec![step("ses_child", "msg_child", "child-model", 13, None)];
+        let dir = std::env::temp_dir().join(format!("orx-oc-v1db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (staged, database) = (dir.join("staged.db"), dir.join("opencode.db"));
+        let db = rusqlite::Connection::open(&staged).unwrap();
+        db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY); CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);").unwrap();
+        for (session, messages) in [("ses_main", main), ("ses_child", child)] {
+            db.execute("INSERT INTO session VALUES (?1)", [session])
+                .unwrap();
+            for mut message in messages {
+                let info = message["info"].as_object_mut().unwrap();
+                let id = info.remove("id").unwrap();
+                info.remove("sessionID");
+                let created = info["time"]["created"].as_i64();
+                let data = Value::Object(info.clone()).to_string();
+                db.execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![id.as_str(), session, created, data],
+                )
+                .unwrap();
+                for mut part in message["parts"].as_array().unwrap().clone() {
+                    let part = part.as_object_mut().unwrap();
+                    let part_id = part.remove("id").unwrap();
+                    part.remove("messageID");
+                    part.remove("sessionID");
+                    let data = Value::Object(part.clone()).to_string();
+                    db.execute(
+                        "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![part_id.as_str(), id.as_str(), session, data],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        drop(db);
+        // The database is unreadable until it appears.
+        let appear = tokio::spawn({
+            let database = database.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::fs::rename(staged, database).unwrap();
+            }
+        });
+        let (store, db) = usage_store();
+        let sink = StoreSink(Mutex::new(store));
+        let scope = json!({"native":"ses_main","startedAt":10,"roots":[],"prompt":PROMPT});
+        let (live, held) = (|| async { None }, || async { false });
+        settle_stored(&sink, &scope, &database, live, held).await;
+        appear.await.unwrap();
+        let first = ledger(&db);
+        settle_stored(&sink, &scope, &database, live, held).await;
+        assert_eq!(ledger(&db), first);
+        let models: Vec<(String, crate::store::Attribution)> = first
+            .into_iter()
+            .map(|(id, attribution, _)| (id, serde_json::from_str(&attribution).unwrap()))
+            .collect();
+        let exact = |model: &str| crate::store::Attribution::Exact {
+            model: model.into(),
+            provider: Some("p".into()),
+        };
+        assert_eq!(
+            models,
+            [
+                ("msg_child_1".to_string(), exact("child-model")),
+                ("msg_compacted_1".to_string(), exact("compact-model")),
+                ("msg_root_1".to_string(), exact("root-model")),
+            ]
+        );
+    }
+
     /// A hold a dead process left (background subagents still to read) is adopted at startup, so
     /// generic recovery cannot close it on that process's last snapshot before its native history
     /// is captured; its scope carries what recovery needs. History gone for good closes it with the
@@ -3857,30 +4325,6 @@ opencode/unknown
         let adopted = std::mem::take(&mut *ADOPTED.lock().unwrap());
         assert_eq!(adopted, [("exec".to_string(), scope.clone())]);
 
-        struct StoreSink(Mutex<crate::store::Store>);
-        impl UsageSink for StoreSink {
-            fn sample(
-                &self,
-                id: &str,
-                attribution: crate::store::Attribution,
-                usage: crate::store::TokenUsage,
-                complete: bool,
-            ) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .record_attributed_sample(
-                        "exec",
-                        id,
-                        "opencode",
-                        &attribution,
-                        &usage,
-                        complete,
-                    )
-                    .unwrap();
-            }
-            fn invoker(&self, _: &str, _: &str, _: Option<&str>) {}
-        }
         let partial = crate::store::TokenUsage {
             input_tokens: Some(5),
             output_tokens: Some(2),
@@ -4027,10 +4471,9 @@ opencode/unknown
         let later = Recorded::default();
         capture_v1(
             &later,
-            &http,
-            &base,
+            History::Server(&http, &base),
             vec![("ses_main".to_string(), None)],
-            150,
+            (150, None),
         )
         .await;
         server.abort();
@@ -4169,10 +4612,9 @@ opencode/unknown
         let recorded = Recorded::default();
         let captured = capture_v1(
             &recorded,
-            &reqwest::Client::new(),
-            &base,
+            History::Server(&reqwest::Client::new(), &base),
             vec![(MAIN.to_string(), None)],
-            started_at,
+            (started_at, None),
         )
         .await;
         server.abort();
@@ -4240,10 +4682,9 @@ opencode/unknown
         let recorded = Recorded::default();
         capture_v1(
             &recorded,
-            &reqwest::Client::new(),
-            &base,
+            History::Server(&reqwest::Client::new(), &base),
             vec![(main, None)],
-            started_at,
+            (started_at, None),
         )
         .await;
         server.abort();
@@ -4310,10 +4751,9 @@ opencode/unknown
         let recorded = Recorded::default();
         capture_v1(
             &recorded,
-            &reqwest::Client::new(),
-            &base,
+            History::Server(&reqwest::Client::new(), &base),
             vec![(main, None)],
-            started_at,
+            (started_at, None),
         )
         .await;
         server.abort();
@@ -4473,17 +4913,22 @@ opencode/unknown
         // Turn A's own capture holds the grandchild and notes the session its result reports to.
         let turn_a = capture_v1(
             &Recorded::default(),
-            &http,
-            &base,
+            History::Server(&http, &base),
             vec![("ses_main".into(), None)],
-            10,
+            (10, None),
         )
         .await;
         assert_eq!(turn_a.parents, HashSet::from(["ses_child".to_string()]));
 
         // Turn B continues the child session and never accounts the woken run.
         let later = Recorded::default();
-        capture_v1(&later, &http, &base, vec![("ses_main".into(), None)], 20).await;
+        capture_v1(
+            &later,
+            History::Server(&http, &base),
+            vec![("ses_main".into(), None)],
+            (20, None),
+        )
+        .await;
         let later = later.samples.into_inner().unwrap();
         assert!(later.contains_key("msg_child_b_s"));
         assert!(!later.contains_key("msg_child_woken_s"));
