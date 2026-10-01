@@ -25,8 +25,9 @@ pub fn open_browser(url: &str) {
 pub fn has_display() -> bool {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     if !is_wsl() {
-        return std::env::var_os("DISPLAY").is_some()
-            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        return ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .any(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()));
     }
     true
 }
@@ -86,4 +87,28 @@ fn is_wsl() -> bool {
         || std::env::var_os("WSL_DISTRO_NAME").is_some()
         || std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #[test]
+    fn empty_or_missing_display_is_headless() {
+        if super::is_wsl() {
+            return;
+        }
+        let saved = ["DISPLAY", "WAYLAND_DISPLAY"].map(|var| (var, std::env::var_os(var)));
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("DISPLAY");
+        assert!(!super::has_display());
+        std::env::set_var("DISPLAY", "");
+        assert!(!super::has_display());
+        std::env::set_var("DISPLAY", ":0");
+        assert!(super::has_display());
+        for (var, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
 }
