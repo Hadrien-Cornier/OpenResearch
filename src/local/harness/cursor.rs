@@ -171,8 +171,9 @@ impl Harness for Cursor {
             .map_err(|error| TurnFailure::adapter(error, ctx.delivery_state()))
     }
 
-    async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        cursor_one_shot(&find_cursor()?, request).await
+    async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
+        let bin = find_cursor().ok_or_else(|| anyhow!("{} is not installed", self.name()))?;
+        cursor_one_shot(&bin, request).await
     }
 
     fn options(&self) -> HarnessOptions {
@@ -571,7 +572,7 @@ fn cursor_exit_detail(status: std::process::ExitStatus, log: &Path) -> String {
     })
 }
 
-async fn cursor_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
+async fn cursor_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
     let message = format!("{}\n\n{}", request.system, request.prompt);
     let mut cmd = Command::new(bin);
     cmd.args([
@@ -589,30 +590,35 @@ async fn cursor_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .current_dir(std::env::temp_dir());
     prepare_env(&mut cmd);
     let cursor_home =
         tokio::task::spawn_blocking(|| native_store::prepare_cursor(NativeStore::Isolated))
-            .await
-            .ok()?
-            .ok()?;
+            .await??;
     cmd.env("CURSOR_CONFIG_DIR", &cursor_home);
     cmd.env("CURSOR_DATA_DIR", &cursor_home);
     cmd.env("NO_COLOR", "1");
     let out = tokio::time::timeout(request.timeout, async {
-        let mut child = cmd.spawn().ok()?;
-        send_prompt(&mut child, &message).await.ok()?;
-        child.wait_with_output().await.ok()
+        let mut child = cmd.spawn()?;
+        send_prompt(&mut child, &message).await?;
+        Ok::<_, crate::error::Error>(child.wait_with_output().await?)
     })
     .await
-    .ok()??;
+    .map_err(|_| anyhow!("timed out after {}s", request.timeout.as_secs()))??;
     if !out.status.success() {
-        return None;
+        let detail = cursor_cli_error(&String::from_utf8_lossy(&out.stderr));
+        return Err(match detail {
+            Some(detail) => anyhow!("{}", super::one_line(&detail, 300)),
+            None => super::one_shot_exit_error(out.status, &[&out.stdout]),
+        });
     }
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+    if text.is_empty() {
+        return Err(anyhow!("returned no reply"));
+    }
+    Ok(text)
 }
 
 async fn send_prompt(child: &mut tokio::process::Child, prompt: &str) -> Result<()> {

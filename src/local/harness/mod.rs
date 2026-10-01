@@ -35,7 +35,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use crate::error::Result;
+use crate::error::{anyhow, Error, Result};
 use crate::local::chat::{
     stored_to_wire, DeliveryState, PromptAnswer, ResumeCtx, SteerMessage, SteerReceiver, TurnCtx,
     WirePart, WirePrompt,
@@ -344,7 +344,7 @@ pub trait Harness: Send + Sync {
             model: model.filter(|model| self.id() == "opencode" && model.starts_with("orx-local-")),
             ..title::title_request(&prompt)
         };
-        let raw = self.one_shot(request).await?;
+        let raw = self.one_shot(request).await.ok()?;
         title::sanitize_title(&raw)
     }
 
@@ -352,9 +352,9 @@ pub trait Harness: Send + Sync {
     /// [`OneShotQuality`] and return the model's reply verbatim. The child
     /// cannot write or reach MCP servers (tools are disabled where the CLI
     /// allows), and nothing is recorded in the harness's own session store.
-    /// `None` = can't or failed.
-    async fn one_shot(&self, _request: OneShot<'_>) -> Option<String> {
-        None
+    /// The error says why it couldn't run or failed, in the CLI's own words where it gave any.
+    async fn one_shot(&self, _request: OneShot<'_>) -> Result<String> {
+        Err(anyhow!("{} cannot run one-shot requests", self.name()))
     }
 
     /// Whether `one_shot` runs on `OneShot::model`; callers caching by model
@@ -542,6 +542,25 @@ pub struct OneShot<'a> {
     /// provider with no working key); Claude keeps its per-quality alias.
     pub model: Option<&'a str>,
     pub timeout: Duration,
+}
+
+/// A failed one-shot child's message from the first of `outputs` it wrote to,
+/// on one line so a dumped model catalog stays readable in the log.
+pub(crate) fn one_shot_exit_error(status: std::process::ExitStatus, outputs: &[&[u8]]) -> Error {
+    outputs
+        .iter()
+        .map(|bytes| one_line(&String::from_utf8_lossy(bytes), 300))
+        .find(|text| !text.is_empty())
+        .map_or_else(|| anyhow!("{status}"), |text| anyhow!("{text}"))
+}
+
+/// `text` with its whitespace collapsed, capped at `max_chars`.
+pub(crate) fn one_line(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(max_chars) {
+        Some((end, _)) => format!("{}…", &flat[..end]),
+        None => flat,
+    }
 }
 
 /// How much model to spend on a one-shot: `Cheap` is the smallest/fastest
@@ -786,6 +805,16 @@ $ARGUMENTS
 mod tests {
     use super::options::{PlanActivation, REASONING_DEFAULT_ID};
     use super::*;
+
+    #[test]
+    fn one_line_flattens_and_caps_on_a_char_boundary() {
+        assert_eq!(
+            one_line("  Cannot use\n this   model. ", 300),
+            "Cannot use this model."
+        );
+        assert_eq!(one_line("ééééé", 3), "ééé…");
+        assert_eq!(one_line("abc", 3), "abc");
+    }
 
     fn options_for(id: &str) -> HarnessOptions {
         registry()
