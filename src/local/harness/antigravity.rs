@@ -686,8 +686,8 @@ fn denied_actions_error(result: &Value) -> Option<String> {
 #[derive(Default)]
 struct TurnState {
     conversation_id: Option<String>,
-    /// The latest planner step: the model call that issued the tools after it.
-    planner: Option<i64>,
+    /// The latest planner step (conversation, index): the model call that issued the tools after it.
+    planner: Option<(String, i64)>,
     text_part_id: Option<String>,
     text_seq: usize,
     saw_result: bool,
@@ -696,13 +696,19 @@ struct TurnState {
 
 /// A finished tool's invoker is its planner's hook identity. Part ids repeat across
 /// conversations, so the key is scoped to the chat session.
-fn record_tool_invoker(ctx: &TurnCtx, state: &TurnState, part_id: &str) {
-    let (Some(conversation), Some(planner)) = (&state.conversation_id, state.planner) else {
+fn record_tool_invoker(ctx: &TurnCtx, state: &TurnState, own: Option<&str>, part_id: &str) {
+    let Some((conversation, planner)) = state
+        .planner
+        .as_ref()
+        .filter(|(conversation, _)| Some(conversation.as_str()) == own)
+    else {
         return;
     };
     let identity = ctx.capture_store().and_then(|store| {
-        store
-            .native_invocation_identity("antigravity", &invocation_sample_id(conversation, planner))
+        store.native_invocation_identity(
+            "antigravity",
+            &invocation_sample_id(conversation, *planner),
+        )
     });
     if let Ok(Some(identity)) = identity {
         ctx.record_tool_invoker(
@@ -964,31 +970,33 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         }
         "step_update" => {
             if let Some(step) = event.get("step_update") {
-                if let Some(cid) = step
+                // A forwarded sub-agent step names its own conversation; only the first names the root.
+                let own = step
                     .get("conversation_id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
-                {
-                    state.conversation_id = Some(cid.to_string());
+                    .map(str::to_string);
+                if state.conversation_id.is_none() {
+                    state.conversation_id = own.clone();
                 }
+                let own = own.or_else(|| state.conversation_id.clone());
                 let usage = antigravity_step_usage(step);
                 // A planner step is a model call even without usage; its identity comes from the
                 // hook or, failing that, the conversation's native generation record.
                 let planner =
                     step.get("step_type").and_then(Value::as_str) == Some("agent_response");
                 if planner {
-                    state.planner = step.get("step_index").and_then(Value::as_i64);
+                    state.planner = own
+                        .clone()
+                        .zip(step.get("step_index").and_then(Value::as_i64));
                 }
                 if let Some(index) = step
                     .get("step_index")
                     .and_then(Value::as_i64)
                     .filter(|_| usage.is_some() || planner)
                 {
-                    let sample_id = step
-                        .get("conversation_id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .or(state.conversation_id.as_deref())
+                    let sample_id = own
+                        .as_deref()
                         .map(|conversation| invocation_sample_id(conversation, index))
                         .unwrap_or_else(|| {
                             format!("antigravity-{}:{index}", ctx.attempt_count_for_usage())
@@ -1052,7 +1060,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                                 });
                         let is_done = step_is_terminal(step_state) || error.is_some();
                         if is_done {
-                            record_tool_invoker(ctx, state, &call_id);
+                            record_tool_invoker(ctx, state, own.as_deref(), &call_id);
                         }
 
                         let status = if !is_done {
@@ -1699,6 +1707,80 @@ mod tests {
             Some("gemini-3.8-flash-high".into())
         );
         drop((generations, store));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A forwarded sub-agent step keeps its own conversation without becoming the chat's root,
+    /// and an invocation with no planner row never claims a step a later planner owns.
+    #[test]
+    fn sub_agent_steps_and_unmatched_hooks_keep_their_own_identity() {
+        let dir = std::env::temp_dir().join(format!("orx-agy-own-{}", uuid::Uuid::new_v4()));
+        let mut ctx = TurnCtx::test_capture(dir.clone(), "antigravity");
+        let store = crate::store::Store::open_at(dir.clone()).unwrap();
+        let mut state = TurnState::default();
+        for event in [
+            json!({"event": "init", "conversation_id": "conv"}),
+            json!({"event": "step_update", "step_update": {"conversation_id": "child", "step_index": 1, "step_type": "agent_response", "state": "DONE", "usage": {"input_tokens": 9, "output_tokens": 1}}}),
+        ] {
+            apply_event(&mut ctx, &mut state, &event);
+        }
+        assert_eq!(state.conversation_id.as_deref(), Some("conv"));
+        assert_eq!(state.planner, Some(("child".into(), 1)));
+        let ids: Vec<String> = store
+            .conn_for_tests()
+            .prepare("SELECT sample_id FROM chat_usage_samples")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, ["antigravity:child:step:1"]);
+        let hook = |name: &str, rows: &[(i64, &str)], model: &str| {
+            let path = dir.join(name);
+            let text: Vec<String> = rows
+                .iter()
+                .map(|(step, kind)| json!({"step_index": step, "type": kind}).to_string())
+                .collect();
+            std::fs::write(&path, text.join("\n")).unwrap();
+            json!({"transcriptPath": path, "modelName": model})
+        };
+        // The failed invocation at n = 6 produced no planner; the next one at n = 6 did.
+        let failed = hook("failed.jsonl", &[(4, "PLANNER_RESPONSE")], "model-a");
+        crate::commands::mcp_gate::record_invocation(
+            &store,
+            &failed,
+            "conv",
+            6,
+            "test-session",
+            Some("test-execution"),
+        )
+        .unwrap();
+        let next = hook(
+            "next.jsonl",
+            &[(4, "PLANNER_RESPONSE"), (6, "PLANNER_RESPONSE")],
+            "model-b",
+        );
+        crate::commands::mcp_gate::record_invocation(
+            &store,
+            &next,
+            "conv",
+            6,
+            "test-session",
+            Some("test-execution"),
+        )
+        .unwrap();
+        let model = |key: &str| {
+            store
+                .native_invocation_identity("antigravity", key)
+                .unwrap()
+                .map(|identity| identity.model)
+        };
+        assert_eq!(model("antigravity:conv:step:6").as_deref(), Some("model-b"));
+        assert_eq!(
+            model("antigravity:conv:invocation:6").as_deref(),
+            Some("model-a")
+        );
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

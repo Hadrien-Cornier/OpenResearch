@@ -252,6 +252,8 @@ pub enum ResumeAction {
 
 /// One coding-agent integration. See the module docs for the capability model.
 #[async_trait]
+// async-trait marks its boxed futures `#[must_use]`; clippy 1.99 flags that generated code.
+#[allow(clippy::double_must_use)]
 pub trait Harness: Send + Sync {
     /// Canonical, stable id used on the wire and in the store
     /// (e.g. `"claude-code"`). Must be unique across the registry.

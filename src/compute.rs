@@ -279,6 +279,8 @@ pub struct LogBatch {
 }
 
 #[async_trait]
+// async-trait marks its boxed futures `#[must_use]`; clippy 1.99 flags that generated code.
+#[allow(clippy::double_must_use)]
 pub trait ComputeBackend: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     async fn preflight(&self, args: &crate::ExpRunArgs) -> Result<Preflight>;

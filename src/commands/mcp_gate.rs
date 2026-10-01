@@ -247,9 +247,15 @@ pub(crate) fn record_invocation(
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                 .filter(|row| row["type"] == "PLANNER_RESPONSE")
                 .find_map(|row| row["step_index"].as_i64().filter(|index| *index >= step))
-        })
-        .unwrap_or(step);
-    let key = crate::local::harness::antigravity::invocation_sample_id(conversation, planner);
+        });
+    // No planner row (a failed call or an unflushed transcript): keep the identity under its own
+    // invocation key, never a step a later invocation's planner may own.
+    let key = match planner {
+        Some(planner) => {
+            crate::local::harness::antigravity::invocation_sample_id(conversation, planner)
+        }
+        None => format!("antigravity:{conversation}:invocation:{step}"),
+    };
     store.record_native_invocation(&key, &identity, Some(owner))?;
     if let Some(execution) = execution {
         store.record_attributed_sample(

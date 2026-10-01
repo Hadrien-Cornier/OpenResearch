@@ -477,8 +477,9 @@ impl Store {
         Ok(keys
             .iter()
             .filter_map(|key| {
-                key.strip_prefix(&format!("{harness}:"))?
-                    .split_once(":step:")
+                let key = key.strip_prefix(&format!("{harness}:"))?;
+                key.split_once(":step:")
+                    .or_else(|| key.split_once(":invocation:"))
             })
             .map(|(conversation, _)| conversation.to_string())
             .collect())
