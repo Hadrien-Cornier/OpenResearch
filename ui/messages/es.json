@@ -1255,5 +1255,13 @@
   "tree_restore_only": "Restaurar este experimento",
   "tree_restore_above": "Restaurar antepasados archivados",
   "tree_restore_down": "Restaurar descendientes",
-  "tree_all_experiments_archived": "Todos los experimentos están archivados. Activa Mostrar archivados para verlos."
+  "tree_all_experiments_archived": "Todos los experimentos están archivados. Activa Mostrar archivados para verlos.",
+  "side_command_description": "Haz una pregunta rápida en un chat lateral temporal",
+  "side_chat_open": "Chat lateral",
+  "side_chat_needs_a_chat": "Abre primero un chat y luego inicia un chat lateral desde él.",
+  "side_chat_open_failed": "No se pudo abrir un chat lateral: {error}",
+  "side_chat_empty": "Los chats laterales se eliminan cuando los cierras o sales de la app.",
+  "workspace_more_tools": "Más herramientas",
+  "side_chat_nested": "Un chat lateral no puede abrir su propio chat lateral.",
+  "side_chat_close_failed": "No se pudo eliminar el chat lateral: {error}"
 }

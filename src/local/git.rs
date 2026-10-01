@@ -123,10 +123,18 @@ pub fn migrate_legacy_project_worktrees(
     Ok(())
 }
 
+/// Side chats resolve to the worktree of the chat they branched from.
 pub fn existing_session_worktree_path(
     project: &crate::local::model::LocalProject,
     session_id: &str,
 ) -> PathBuf {
+    let owner = crate::store::Store::open()
+        .and_then(|store| store.chat_worktree_owner(session_id))
+        .unwrap_or_else(|_| session_id.to_string());
+    owner_worktree_path(project, &owner)
+}
+
+fn owner_worktree_path(project: &crate::local::model::LocalProject, session_id: &str) -> PathBuf {
     let current = session_worktree_path(&project.id, session_id);
     if current.exists() || !project.has_github_repository() {
         return current;
@@ -1263,12 +1271,13 @@ pub fn ensure_session_worktree(
     if !is_repository(repo_path) {
         return Err(anyhow!("{} is not a Git repository", repo_path.display()));
     }
-    let dir = existing_session_worktree_path(project, session_id);
+    let owner = crate::store::Store::open()?.chat_worktree_owner(session_id)?;
+    let dir = owner_worktree_path(project, &owner);
     let start_ref = super::demo::session_start_ref(
         repo_path,
         &project.github_owner,
         &project.github_repo,
-        session_id,
+        &owner,
     )
     .unwrap_or(&project.baseline_branch);
     git(Some(repo_path), &["rev-parse", "--verify", start_ref])?;

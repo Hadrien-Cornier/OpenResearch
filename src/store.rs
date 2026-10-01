@@ -701,6 +701,7 @@ impl Store {
             "ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN goal TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN autonomy TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN side_parent_session_id TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_service_tier TEXT",
             "ALTER TABLE ui_state ADD COLUMN workspace_state_json TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_autonomy TEXT",
@@ -1966,8 +1967,9 @@ impl Store {
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
                                         service_tier, permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
-                                        active_leaf_id, parent_session_id, created_at, updated_at, autonomy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                                        active_leaf_id, parent_session_id, created_at, updated_at, autonomy,
+                                        side_parent_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 s.id,
                 s.project_id,
@@ -1988,6 +1990,7 @@ impl Store {
                 s.created_at,
                 s.updated_at,
                 s.autonomy,
+                s.side_parent_session_id,
             ],
         )?;
         Ok(())
@@ -2017,10 +2020,43 @@ impl Store {
     /// long-lived install cannot turn one dialog open into a multi-megabyte read.
     pub fn list_all_chat_sessions(&self) -> Result<Vec<StoredChatSession>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions ORDER BY updated_at DESC LIMIT 500"
+            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions WHERE side_parent_session_id IS NULL
+             ORDER BY updated_at DESC LIMIT 500"
         ))?;
         let rows = stmt.query_map([], row_to_chat_session)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn side_chat_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_sessions WHERE side_parent_session_id IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn side_chats_of(&self, parent_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_sessions WHERE side_parent_session_id = ?1")?;
+        let rows = stmt.query_map(params![parent_id], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The session whose worktree `id` runs in: its side-chat parent while that
+    /// parent exists, else itself.
+    pub fn chat_worktree_owner(&self, id: &str) -> Result<String> {
+        let owner: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT parent.id FROM chat_sessions side
+                 JOIN chat_sessions parent ON parent.id = side.side_parent_session_id
+                 WHERE side.id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(owner.unwrap_or_else(|| id.to_string()))
     }
 
     pub fn list_chat_session_project_ids(&self) -> Result<Vec<(String, String)>> {
@@ -2038,6 +2074,7 @@ impl Store {
             "WITH agent_counts AS (
                  SELECT project_id, COUNT(*) AS total_agents
                  FROM chat_sessions
+                 WHERE side_parent_session_id IS NULL
                  GROUP BY project_id
              ),
              experiment_counts AS (
@@ -3124,6 +3161,9 @@ pub struct StoredChatSession {
     /// Session that spawned this one with `orx agent spawn`. `None` for
     /// sessions the user started from the dashboard.
     pub parent_session_id: Option<String>,
+    /// Chat this side chat branched from. Side chats share that chat's
+    /// worktree, stay out of history, and are deleted with it.
+    pub side_parent_session_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -3273,7 +3313,7 @@ fn row_to_chat_turn(
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, service_tier, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
      created_at, updated_at, title_source, bootstrap_context, active_leaf_id, parent_session_id, \
-     goal, autonomy";
+     goal, autonomy, side_parent_session_id";
 
 fn row_to_chat_spawn(row: &rusqlite::Row<'_>) -> std::result::Result<ChatSpawn, rusqlite::Error> {
     Ok(ChatSpawn {
@@ -3311,6 +3351,7 @@ fn row_to_chat_session(
         parent_session_id: row.get(18)?,
         goal: row.get(19)?,
         autonomy: row.get(20)?,
+        side_parent_session_id: row.get(21)?,
     })
 }
 
@@ -4400,6 +4441,7 @@ mod tests {
             autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -4459,6 +4501,38 @@ mod tests {
                 .as_deref(),
             Some("chat_parent")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn side_chats_stay_out_of_history_and_share_their_parents_worktree() {
+        let dir = std::env::temp_dir().join(format!("orx-store-sidechat-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_parent"))
+            .unwrap();
+        let mut side = chat_session_fixture("chat_side");
+        side.side_parent_session_id = Some("chat_parent".into());
+        store.create_chat_session(&side).unwrap();
+
+        let all: Vec<String> = store
+            .list_all_chat_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(all, ["chat_parent"]);
+        assert_eq!(store.side_chats_of("chat_parent").unwrap(), ["chat_side"]);
+        assert_eq!(store.side_chat_ids().unwrap(), ["chat_side"]);
+        assert_eq!(
+            store.chat_worktree_owner("chat_side").unwrap(),
+            "chat_parent"
+        );
+        assert_eq!(store.chat_worktree_owner("chat_gone").unwrap(), "chat_gone");
+        // An orphan whose parent row is gone owns its own worktree again.
+        store.delete_chat_session("chat_parent").unwrap();
+        assert_eq!(store.chat_worktree_owner("chat_side").unwrap(), "chat_side");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
