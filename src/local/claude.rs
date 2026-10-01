@@ -62,6 +62,7 @@ enum LifecycleStopReason {
     IdleExpired,
     IdleLimit,
     Stale,
+    Exited,
 }
 
 impl LifecycleStopReason {
@@ -70,6 +71,7 @@ impl LifecycleStopReason {
             Self::IdleExpired => "idle-expired",
             Self::IdleLimit => "idle-limit",
             Self::Stale => "stale",
+            Self::Exited => "exited",
         }
     }
 }
@@ -791,12 +793,21 @@ impl ClaudeHost {
         let mut doomed = Vec::new();
         let mut idle = Vec::new();
         for (session_id, client) in clients {
+            if client.terminated.load(Ordering::Acquire) {
+                continue;
+            }
+            let exited = !matches!(client.child.lock().await.try_wait(), Ok(None));
             let turn = client.turn.lock().unwrap();
-            if turn.sender.is_some() || client.terminated.load(Ordering::Acquire) {
+            if turn.sender.is_some() {
                 continue;
             }
             let idle_since = turn.idle_since;
-            let reason = turn.stop_reason(client.started_at, now, policy.idle_timeout);
+            // An exited child may leave descendants in its group; release it, never keep it warm.
+            let reason = if exited {
+                Some(LifecycleStopReason::Exited)
+            } else {
+                turn.stop_reason(client.started_at, now, policy.idle_timeout)
+            };
             drop(turn);
             match reason {
                 Some(reason) => doomed.push((session_id, client, idle_since, reason)),
@@ -1588,6 +1599,28 @@ mod tests {
         assert!(!clients.contains_key("older"));
         drop(clients);
         assert!(older.terminated.load(Ordering::Acquire));
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_worker_is_released_instead_of_kept_warm() {
+        let now = Instant::now();
+        let host = ClaudeHost::new();
+        let warm = test_client("warm", now, now - Duration::from_secs(60), "sleep 600").await;
+        let exited = test_client("exited", now, now - Duration::from_secs(40), "exit 0").await;
+        exited.child.lock().await.wait().await.unwrap();
+        install_test_client(&host, warm.clone()).await;
+        install_test_client(&host, exited.clone()).await;
+
+        host.reap_expired_at(now, IdlePolicy::LOW_MEMORY).await;
+
+        let clients = host.inner.lock().await;
+        assert!(clients.contains_key("warm"));
+        assert!(!clients.contains_key("exited"));
+        drop(clients);
+        assert!(!warm.terminated.load(Ordering::Acquire));
+        assert!(exited.terminated.load(Ordering::Acquire));
         host.shutdown().await;
     }
 
