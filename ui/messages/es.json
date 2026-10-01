@@ -1260,7 +1260,7 @@
   "side_chat_open": "Chat lateral",
   "side_chat_needs_a_chat": "Abre primero un chat y luego inicia un chat lateral desde él.",
   "side_chat_open_failed": "No se pudo abrir un chat lateral: {error}",
-  "side_chat_empty": "Haz una pregunta rápida sobre el chat del que surgió. Conoce ese chat tal como estaba cuando abriste este chat lateral.",
+  "side_chat_empty": "Los chats laterales desaparecen cuando los cierras o cierras la app.",
   "workspace_more_tools": "Más herramientas",
   "side_chat_nested": "Un chat lateral no puede abrir su propio chat lateral.",
   "side_chat_close_failed": "No se pudo eliminar el chat lateral: {error}"

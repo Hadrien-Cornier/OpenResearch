@@ -8582,6 +8582,14 @@ async fn deliver_wake_up(
     Ok(store)
 }
 
+/// Side chats last only as long as the app run that opened them.
+pub async fn delete_side_chats(chat: &Arc<ChatHost>) -> Result<()> {
+    for session_id in Store::open()?.side_chat_ids()? {
+        chat.delete_session(&session_id).await?;
+    }
+    Ok(())
+}
+
 /// Resume explicitly subscribed agent sessions after a run finishes. Busy and
 /// draining sessions retain their durable wake-up until they become idle.
 pub async fn watch_runs(

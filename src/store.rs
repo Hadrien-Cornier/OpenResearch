@@ -2027,6 +2027,14 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn side_chat_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_sessions WHERE side_parent_session_id IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn side_chats_of(&self, parent_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -4516,6 +4524,7 @@ mod tests {
             .collect();
         assert_eq!(all, ["chat_parent"]);
         assert_eq!(store.side_chats_of("chat_parent").unwrap(), ["chat_side"]);
+        assert_eq!(store.side_chat_ids().unwrap(), ["chat_side"]);
         assert_eq!(
             store.chat_worktree_owner("chat_side").unwrap(),
             "chat_parent"

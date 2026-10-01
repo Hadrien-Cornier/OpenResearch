@@ -165,6 +165,14 @@ pub async fn run(args: UpArgs) -> Result<()> {
         let gate = state.data_dir_gate.clone();
         tokio::task::spawn_blocking(move || local::demo::prewarm(move_in_progress, gate));
     }
+    if !persistent_host {
+        let chat = state.chat.clone();
+        tokio::spawn(async move {
+            if let Err(err) = local::chat::delete_side_chats(&chat).await {
+                eprintln!("orx up: side chat cleanup: {err}");
+            }
+        });
+    }
     // Deliver explicitly registered run wake-ups once their chat becomes idle.
     tokio::spawn(local::chat::watch_runs(
         state.chat.clone(),

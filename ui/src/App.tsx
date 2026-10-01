@@ -1259,6 +1259,13 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [forgetRightTab, rightTab, sideTabs],
   );
 
+  // Side chats are deleted when orx restarts; drop saved tabs whose chat is gone.
+  useEffect(() => {
+    const live = sessionsQuery.data;
+    if (!live) return;
+    for (const tab of sideTabs) if (!live.some((session) => session.id === tab.sessionId)) forgetSideTab(tab);
+  }, [sessionsQuery.data, sideTabs, forgetSideTab]);
+
   const startSideChat = useCallback(async (parentSessionId: string, question: string) => {
     let session;
     try {
