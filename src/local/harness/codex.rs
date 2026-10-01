@@ -216,6 +216,10 @@ pub(crate) fn record_unowned_in(
     let Some(usage) = token_notification(Some(store), models, method, params) else {
         return Ok(());
     };
+    // A resumed thread replays its last turn's total, already counted by that turn.
+    if store.cumulative_counted("codex", usage.thread, usage.turn, &usage.total)? {
+        return Ok(());
+    }
     let execution = execution(usage.thread, usage.turn);
     store.begin_usage_execution(&execution, &execution, "codex")?;
     store.record_cumulative_usage(

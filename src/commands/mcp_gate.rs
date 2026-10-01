@@ -189,38 +189,11 @@ pub async fn run_antigravity() -> Result<()> {
     tokio::io::stdin().read_to_string(&mut input).await?;
     if let Ok(payload) = serde_json::from_str::<Value>(&input) {
         if payload.get("initialNumSteps").is_some() {
-            let conversation = payload
-                .get("conversationId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("Missing native conversation identity"))?;
-            let step = payload
-                .get("initialNumSteps")
-                .and_then(Value::as_i64)
-                .filter(|step| *step >= 0)
-                .ok_or_else(|| anyhow!("Missing native invocation step"))?;
-            let model = payload
-                .get("modelName")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("Missing native invocation model"))?;
-            let identity = crate::store::InvocationIdentity {
-                harness: "antigravity".into(),
-                model: model.to_string(),
-                provider: None,
-            };
-            let key = invocation_key(&payload, conversation, step);
-            let store = crate::store::Store::open()?;
-            store.record_native_invocation(&key, &identity, Some(conversation))?;
-            // Sub-agents never reach the stream: this is their only per-call record.
-            if let Ok(execution) = std::env::var("ORX_USAGE_EXECUTION_ID") {
-                store.record_usage_sample(
-                    &execution,
-                    &key,
-                    "antigravity",
-                    Some(model),
-                    None,
-                    &Default::default(),
-                )?;
-            }
+            record_post_invocation(
+                &crate::store::Store::open()?,
+                &payload,
+                std::env::var("ORX_USAGE_EXECUTION_ID").ok().as_deref(),
+            )?;
             println!("{{}}");
             return Ok(());
         }
@@ -258,9 +231,52 @@ fn invocation_overwrite(input: &str) -> Option<Value> {
     Some(json!({ "CommandLine": command }))
 }
 
+pub(crate) fn record_post_invocation(
+    store: &crate::store::Store,
+    payload: &Value,
+    execution: Option<&str>,
+) -> Result<()> {
+    let conversation = payload
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Missing native conversation identity"))?;
+    let step = payload
+        .get("initialNumSteps")
+        .and_then(Value::as_i64)
+        .filter(|step| *step >= 0)
+        .ok_or_else(|| anyhow!("Missing native invocation step"))?;
+    let model = payload
+        .get("modelName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Missing native invocation model"))?;
+    let identity = crate::store::InvocationIdentity {
+        harness: "antigravity".into(),
+        model: model.to_string(),
+        provider: None,
+    };
+    let planner = invocation_key(payload, conversation, step);
+    let key = planner
+        .clone()
+        .unwrap_or_else(|| format!("antigravity:{conversation}:invocation:{step}"));
+    store.record_native_invocation(&key, &identity, Some(conversation))?;
+    // Sub-agents never reach the stream: this is their only per-call record. Only a planner row
+    // proves the model ran; without one the call may have failed before executing.
+    if let (Some(planner), Some(execution)) = (planner, execution) {
+        store.record_usage_sample(
+            execution,
+            &planner,
+            "antigravity",
+            Some(model),
+            None,
+            &Default::default(),
+        )?;
+    }
+    Ok(())
+}
+
 /// The invocation's own planner step from its native transcript (native steps can be inserted at
-/// or after `initialNumSteps`); none flushed yet keeps it under its own key, never a step.
-fn invocation_key(payload: &Value, conversation: &str, step: i64) -> String {
+/// or after `initialNumSteps`); none flushed yet means no step, never a guessed one.
+fn invocation_key(payload: &Value, conversation: &str, step: i64) -> Option<String> {
     let planner = payload
         .get("transcriptPath")
         .and_then(Value::as_str)
@@ -271,12 +287,9 @@ fn invocation_key(payload: &Value, conversation: &str, step: i64) -> String {
                 .filter(|row| row["type"] == "PLANNER_RESPONSE")
                 .find_map(|row| row["step_index"].as_i64().filter(|index| *index >= step))
         });
-    match planner {
-        Some(planner) => {
-            crate::local::harness::antigravity::invocation_sample_id(conversation, planner)
-        }
-        None => format!("antigravity:{conversation}:invocation:{step}"),
-    }
+    planner.map(|planner| {
+        crate::local::harness::antigravity::invocation_sample_id(conversation, planner)
+    })
 }
 
 async fn antigravity_decision(input: &str) -> Result<Value> {
@@ -406,11 +419,11 @@ mod antigravity_tests {
         .map(|(step, kind)| json!({"step_index": step, "type": kind}).to_string());
         std::fs::write(&path, rows.join("\n")).unwrap();
         let payload = json!({"transcriptPath": path});
-        assert_eq!(invocation_key(&payload, "c", 3), "antigravity:c:step:4");
         assert_eq!(
-            invocation_key(&payload, "c", 5),
-            "antigravity:c:invocation:5"
+            invocation_key(&payload, "c", 3).as_deref(),
+            Some("antigravity:c:step:4")
         );
+        assert_eq!(invocation_key(&payload, "c", 5), None);
         std::fs::remove_file(path).unwrap();
     }
 }

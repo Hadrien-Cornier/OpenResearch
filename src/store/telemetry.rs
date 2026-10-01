@@ -193,6 +193,54 @@ impl Store {
         Ok(())
     }
 
+    /// A native turn's last counted cumulative total, shared by every execution that sees the turn
+    /// (a sub-agent outliving its parent's turn, a resume replaying it). Stores from before the
+    /// shared row fall back to the turn's recorded sample ids (`{scope}:{turn}:{generation}:{total}`).
+    fn cumulative_baseline(
+        &self,
+        harness: &str,
+        native_scope: &str,
+        native_turn: &str,
+    ) -> Result<Option<CumulativeBaseline>> {
+        let shared: Option<String> = self.conn.query_row("SELECT totals_json FROM native_usage_baselines WHERE execution_id = ?1 AND prefix = ?2", params![harness, format!("cumulative:{native_scope}:{native_turn}")], |row| row.get(0)).optional()?.flatten();
+        if let Some(json) = shared {
+            return Ok(Some(serde_json::from_str(&json)?));
+        }
+        let ids = format!("{native_scope}:{native_turn}:");
+        let mut stmt = self.conn.prepare("SELECT substr(sample_id, length(?2) + 1) FROM chat_usage_samples WHERE harness = ?1 AND substr(sample_id, 1, length(?2)) = ?2")?;
+        let mut latest: Option<CumulativeBaseline> = None;
+        for rest in stmt.query_map(params![harness, ids], |row| row.get::<_, String>(0))? {
+            let rest = rest?;
+            let Some((generation, total)) = rest.split_once(':') else {
+                continue;
+            };
+            let recorded = CumulativeBaseline {
+                generation: generation.parse()?,
+                usage: serde_json::from_str(total)?,
+            };
+            if latest.as_ref().is_none_or(|latest| {
+                (recorded.generation, recorded.usage.total())
+                    > (latest.generation, latest.usage.total())
+            }) {
+                latest = Some(recorded);
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Whether `total` is already this native turn's counted total.
+    pub(crate) fn cumulative_counted(
+        &self,
+        harness: &str,
+        native_scope: &str,
+        native_turn: &str,
+        total: &TokenUsage,
+    ) -> Result<bool> {
+        Ok(self
+            .cumulative_baseline(harness, native_scope, native_turn)?
+            .is_some_and(|baseline| &baseline.usage == total))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_cumulative_usage(
         &self,
@@ -206,27 +254,15 @@ impl Store {
     ) -> Result<()> {
         total.validate()?;
         last.validate()?;
-        let prefix = format!("cumulative:{native_scope}");
+        let prefix = format!("cumulative:{native_scope}:{native_turn}");
         let tx = self.begin()?;
-        let previous: Option<String> = tx.query_row("SELECT totals_json FROM native_usage_baselines WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, prefix], |row| row.get(0)).optional()?.flatten();
-        let previous: Option<CumulativeBaseline> = previous
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?;
+        let previous = self.cumulative_baseline(harness, native_scope, native_turn)?;
         if previous
             .as_ref()
             .is_some_and(|previous| &previous.usage == total)
         {
             return Ok(());
         }
-        // A scope changing executions (a sub-agent outliving its parent's turn) can repeat the
-        // snapshot the previous execution already counted.
-        let seen: Option<String> = tx.query_row("SELECT totals_json FROM native_usage_totals WHERE harness = ?1 AND native_scope = ?2", params![harness, prefix], |row| row.get(0)).optional()?;
-        let repeated = previous.is_none()
-            && seen
-                .map(|json| serde_json::from_str::<TokenUsage>(&json))
-                .transpose()?
-                .as_ref()
-                == Some(total);
         let delta = if let Some(previous) = &previous {
             TokenUsage {
                 input_tokens: total
@@ -252,7 +288,7 @@ impl Store {
             previous.is_some() && (delta.input_tokens.is_none() || delta.output_tokens.is_none());
         let generation =
             previous.as_ref().map_or(0, |previous| previous.generation) + u64::from(reset);
-        if !reset && !repeated {
+        if !reset {
             let sample_id = format!(
                 "{native_scope}:{native_turn}:{generation}:{}",
                 serde_json::to_string(total)?
@@ -265,8 +301,8 @@ impl Store {
             usage: total.clone(),
             generation,
         };
-        tx.execute("INSERT INTO native_usage_baselines (execution_id, prefix, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(execution_id, prefix) DO UPDATE SET totals_json = excluded.totals_json", params![execution_id, prefix, serde_json::to_string(&baseline)?])?;
-        tx.execute("INSERT INTO native_usage_totals (harness, native_scope, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(harness, native_scope) DO UPDATE SET totals_json = excluded.totals_json", params![harness, prefix, serde_json::to_string(total)?])?;
+        // Keyed by harness, not execution: the baseline belongs to the native turn.
+        tx.execute("INSERT INTO native_usage_baselines (execution_id, prefix, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(execution_id, prefix) DO UPDATE SET totals_json = excluded.totals_json", params![harness, prefix, serde_json::to_string(&baseline)?])?;
         tx.commit()?;
         Ok(())
     }
@@ -678,9 +714,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A sub-agent outliving its parent's turn: the parent counted its first snapshot, the late
-    /// execution counts only what follows (a repeat adds nothing), under its native reroute even
-    /// after the in-memory model cache is gone, and closes with the child's own `turn/completed`.
+    /// A sub-agent outliving its parent's turn continues the native turn's shared baseline: the
+    /// late execution counts the increase since the parent's last total (requests between them
+    /// included), a replay adds nothing, a new native turn starts its own baseline, and a legacy
+    /// store's replayed total (no shared row) opens no execution.
     #[test]
     fn late_codex_child_usage_continues_from_its_parent_execution() {
         let dir = std::env::temp_dir().join(format!("orx-late-child-{}", uuid::Uuid::new_v4()));
@@ -695,8 +732,8 @@ mod tests {
             output_tokens: Some(n),
             ..Default::default()
         };
-        let usage = |total: u64, last: u64| {
-            serde_json::json!({"threadId": "child", "turnId": "ct", "tokenUsage": {
+        let usage = |turn: &str, total: u64, last: u64| {
+            serde_json::json!({"threadId": "child", "turnId": turn, "tokenUsage": {
                 "total": {"inputTokens": total, "outputTokens": total},
                 "last": {"inputTokens": last, "outputTokens": last}}})
         };
@@ -721,6 +758,13 @@ mod tests {
                 })
                 .collect()
         };
+        let executions = || -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM chat_usage_executions WHERE execution_id LIKE 'codex-late:%'", [], |row| row.get(0))
+                .unwrap()
+        };
+        let safe = || Some("gpt-6-safe".to_string());
         store
             .begin_usage_execution("parent", "parent-turn", "codex")
             .unwrap();
@@ -730,7 +774,7 @@ mod tests {
                 "codex",
                 "child",
                 "ct",
-                Some("gpt-6-safe"),
+                safe().as_deref(),
                 &counters(10),
                 &counters(4),
             )
@@ -742,25 +786,99 @@ mod tests {
             &serde_json::json!({"threadId": "child", "turnId": "ct", "toModel": "gpt-6-safe"}),
         );
         models.lock().unwrap().clear();
-        record("thread/tokenUsage/updated", usage(10, 4));
-        record("thread/tokenUsage/updated", usage(15, 5));
+        record("thread/tokenUsage/updated", usage("ct", 10, 4));
+        assert_eq!(executions(), 0);
+        record("thread/tokenUsage/updated", usage("ct", 30, 5));
+        record("thread/tokenUsage/updated", usage("ct", 30, 5));
         record(
             "turn/completed",
             serde_json::json!({"threadId": "child", "turn": {"id": "ct", "status": "completed"}}),
         );
-        record("thread/tokenUsage/updated", usage(20, 5));
-        let late = "codex-late:s:child:ct";
-        assert_eq!(samples("parent"), [(Some("gpt-6-safe".into()), 4)]);
-        assert_eq!(samples(late), [(Some("gpt-6-safe".into()), 5)]);
+        record("thread/tokenUsage/updated", usage("ct", 40, 5));
+        assert_eq!(samples("parent"), [(safe(), 4)]);
+        assert_eq!(samples("codex-late:s:child:ct"), [(safe(), 20)]);
         let outcome: String = store
             .conn
-            .query_row(
-                "SELECT outcome FROM chat_usage_executions WHERE execution_id = ?1",
-                [late],
-                |row| row.get(0),
-            )
+            .query_row("SELECT outcome FROM chat_usage_executions WHERE execution_id = 'codex-late:s:child:ct'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(outcome, "done");
+        models
+            .lock()
+            .unwrap()
+            .insert(("child".into(), "ct2".into()), "gpt-6-sol".into());
+        record("thread/tokenUsage/updated", usage("ct2", 47, 7));
+        assert_eq!(
+            samples("codex-late:s:child:ct2"),
+            [(Some("gpt-6-sol".into()), 7)]
+        );
+        // A store from before the shared baseline knows a finished turn only by its sample ids.
+        store
+            .begin_usage_execution("old", "old-turn", "codex")
+            .unwrap();
+        store
+            .record_cumulative_usage(
+                "old",
+                "codex",
+                "child",
+                "ct3",
+                None,
+                &counters(60),
+                &counters(3),
+            )
+            .unwrap();
+        store.finalize_turn_usage("old-turn", "done").unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM native_usage_baselines WHERE prefix = 'cumulative:child:ct3'",
+                [],
+            )
+            .unwrap();
+        record("thread/tokenUsage/updated", usage("ct3", 60, 3));
+        assert_eq!(executions(), 2);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A hook without a planner row may be a call that failed before running: its model is kept
+    /// as invocation evidence but never becomes an executed sample.
+    #[test]
+    fn antigravity_hooks_record_executed_models_only_with_a_planner() {
+        let dir = std::env::temp_dir().join(format!("orx-agy-planner-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let transcript = dir.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::json!({"step_index": 4, "type": "PLANNER_RESPONSE"}).to_string(),
+        )
+        .unwrap();
+        store
+            .begin_usage_execution("e", "t", "antigravity")
+            .unwrap();
+        for step in [3, 5] {
+            let payload = serde_json::json!({"conversationId": "c", "initialNumSteps": step,
+                "modelName": "gemini-3.8-flash-high", "transcriptPath": transcript});
+            crate::commands::mcp_gate::record_post_invocation(&store, &payload, Some("e")).unwrap();
+        }
+        let samples: Vec<(String, Option<String>)> = store
+            .conn
+            .prepare("SELECT sample_id, model FROM chat_usage_samples")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            samples,
+            [(
+                "antigravity:c:step:4".into(),
+                Some("gemini-3.8-flash-high".into())
+            )]
+        );
+        assert!(store
+            .native_invocation_identity("antigravity", "antigravity:c:invocation:5")
+            .unwrap()
+            .is_some());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
