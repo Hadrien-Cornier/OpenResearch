@@ -680,6 +680,9 @@ pub struct UpArgs {
     /// Internal persistent dashboard/agent-host mode.
     #[arg(long, hide = true)]
     pub remote_host: bool,
+    /// Serving the desktop app's window, which only restarts when asked.
+    #[arg(skip)]
+    pub desktop_app: bool,
 }
 
 #[derive(Args, Clone, Debug)]

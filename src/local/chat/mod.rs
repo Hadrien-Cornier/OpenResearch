@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 use crate::error::{anyhow, Result};
+use crate::local::autonomy::Autonomy;
 use crate::local::harness::ResumeAction;
 use crate::local::model::LocalProject;
 use crate::local::opencode::AgentHost;
@@ -1183,6 +1184,7 @@ pub fn import_native_chat(
         context_usage_json: None,
         bootstrap_context: None,
         goal: None,
+        autonomy: None,
         active_leaf_id: None,
         parent_session_id: None,
         created_at: now_ms(),
@@ -1241,6 +1243,7 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         "activeLeafId": s.active_leaf_id,
         "parentSessionId": s.parent_session_id,
         "goal": s.goal,
+        "autonomy": Autonomy::from_stored(s.autonomy.as_deref()).id(),
     })
 }
 
@@ -1269,6 +1272,7 @@ fn with_turn_context(
     native_session_id: Option<&str>,
     bootstrap_context: Option<&str>,
     goal: Option<&str>,
+    autonomy: Option<&str>,
     demo_evidence_context: Option<&str>,
     shell_context: Option<&str>,
     text: String,
@@ -1286,6 +1290,9 @@ fn with_turn_context(
     });
     if let Some(goal) = goal.as_deref() {
         contexts.push(goal);
+    }
+    if let Some(autonomy) = autonomy {
+        contexts.push(autonomy);
     }
     if let Some(context) = demo_evidence_context {
         contexts.push(context);
@@ -2006,6 +2013,7 @@ mod shell_command_tests {
             None,
             None,
             None,
+            None,
             Some(&context),
             "why?".into(),
         );
@@ -2022,6 +2030,7 @@ mod initial_message_tests {
         contextualize_messages, is_initial_chat_message, with_selected_chat_context,
         with_turn_context, AnnotatedText, TextAnnotation,
     };
+    use crate::local::autonomy::Autonomy;
     use serde_json::{json, Value};
 
     #[test]
@@ -2039,6 +2048,7 @@ mod initial_message_tests {
             None,
             None,
             None,
+            None,
             "continue".into(),
         );
         assert!(seeded.contains("prior demo"));
@@ -2050,12 +2060,13 @@ mod initial_message_tests {
                 None,
                 None,
                 None,
+                None,
                 "continue".into()
             ),
             "continue"
         );
         assert_eq!(
-            with_turn_context(None, None, None, None, None, "continue".into()),
+            with_turn_context(None, None, None, None, None, None, "continue".into()),
             "continue"
         );
     }
@@ -2068,6 +2079,7 @@ mod initial_message_tests {
             Some("ship the sweep"),
             None,
             None,
+            None,
             "continue".into(),
         );
         assert!(seeded.contains("ship the sweep"));
@@ -2076,9 +2088,34 @@ mod initial_message_tests {
         assert!(!seeded.contains("prior demo"));
         assert!(seeded.contains("<current-user-message>\ncontinue"));
         assert_eq!(
-            with_turn_context(Some("native"), None, None, None, None, "continue".into()),
+            with_turn_context(
+                Some("native"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "continue".into()
+            ),
             "continue"
         );
+    }
+
+    #[test]
+    fn autonomy_rides_every_turn_after_the_goal() {
+        let turn = with_turn_context(
+            Some("native"),
+            None,
+            Some("ship the sweep"),
+            Autonomy::Copilot.turn_context(),
+            None,
+            None,
+            "continue".into(),
+        );
+        let goal = turn.find("<orx-goal>").unwrap();
+        let autonomy = turn.find("<orx-autonomy level=\"copilot\">").unwrap();
+        assert!(goal < autonomy);
+        assert!(turn.ends_with("<current-user-message>\ncontinue\n</current-user-message>"));
     }
 
     #[test]
@@ -2087,6 +2124,7 @@ mod initial_message_tests {
             None,
             Some("prior demo"),
             None,
+            None,
             Some("demo evidence"),
             None,
             "first".into(),
@@ -2094,6 +2132,7 @@ mod initial_message_tests {
         let follow_up = with_turn_context(
             Some("native"),
             Some("prior demo"),
+            None,
             None,
             Some("demo evidence"),
             None,
@@ -2106,7 +2145,15 @@ mod initial_message_tests {
         assert!(follow_up.contains("<current-user-message>\nfollow up"));
         assert_eq!(first.matches("<current-user-message>").count(), 1);
         assert_eq!(
-            with_turn_context(Some("native"), None, None, None, None, "ordinary".into()),
+            with_turn_context(
+                Some("native"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ordinary".into()
+            ),
             "ordinary"
         );
     }
@@ -2302,6 +2349,8 @@ pub struct ChatHost {
     turns: Mutex<HashMap<String, TurnState>>,
     /// Cross-process ownership tokens for locally active turn slots.
     durable_turns: std::sync::Mutex<HashMap<String, String>>,
+    /// Set once `orx up` commits to restarting into an update; no turn starts after.
+    restarting: std::sync::atomic::AtomicBool,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
@@ -3256,6 +3305,7 @@ impl ChatHost {
             events,
             turns: Mutex::new(HashMap::new()),
             durable_turns: std::sync::Mutex::new(HashMap::new()),
+            restarting: std::sync::atomic::AtomicBool::new(false),
             deleting_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
@@ -3633,7 +3683,23 @@ impl ChatHost {
         f()
     }
 
+    /// Stop admitting turns if none is running, queued, or awaiting an answer. Every
+    /// admission claims under the turn map's lock, so none can slip in after this check.
+    pub async fn stop_admitting_if_idle(&self) -> bool {
+        let turns = self.turns.lock().await;
+        let idle =
+            turns.is_empty() && self.queued_count() == 0 && self.pending_permission_count() == 0;
+        if idle {
+            self.restarting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        idle
+    }
+
     fn claim_durable_turn(&self, session_id: &str) -> bool {
+        if self.restarting.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
         let mut claims = self.durable_turns.lock().unwrap();
         if claims.contains_key(session_id) {
             return false;
@@ -5489,6 +5555,7 @@ impl ChatHost {
                 session.native_session_id.as_deref(),
                 session.bootstrap_context.as_deref(),
                 session.goal.as_deref(),
+                Autonomy::from_stored(session.autonomy.as_deref()).turn_context(),
                 super::demo::turn_context(&project.id),
                 shell_context.as_deref(),
                 expanded,
@@ -6293,6 +6360,16 @@ impl ChatHost {
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
         store.set_chat_session_goal(session_id, goal)?;
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    pub async fn set_autonomy(
+        &self,
+        session_id: &str,
+        autonomy: Autonomy,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        store.set_chat_session_autonomy(session_id, autonomy)?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -8674,6 +8751,9 @@ pub const LOCAL_SESSION_ENV: &str = "ORX_LOCAL_SESSION";
 /// Loopback port of the trusted `orx up` process that owns local agent runs.
 pub const UP_PORT_ENV: &str = "ORX_UP_PORT";
 
+/// Version of that `orx up`, which keeps running its own code after an update lands on disk.
+pub const UP_VERSION_ENV: &str = "ORX_UP_VERSION";
+
 /// Route-scoped bearer for agent subprocesses calling their owning `orx up`.
 pub const UP_AUTH_TOKEN_ENV: &str = "ORX_UP_AUTH_TOKEN";
 
@@ -8804,9 +8884,11 @@ pub fn set_chat_session_env(
     match up_port {
         Some(port) => {
             cmd.env(UP_PORT_ENV, port.to_string());
+            cmd.env(UP_VERSION_ENV, env!("CARGO_PKG_VERSION"));
         }
         None => {
             cmd.env_remove(UP_PORT_ENV);
+            cmd.env_remove(UP_VERSION_ENV);
         }
     }
     match up_auth_token() {
@@ -9233,6 +9315,7 @@ mod cap_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
                 created_at: 1,
@@ -9340,6 +9423,7 @@ mod cap_tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
             created_at: 1,
@@ -9396,6 +9480,7 @@ mod cap_tests {
             context_usage_json: Some("{\"usedTokens\":9000}".into()),
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
             created_at: 1,
@@ -9423,6 +9508,7 @@ mod cap_tests {
         assert!(with_turn_context(
             session.native_session_id.as_deref(),
             session.bootstrap_context.as_deref(),
+            None,
             None,
             None,
             None,
@@ -9899,6 +9985,19 @@ mod bridge_tests {
     }
 
     #[tokio::test]
+    async fn restart_stops_admitting_turns_only_when_idle() {
+        let host = test_host();
+        host.turns
+            .lock()
+            .await
+            .insert("busy".into(), TurnState::Reserved { turn_id: None });
+        assert!(!host.stop_admitting_if_idle().await);
+        host.turns.lock().await.clear();
+        assert!(host.stop_admitting_if_idle().await);
+        assert!(!host.claim_durable_turn("next"));
+    }
+
+    #[tokio::test]
     async fn claude_permission_reviews_are_serialized_per_session() {
         let host = test_host();
         let lock = host
@@ -10155,6 +10254,7 @@ mod bridge_tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
             created_at: 1,
@@ -10310,6 +10410,7 @@ mod run_wakeup_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
                 created_at: 1,
@@ -11163,6 +11264,7 @@ mod steering_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
                 created_at: 1,

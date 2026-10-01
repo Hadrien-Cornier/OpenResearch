@@ -33,8 +33,10 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 
 use crate::commands::remote_host::{DashboardLock, DashboardLockMode, HostDescriptor, RemoteAuth};
+use crate::commands::up_remote::RemoteSessionStatus;
 use crate::error::{anyhow, Result};
 use crate::local;
+use crate::local::autonomy::Autonomy;
 use crate::local::chat::ChatHost;
 use crate::local::is_terminal;
 use crate::local::opencode::AgentHost;
@@ -176,6 +178,9 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.harness_fill_in_flight.clone(),
     );
     spawn_background_tasks(remote_auth.is_none());
+    if !persistent_host && !args.desktop_app {
+        spawn_restart_when_idle(state.clone());
+    }
     let live_events = state.chat.clone();
     local::overleaf_live::set_event_sink(Box::new(move |name, data| {
         live_events.emit_event(name, data)
@@ -757,9 +762,11 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         // above the client-side per-file limit so a full message still fits.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
-    let app = app.layer(middleware::from_fn(
-        crate::commands::up_remote::loopback_guard,
-    ));
+    let app = app
+        .layer(middleware::from_fn(track_active))
+        .layer(middleware::from_fn(
+            crate::commands::up_remote::loopback_guard,
+        ));
     match remote_auth {
         Some(auth) => app.layer(middleware::from_fn_with_state(auth, require_remote_auth)),
         None => app,
@@ -4300,6 +4307,111 @@ fn spawn_background_tasks(check_updates: bool) {
     });
 }
 
+/// Requests and terminals in flight, which an automatic restart would cut off.
+static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// An automatic restart is checking for idleness; new requests wait it out.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+struct Active;
+
+impl Active {
+    fn new() -> Self {
+        ACTIVE.fetch_add(1, Ordering::SeqCst);
+        Active
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) async fn track_active(request: axum::extract::Request, next: Next) -> Response {
+    // The dashboard holds its event stream open for as long as it is open.
+    if request.uri().path() == "/api/events" {
+        return next.run(request).await;
+    }
+    // Count first, then check: paired with the drain's set-then-count, one side always sees the other.
+    let active = loop {
+        let active = Active::new();
+        if !DRAINING.load(Ordering::SeqCst) {
+            break active;
+        }
+        drop(active);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    next.run(request).await.map(|body| {
+        axum::body::Body::new(ActiveBody {
+            body,
+            _active: active,
+        })
+    })
+}
+
+/// A response body that stays `Active` until hyper has sent or dropped it, so a
+/// file still streaming after its handler returned isn't cut off by a restart.
+struct ActiveBody {
+    body: axum::body::Body,
+    _active: Active,
+}
+
+impl axum::body::HttpBody for ActiveBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// Relaunch into an update installed underneath this server once that interrupts nothing,
+/// so a long-lived `orx up` stops launching runs and building sandboxes with old code.
+fn spawn_restart_when_idle(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(UPDATE_SAMPLE_INTERVAL).await;
+            let status = updates::status();
+            // The cache can claim an install the exec target doesn't have; never restart in a loop.
+            if !(status.auto_update
+                && status.restart_required
+                && updates::newer_exe_on_disk().await)
+            {
+                continue;
+            }
+            DRAINING.store(true, Ordering::SeqCst);
+            if ACTIVE.load(Ordering::SeqCst) == 0
+                && !state.data_dir_move_in_progress.load(Ordering::SeqCst)
+                && state.remote_sessions.list().await.iter().all(|session| {
+                    matches!(
+                        session.status,
+                        RemoteSessionStatus::Disconnected
+                            | RemoteSessionStatus::NeedsInstall
+                            | RemoteSessionStatus::NeedsUpdate
+                    )
+                })
+                && state.chat.stop_admitting_if_idle().await
+            {
+                state.restart.notify_one();
+                return;
+            }
+            DRAINING.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
 /// Startup summary of detected coding agents. Never blocks. It goes through
 /// the same locked cache path as `/api/harnesses`, so the dashboard's first
 /// call serves the preflight result instead of launching a second sweep.
@@ -5248,6 +5360,7 @@ struct SetUiStateReq {
     #[serde(default)]
     preferred_agent: Option<StoredAgentSelectionReq>,
     workspace: Option<GlobalWorkspaceState>,
+    preferred_autonomy: Option<Autonomy>,
 }
 
 #[derive(Deserialize)]
@@ -5299,6 +5412,9 @@ async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
         }
         if let Some(selection) = selection {
             store.set_preferred_agent(&selection)?;
+        }
+        if let Some(autonomy) = req.preferred_autonomy {
+            store.set_preferred_autonomy(autonomy)?;
         }
         if let Some(workspace) = req.workspace {
             store.set_global_workspace_state(&workspace)?;
@@ -5472,7 +5588,11 @@ pub(crate) async fn ssh_connect_to_target(
     if host.is_empty() {
         return bad_request("host is required").into_response();
     }
-    ws.on_upgrade(move |socket| ssh_connect_socket(socket, host, req.backend, target))
+    let active = Active::new();
+    ws.on_upgrade(move |socket| async move {
+        let _active = active;
+        ssh_connect_socket(socket, host, req.backend, target).await
+    })
 }
 
 const DEFAULT_PTY_SIZE: PtySize = PtySize {
@@ -5775,7 +5895,9 @@ async fn project_terminal(
     if let Some(rejected) = reject_cross_origin(&headers) {
         return rejected;
     }
+    let active = Active::new();
     ws.on_upgrade(move |mut socket| async move {
+        let _active = active;
         let mut size = DEFAULT_PTY_SIZE;
         let started = tokio::task::spawn_blocking(move || {
             let root = project_terminal_root(&id, req.session_id.as_deref())?;
@@ -5930,7 +6052,9 @@ async fn command_terminal(
     if let Some(rejected) = reject_cross_origin(headers) {
         return rejected;
     }
+    let active = Active::new();
     ws.on_upgrade(move |mut socket| async move {
+        let _active = active;
         let mut size = DEFAULT_PTY_SIZE;
         let started = match program {
             Ok(program) => spawn_pty(program, args, Vec::new(), size).await,
@@ -6816,6 +6940,7 @@ struct CreateChatSessionReq {
     #[serde(default)]
     plan_mode: bool,
     reasoning_level: Option<String>,
+    autonomy: Option<Autonomy>,
 }
 
 async fn create_chat_session(
@@ -6871,6 +6996,7 @@ async fn create_chat_session(
         context_usage_json: None,
         bootstrap_context: None,
         goal: None,
+        autonomy: req.autonomy.map(|autonomy| autonomy.id().to_string()),
         active_leaf_id: None,
         parent_session_id: None,
         created_at: now_ms(),
@@ -6971,6 +7097,7 @@ struct UpdateChatSessionReq {
     /// Present-and-null clears the goal, which is why it is doubly wrapped.
     #[serde(default, deserialize_with = "present_nullable_string")]
     goal: Option<Option<String>>,
+    autonomy: Option<Autonomy>,
 }
 
 async fn update_chat_session(
@@ -7014,6 +7141,12 @@ async fn update_chat_session(
         state
             .chat
             .set_permission_mode(&id, &permission_mode)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(autonomy) = req.autonomy {
+        state
+            .chat
+            .set_autonomy(&id, autonomy)
             .await?
             .ok_or_else(|| not_found("chat session"))?
     } else {
@@ -7909,6 +8042,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_streaming_response_stays_active_until_its_body_is_sent() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let release = gate.clone();
+        let app = Router::new()
+            .route(
+                "/file",
+                get(move || async move {
+                    axum::body::Body::from_stream(futures::stream::once(async move {
+                        gate.notified().await;
+                        Ok::<_, Infallible>("done")
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn(track_active));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        assert_eq!(response.text().await.unwrap(), "done");
+        for _ in 0..100 {
+            if ACTIVE.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a sent response body stayed active");
+    }
+
+    #[tokio::test]
     async fn lagged_chat_stream_requests_resync_and_continues() {
         use axum::response::IntoResponse;
         let (sender, receiver) = tokio::sync::broadcast::channel(1);
@@ -7957,6 +8122,7 @@ mod tests {
             tour_completed: Some(true),
             preferred_agent: None,
             workspace: Some(invalid),
+            preferred_autonomy: None,
         }))
         .await;
         assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);

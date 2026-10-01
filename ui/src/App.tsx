@@ -90,6 +90,8 @@ import {
   openProject,
   updateUiState,
   type AgentSelection,
+  type Autonomy,
+  DEFAULT_AUTONOMY,
   type Project,
   type RuntimeInfo,
   type Run,
@@ -814,6 +816,18 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       });
     preferredAgentWrite.current = write.catch(() => {});
     return write;
+  }, []);
+
+  const preferredAutonomyWrite = useRef<Promise<unknown>>(Promise.resolve());
+  const preferredAutonomySaveSeq = useRef(0);
+  const persistPreferredAutonomy = useCallback((autonomy: Autonomy) => {
+    const saveSeq = ++preferredAutonomySaveSeq.current;
+    setUiState((current) => current && { ...current, preferredAutonomy: autonomy });
+    preferredAutonomyWrite.current = preferredAutonomyWrite.current
+      .then(() => updateUiStateMutation.mutateAsync({ preferredAutonomy: autonomy }))
+      .catch(() => {
+        if (saveSeq === preferredAutonomySaveSeq.current) void uiStateQuery.refetch();
+      });
   }, []);
 
   // Shrinking the window can push a fixed-width panel past its usable max —
@@ -1641,6 +1655,8 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             onActiveSessionChange={onActiveSessionChange}
             preferredAgent={uiState.preferredAgent}
             onPreferredAgentChange={persistPreferredAgent}
+            preferredAutonomy={uiState.preferredAutonomy ?? DEFAULT_AUTONOMY}
+            onPreferredAutonomyChange={persistPreferredAutonomy}
           >
             {mainView === "skills" ? (
               <SkillsTab />
