@@ -96,13 +96,18 @@ mod tests {
         if super::is_wsl() {
             return;
         }
-        let saved = ["DISPLAY", "WAYLAND_DISPLAY"].map(|var| (var, std::env::var_os(var)));
+        let saved = ["DISPLAY", "WAYLAND_DISPLAY", "WSL_DISTRO_NAME"]
+            .map(|var| (var, std::env::var_os(var)));
         std::env::remove_var("WAYLAND_DISPLAY");
         std::env::remove_var("DISPLAY");
         assert!(!super::has_display());
         std::env::set_var("DISPLAY", "");
         assert!(!super::has_display());
         std::env::set_var("DISPLAY", ":0");
+        assert!(super::has_display());
+        // WSL opens the Windows host's browser without a Linux display.
+        std::env::remove_var("DISPLAY");
+        std::env::set_var("WSL_DISTRO_NAME", "Ubuntu");
         assert!(super::has_display());
         for (var, value) in saved {
             match value {
