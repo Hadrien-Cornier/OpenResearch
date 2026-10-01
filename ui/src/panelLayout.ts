@@ -10,8 +10,8 @@ export function panelMaxWidth(): number {
   return Math.max(PANEL_MIN_WIDTH, window.innerWidth - LAYOUT_CHROME - CHAT_MIN_SPACE);
 }
 
-const SIDE_CHAT_MIN_WIDTH = 560;
-const SIDE_CHAT_WIDTH_RATIO = 0.38;
+const SIDE_CHAT_MIN_WIDTH = 500;
+const SIDE_CHAT_WIDTH_RATIO = 0.33;
 
 /** A side chat needs room for a full transcript and composer. */
 export function sideChatPanelWidth(): number {
