@@ -1255,5 +1255,13 @@
   "tree_restore_only": "恢复此实验",
   "tree_restore_above": "恢复已归档的祖先节点",
   "tree_restore_down": "恢复后代节点",
-  "tree_all_experiments_archived": "所有实验均已归档。开启“显示已归档”即可查看。"
+  "tree_all_experiments_archived": "所有实验均已归档。开启“显示已归档”即可查看。",
+  "side_command_description": "在临时侧边对话中快速提问",
+  "side_chat_open": "侧边对话",
+  "side_chat_needs_a_chat": "请先打开一个对话，再从中开启侧边对话。",
+  "side_chat_open_failed": "无法打开侧边对话：{error}",
+  "side_chat_empty": "关闭侧边对话或关闭应用后，侧边对话就会消失。",
+  "workspace_more_tools": "更多工具",
+  "side_chat_nested": "侧边对话不能再开启自己的侧边对话。",
+  "side_chat_close_failed": "无法删除侧边对话：{error}"
 }

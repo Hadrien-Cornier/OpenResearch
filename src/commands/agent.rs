@@ -186,6 +186,7 @@ async fn spawn(
         autonomy: None,
         active_leaf_id: None,
         parent_session_id: Some(parent_id.clone()),
+        side_parent_session_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -239,6 +240,7 @@ mod tests {
             autonomy: None,
             active_leaf_id: None,
             parent_session_id: parent_session_id.map(str::to_string),
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         }
