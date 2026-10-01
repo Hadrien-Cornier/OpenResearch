@@ -12,12 +12,17 @@ pub fn open_browser(url: &str) {
 
 /// [`open_browser`] for `orx up`, reporting an opener that fails to spawn or
 /// exits non-zero (e.g. `xdg-open` without a display) to telemetry.
-pub fn open_dashboard(url: &str, mode: crate::telemetry::UpLaunchMode) {
+/// Returns the watcher so a command about to exit can await it.
+pub fn open_dashboard(
+    url: &str,
+    mode: crate::telemetry::UpLaunchMode,
+) -> Option<tokio::task::JoinHandle<()>> {
     let Some(mut child) = launch(url) else {
-        return crate::telemetry::capture_browser_open_failed(mode);
+        crate::telemetry::capture_browser_open_failed(mode);
+        return None;
     };
     // Openers that run the browser in the foreground never exit; stop watching then.
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         for _ in 0..50 {
             match child.try_wait() {
                 Ok(Some(status)) if !status.success() => {
@@ -27,7 +32,7 @@ pub fn open_dashboard(url: &str, mode: crate::telemetry::UpLaunchMode) {
                 _ => return,
             }
         }
-    });
+    }))
 }
 
 fn launch(url: &str) -> Option<Child> {

@@ -2069,16 +2069,6 @@ mod tests {
                 "cli-release-contract-test",
                 json!({ "command": "up" }),
             ),
-            build_payload(
-                "command",
-                "cli-release-contract-test",
-                json!({ "command": "up", "mode": UpLaunchMode::Remote }),
-            ),
-            build_payload(
-                "browser_open_failed",
-                "cli-release-contract-test",
-                json!({ "mode": UpLaunchMode::Browser }),
-            ),
             build_payload("app_started", "cli-release-contract-test", json!({})),
             build_payload(
                 "telemetry_consent",
@@ -2146,9 +2136,34 @@ mod tests {
                 json!({ "kind": "run", "local": true, "computeTarget": "local" }),
             ),
         ];
+        let launch_modes = [
+            UpLaunchMode::Browser,
+            UpLaunchMode::NoBrowser,
+            UpLaunchMode::Ssh,
+            UpLaunchMode::Remote,
+            UpLaunchMode::RemoteHost,
+        ];
+        let launch_payloads = launch_modes.into_iter().flat_map(|mode| {
+            [
+                build_payload(
+                    "command",
+                    "cli-release-contract-test",
+                    json!({ "command": "up", "mode": mode }),
+                ),
+                build_payload(
+                    "browser_open_failed",
+                    "cli-release-contract-test",
+                    json!({ "mode": mode }),
+                ),
+            ]
+        });
         let mut localized = build_payload("app_started", "cli-release-contract-test", json!({}));
         localized["context"]["locale"] = json!("zh-CN");
-        for payload in payloads.into_iter().chain([localized]) {
+        for payload in payloads
+            .into_iter()
+            .chain(launch_payloads)
+            .chain([localized])
+        {
             assert_eq!(post_payload(&payload).await, DeliveryOutcome::Acknowledged);
         }
     }
