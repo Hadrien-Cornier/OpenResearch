@@ -1749,7 +1749,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         (root || !captured.background.is_empty()).then(|| {
             json!({"native": native_id, "startedAt": turn_started_at,
                 "roots": captured.background, "parents": captured.parents,
-                "prompt": root.then_some(&prompt_id)})
+                "prompt": root.then_some(&prompt_id), "endpoint": base})
         }),
         &base,
     );
