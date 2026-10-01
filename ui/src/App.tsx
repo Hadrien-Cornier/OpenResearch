@@ -2168,8 +2168,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       }
                       runtime={runtime}
                       activeSessionId={sideTab.sessionId}
+                      onOpenSideChat={(parentSessionId, question) => void startSideChat(parentSessionId, question)}
                       onActiveSessionChange={(sessionId, options) => {
-                        // Null after a delete drops the tab; otherwise (`/new`) it is the main chat's.
+                        // Null after a delete drops the tab; anything else (`/resume`) is the main chat's.
                         const deleted = !queryClient.getQueryData(listChatSessionsQuery(projectId).queryKey)
                           ?.some((session) => session.id === sideTab.sessionId);
                         if (sessionId === null && deleted) forgetSideTab(sideTab);

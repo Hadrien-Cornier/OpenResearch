@@ -4794,7 +4794,10 @@ export function ChatPanel({
         void togglePlanMode();
         return false;
       case "new":
-        startNewTask();
+        // In a side chat, a new chat is another side chat off the same parent.
+        if (embedded) {
+          if (openSession?.sideParentSessionId) onOpenSideChat?.(openSession.sideParentSessionId, "");
+        } else startNewTask();
         return false;
       case "resume":
         setResumeOpen(true);
@@ -6007,7 +6010,8 @@ export function ChatPanel({
         event.key !== "Enter" ||
         (!event.metaKey && !event.ctrlKey) ||
         event.altKey ||
-        !event.shiftKey
+        !event.shiftKey ||
+        inSideChat(event.target)
       )
         return;
       event.preventDefault();
