@@ -586,8 +586,8 @@ async fn connect(args: &CheckArgs, persist: Option<u64>) -> Result<()> {
             }
             .ok_or_else(|| anyhow!("Pass --host or configure a default host."))?;
             let target = crate::jobs::ssh::SshTarget::alias(&host);
-            let argv = crate::jobs::ssh::interactive_args(&target, persist).await?;
-            interactive_command("ssh", &argv).await?;
+            let connection = crate::jobs::ssh::interactive_args(&target, persist).await?;
+            interactive_command("ssh", &connection.args).await?;
         }
         Backend::Hf => {
             interactive_command("hf", &["auth".into(), "login".into()]).await?;

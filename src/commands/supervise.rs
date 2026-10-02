@@ -611,12 +611,14 @@ async fn watch_ssh_job(
 ) -> Result<RunStatus> {
     let path = log_path(run_id);
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+    let (log_error_tx, log_error_rx) = tokio::sync::watch::channel(None);
     let mut log_task = tokio::spawn(tail_logs_ssh(
         target.clone(),
         dir.clone(),
         path.clone(),
         run_id.to_string(),
         done_rx,
+        Some(log_error_tx),
     ));
 
     let mut last_status = initial_status;
@@ -630,7 +632,12 @@ async fn watch_ssh_job(
             cancel_ssh(&target, &dir, container.as_ref(), run_id, &mut cancel_sent).await;
         }
         let observed = ssh::inspect_job(&target, &dir, container.as_ref()).await;
-        let error = observed.as_ref().err().map(|err| {
+        let polling_error = observed
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .or_else(|| log_error_rx.borrow().clone());
+        let error = polling_error.map(|err| {
             let recovery = if descriptor.kind == "ssh_job" {
                 format!(
                     "Reconnect with orx compute connect ssh --host {}.",
@@ -669,11 +676,13 @@ async fn watch_ssh_job(
                 Err(err) => eprintln!("supervise {run_id}: could not save monitoring state: {err}"),
             }
         }
-        if error.is_some() {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            continue;
+        let job = match observed {
+            Ok(job) => job,
+            Err(_) => {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
         };
-        let job = observed?;
         let stage = job.stage.as_str();
         let status = run_status_for_stage(store, run_id, cancel_sent, stage);
 
@@ -739,6 +748,7 @@ async fn tail_logs_ssh(
     path: std::path::PathBuf,
     run_id: String,
     done: tokio::sync::watch::Receiver<bool>,
+    errors: Option<tokio::sync::watch::Sender<Option<String>>>,
 ) {
     let mut log_file = match std::fs::OpenOptions::new()
         .create(true)
@@ -748,6 +758,9 @@ async fn tail_logs_ssh(
     {
         Ok(f) => f,
         Err(err) => {
+            if let Some(errors) = &errors {
+                errors.send_replace(Some(format!("could not open local run log: {err}")));
+            }
             eprintln!(
                 "supervise {run_id}: could not open {}: {err}",
                 path.display()
@@ -774,6 +787,9 @@ async fn tail_logs_ssh(
                     last_error = Some(err);
                 }
             }
+        }
+        if let Some(errors) = &errors {
+            errors.send_replace(last_error.clone());
         }
         let _ = log_file.flush();
         if *done.borrow() {
@@ -1161,6 +1177,7 @@ async fn run_slurm(
         path.clone(),
         run_id.clone(),
         done_rx,
+        None,
     ));
 
     let mut last_status = status_of(&stored)?;

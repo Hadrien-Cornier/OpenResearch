@@ -223,12 +223,12 @@ case "$*" in
     case "$phase" in
       outage) echo 'Permission denied (MFA expired)' >&2; exit 255;;
       missing) if [ "$SSH_BACKEND" = 1 ]; then echo 'cannot assign requested address'; else echo GONE; fi;;
-      running) if [ "$SSH_BACKEND" = 1 ]; then echo RUNNING; else echo 'SQ RUNNING'; fi;;
+      running|log_failure) if [ "$SSH_BACKEND" = 1 ]; then echo RUNNING; else echo 'SQ RUNNING'; fi;;
       done) if [ "$SSH_BACKEND" = 1 ]; then echo 'EXIT 0'; else echo 'SA COMPLETED'; fi;;
     esac;;
   *tail*)
     case "$(cat "$HOME/phase")" in
-      missing|outage) echo 'proxy dial error';;
+      missing|outage|log_failure) echo 'proxy dial error';;
       *) printf '__ORX_LOG_START__\n'; case "$*" in *'tail -n +1 '*) printf 'first\nsecond\n';; esac;;
     esac;;
   *) exit 0;;
@@ -305,6 +305,14 @@ esac
         metadata()["jobId"],
         if ssh_backend { ".orx/runs/run" } else { "42" }
     );
+    if ssh_backend {
+        std::fs::write(&phase, "log_failure").unwrap();
+        wait(&|| {
+            metadata()["monitoringError"]
+                .as_str()
+                .is_some_and(|s| s.contains("unexpected SSH log output"))
+        });
+    }
     std::fs::write(&phase, "running").unwrap();
     wait(&|| metadata()["monitoringError"].is_null());
     std::fs::write(&phase, "done").unwrap();

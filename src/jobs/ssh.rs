@@ -282,6 +282,12 @@ pub(crate) fn forward_args(
     Ok(args)
 }
 
+pub(crate) struct InteractiveConnection {
+    pub args: Vec<String>,
+    #[cfg(unix)]
+    _lock: std::fs::File,
+}
+
 /// Arguments for the short interactive login opened by Settings. `true` ends
 /// the visible session after authentication while ControlPersist keeps its
 /// master available to the batch-mode calls below — on Windows there is no
@@ -289,8 +295,26 @@ pub(crate) fn forward_args(
 pub(crate) async fn interactive_args(
     target: &SshTarget,
     persist: Option<u64>,
-) -> Result<Vec<String>> {
+) -> Result<InteractiveConnection> {
     prepare_control_dir()?;
+    #[cfg(unix)]
+    let lock = {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(control_path(target).with_extension("lock"))?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+        file
+    };
     #[cfg(unix)]
     if !master_is_running(target).await? {
         match std::fs::remove_file(control_path(target)) {
@@ -305,7 +329,11 @@ pub(crate) async fn interactive_args(
     }
     args.extend(ssh_opts(target, false));
     args.extend(["--".into(), target.dest.clone(), "true".into()]);
-    Ok(args)
+    Ok(InteractiveConnection {
+        args,
+        #[cfg(unix)]
+        _lock: lock,
+    })
 }
 
 #[cfg(not(unix))]
@@ -789,7 +817,17 @@ mod tests {
         symlink(path.with_extension("missing"), &path).unwrap();
         let args = interactive_args(&target, Some(120)).await.unwrap();
         assert!(std::fs::symlink_metadata(&path).is_err());
-        assert_eq!(args[..2], ["-o", "ControlPersist=120"]);
+        assert_eq!(args.args[..2], ["-o", "ControlPersist=120"]);
+        let socket = UnixListener::bind(&path).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), interactive_args(&target, None))
+                .await
+                .is_err()
+        );
+        assert!(path.exists());
+        drop(socket);
+        drop(args);
+        assert!(interactive_args(&target, None).await.is_ok());
         let opts = ssh_opts(&target, true);
         for option in [
             "ServerAliveInterval=30",
