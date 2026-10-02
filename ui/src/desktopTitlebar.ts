@@ -10,7 +10,7 @@ const swatch = document
   .createElement("canvas")
   .getContext("2d", { willReadFrequently: true });
 
-/** Any CSS color as #rrggbb, or null when it is not fully opaque. */
+/** Any CSS color as rrggbb hex, or null when it is not fully opaque. */
 function opaqueHex(color: string): string | null {
   if (!swatch) return null;
   swatch.clearRect(0, 0, 1, 1);
@@ -26,7 +26,9 @@ function opaqueHex(color: string): string | null {
 function topEdgeColor(): string | null {
   const hits = document.elementsFromPoint(window.innerWidth / 2, 0);
   // Content scrolled under the titlebar shouldn't recolor it; match the surface it scrolls over.
-  const scroller = hits.findIndex((el) => /auto|scroll/.test(getComputedStyle(el).overflowY));
+  const scroller = hits.findIndex(
+    (el) => el.scrollHeight > el.clientHeight && /auto|scroll/.test(getComputedStyle(el).overflowY),
+  );
   for (const element of hits.slice(Math.max(scroller, 0))) {
     const hex = opaqueHex(getComputedStyle(element).backgroundColor);
     if (hex) return hex;

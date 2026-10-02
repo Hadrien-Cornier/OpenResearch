@@ -1221,7 +1221,7 @@ mod imp {
         use tao::window::Theme;
 
         #[test]
-        fn parses_titlebar_colors() {
+        fn titlebar_messages_carry_a_preference_and_an_opaque_color() {
             assert_eq!(
                 parse_titlebar_message("titlebar:system:0e0c0c"),
                 Some((None, [0x0e, 0x0c, 0x0c]))
