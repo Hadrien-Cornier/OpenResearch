@@ -725,6 +725,18 @@ mod imp {
                 return;
             }
         };
+        #[cfg(target_os = "linux")]
+        {
+            use gtk::prelude::*;
+            use tao::platform::unix::WindowExtUnix;
+            // The AppImage forces X11, where the window manager's own titlebar ignores
+            // GTK styling; a header bar puts the titlebar in GTK's hands.
+            let header = gtk::HeaderBar::new();
+            header.set_title(Some("OpenResearch"));
+            header.set_show_close_button(true);
+            header.show();
+            window.gtk_window().set_titlebar(Some(&header));
+        }
         // The dashboard's --base until the page reports what it shows under the titlebar.
         #[cfg(not(target_os = "linux"))]
         set_titlebar_color(
@@ -975,8 +987,6 @@ mod imp {
         };
     }
 
-    /// GTK draws the titlebar on GNOME and Wayland; window managers that draw
-    /// their own ignore this.
     #[cfg(target_os = "linux")]
     fn titlebar_css() -> gtk::CssProvider {
         let provider = gtk::CssProvider::new();
@@ -1005,7 +1015,8 @@ mod imp {
         };
         let rule = format!(
             ".titlebar, .titlebar:backdrop {{ background: rgb({r}, {g}, {b}); \
-             color: rgb({tr}, {tg}, {tb}); border-color: transparent; box-shadow: none; }}"
+             border-color: transparent; box-shadow: none; }} \
+             .titlebar *, .titlebar:backdrop * {{ color: rgb({tr}, {tg}, {tb}); }}"
         );
         if let Err(err) = css.load_from_data(rule.as_bytes()) {
             eprintln!("openresearch app: could not style the titlebar: {err}");
