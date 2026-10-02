@@ -78,6 +78,13 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || inputs.tag }}
 
+      - name: Take signing action from the workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: signing-workflow
+          sparse-checkout: .github/actions/windows-signing
+
       # The runner's preinstalled stable toolchain, as release-macos-app.yml uses.
       - name: Build the launcher
         run: cargo build --release --locked --manifest-path windows/launcher/Cargo.toml
@@ -105,7 +112,7 @@ jobs:
           subscription-id: ${{ vars.WINDOWS_SIGNING_SUBSCRIPTION_ID }}
 
       - name: Sign the app and bundled CLI
-        uses: ./.github/actions/windows-signing
+        uses: ./signing-workflow/.github/actions/windows-signing
         with:
           files: |
             ${{ github.workspace }}\app-staging\OpenResearch.exe
@@ -120,7 +127,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Sign the installer
-        uses: ./.github/actions/windows-signing
+        uses: ./signing-workflow/.github/actions/windows-signing
         with:
           files: ${{ github.workspace }}\app-installer\OpenResearch-Setup.exe
           endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
