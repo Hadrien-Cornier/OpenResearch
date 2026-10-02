@@ -5732,13 +5732,14 @@ async fn ssh_connect_socket(
     backend: SshConnectBackend,
     target: crate::jobs::ssh::SshTarget,
 ) {
-    let args = match crate::jobs::ssh::interactive_args(&target) {
-        Ok(args) => args,
+    let connection = match crate::jobs::ssh::interactive_args(&target, None).await {
+        Ok(connection) => connection,
         Err(error) => {
             send_ssh_connect_error(&mut socket, &host, backend, error.to_string()).await;
             return;
         }
     };
+    let args = connection.args.clone();
     let session = match tokio::task::spawn_blocking(move || start_pty("ssh", args)).await {
         Ok(Ok(session)) => session,
         Ok(Err(error)) => {
@@ -5779,6 +5780,7 @@ async fn ssh_connect_socket(
         }
     }
 
+    drop(connection);
     let (backend_name, result, ssh_test) = match backend {
         SshConnectBackend::Ssh => {
             let test = probe_ssh_host_preflight(host.clone()).await;

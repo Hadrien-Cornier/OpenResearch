@@ -1321,7 +1321,16 @@ fn ensure_worktree_from(
     start_ref: &str,
     restore_lost: bool,
 ) -> Result<PathBuf> {
-    if dir.join(".git").exists() {
+    // In-process turns, terminals and slash commands race to create the same session's worktree.
+    static WORKTREE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = WORKTREE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let has_git = dir
+        .join(".git")
+        .try_exists()
+        .map_err(|e| anyhow!("Could not inspect worktree {}: {}", dir.display(), e))?;
+    if has_git {
         if git(Some(&dir), &["rev-parse", "--is-inside-work-tree"]).is_ok() {
             return Ok(dir);
         }
@@ -1337,22 +1346,42 @@ fn ensure_worktree_from(
     }
     // An empty dir left at the path would make git refuse to treat the worktree as missing.
     let _ = std::fs::remove_dir(&dir);
-    let target = dir.to_string_lossy().to_string();
     // Read the lost checkout before the `worktree remove` below erases its registration.
     let lost = if restore_lost {
         lost_worktree_head(repo, &dir)
     } else {
         None
     };
-    // A manually deleted worktree dir leaves a stale registration that blocks `worktree add`
-    // here; a prune would also erase other vanished sessions' checkouts before they restore.
-    let _ = git(Some(repo), &["worktree", "remove", "--force", &target]);
+    // An agent that recreates its vanished worktree leaves files there that block `worktree add`.
+    let stamp = crate::store::now_ms().to_string();
+    let stray = if restore_lost {
+        set_aside_stray_dir(&dir, &stamp)?
+    } else {
+        None
+    };
+    // Clears a stale registration (prune would also erase other vanished sessions' checkouts).
+    // `remove --force` deletes a live checkout, so it only runs once the dir is confirmed gone.
+    if matches!(dir.try_exists(), Ok(false)) {
+        let _ = git(
+            Some(repo),
+            &["worktree", "remove", "--force", &dir.to_string_lossy()],
+        );
+    }
+    let added = add_worktree(repo, &dir, lost.as_deref(), start_ref);
+    if let Some(stray) = stray {
+        settle_stray_dir(&dir, &stray, &stamp, added.is_ok());
+    }
+    added.map(|()| dir)
+}
+
+fn add_worktree(repo: &Path, dir: &Path, lost: Option<&str>, start_ref: &str) -> Result<()> {
+    let target = dir.to_string_lossy();
     if let Some(head) = lost {
         // A commit sha checks out detached; a branch name checks out the branch.
-        match git(Some(repo), &["worktree", "add", &target, &head]) {
+        match git(Some(repo), &["worktree", "add", &target, head]) {
             Ok(_) => {
                 eprintln!("orx: restored missing worktree {} at {head}", dir.display());
-                return Ok(dir);
+                return Ok(());
             }
             Err(err) => eprintln!(
                 "orx: could not restore missing worktree {} at {head}: {err}",
@@ -1364,7 +1393,43 @@ fn ensure_worktree_from(
         Some(repo),
         &["worktree", "add", "--detach", &target, start_ref],
     )?;
-    Ok(dir)
+    Ok(())
+}
+
+fn set_aside_stray_dir(dir: &Path, stamp: &str) -> Result<Option<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let mut name = dir.as_os_str().to_owned();
+    name.push(format!(".stray-{stamp}"));
+    let stray = PathBuf::from(name);
+    std::fs::rename(dir, &stray)
+        .map_err(|e| anyhow!("Could not move {} aside: {}", dir.display(), e))?;
+    Ok(Some(stray))
+}
+
+/// Keeps set-aside files inside the restored worktree, or puts them back if the restore failed.
+fn settle_stray_dir(dir: &Path, stray: &Path, stamp: &str, restored: bool) {
+    let recovered = dir.join(".openresearch").join("recovered");
+    let kept = recovered.join(stamp);
+    let moved = if restored {
+        std::fs::create_dir_all(&recovered).and_then(|()| std::fs::rename(stray, &kept))
+    } else {
+        std::fs::rename(stray, dir)
+    };
+    if let Err(err) = moved {
+        eprintln!(
+            "orx: left files found in missing worktree {} at {}: {err}",
+            dir.display(),
+            stray.display()
+        );
+    } else if restored {
+        eprintln!(
+            "orx: kept files found in missing worktree {} at {}",
+            dir.display(),
+            kept.display()
+        );
+    }
 }
 
 /// What a still-registered worktree at `dir` had checked out: its branch, else its commit.
@@ -2791,6 +2856,65 @@ mod tests {
 
         ensure_worktree_from(&hub, dir.clone(), "main", true).unwrap();
         assert_eq!(run(&dir, &["branch", "--show-current"]), "exp/empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn vanished_worktree_recreated_with_files_is_restored_and_keeps_them() {
+        let hub = temp_repo();
+        let dir = hub.with_extension("session");
+        ensure_worktree_from(&hub, dir.clone(), "main", true).unwrap();
+        run(&dir, &["switch", "-q", "-c", "exp/stray"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        write(&dir, "figure.png", "plot\n");
+
+        ensure_worktree_from(&hub, dir.clone(), "main", true).unwrap();
+        assert_eq!(run(&dir, &["branch", "--show-current"]), "exp/stray");
+        let mut recovered = std::fs::read_dir(dir.join(".openresearch").join("recovered")).unwrap();
+        let kept = recovered.next().unwrap().unwrap().path();
+        assert!(recovered.next().is_none());
+        assert_eq!(
+            std::fs::read_to_string(kept.join("figure.png")).unwrap(),
+            "plot\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn failed_add_puts_stray_files_back() {
+        let hub = temp_repo();
+        let dir = hub.with_extension("session");
+        std::fs::create_dir(&dir).unwrap();
+        write(&dir, "figure.png", "plot\n");
+
+        assert!(ensure_worktree_from(&hub, dir.clone(), "no-such-ref", true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("figure.png")).unwrap(),
+            "plot\n"
+        );
+        let stray_prefix = format!("{}.stray-", dir.file_name().unwrap().to_string_lossy());
+        let siblings = std::fs::read_dir(dir.parent().unwrap()).unwrap();
+        assert!(!siblings
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with(&stray_prefix)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn seeded_worktree_never_moves_recreated_files() {
+        let hub = temp_repo();
+        let dir = hub.with_extension("seeded");
+        ensure_worktree_from(&hub, dir.clone(), "main", false).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        write(&dir, "figure.png", "plot\n");
+
+        assert!(ensure_worktree_from(&hub, dir.clone(), "main", false).is_err());
+        assert!(dir.join("figure.png").is_file());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&hub);
     }
