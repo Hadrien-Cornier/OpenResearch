@@ -194,7 +194,6 @@ jobs:
     uses: ./.github/workflows/sign-windows-cli.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
