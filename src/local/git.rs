@@ -157,10 +157,13 @@ fn long_paths() -> &'static [&'static str] {
     }
 }
 
-/// `git` resolved on the user's shell PATH: a Finder-launched app's launchd PATH
-/// finds only `/usr/bin/git`, which fails without the Xcode Command Line Tools.
+/// `git` resolved on, and run with, the user's shell PATH: a Finder-launched
+/// app's launchd PATH finds only `/usr/bin/git`, which needs the Xcode CLT.
 pub fn git_command() -> Command {
-    let mut command = Command::new("git");
+    let mut command = match super::shell_env::find_on_path("git") {
+        Some(path) => Command::new(path),
+        None => Command::new("git"),
+    };
     if let Some(paths) = super::shell_env::search_path() {
         command.env("PATH", paths);
     }
