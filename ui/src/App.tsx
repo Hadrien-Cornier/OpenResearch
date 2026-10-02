@@ -975,6 +975,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     reportFirstAction("open_experiment");
     const tab = { id, view };
     setExpTabs((prev) => (prev.some((t) => sameExpTab(t, tab)) ? prev : [...prev, tab]));
+    if (view === "terminal" && isDemoProjectId(projectIdRef.current)) {
+      setPanelWidth((width) => Math.max(width, sideChatPanelWidth()));
+    }
     openRightTab(tab, intent, runId);
   }, [openRightTab]);
 

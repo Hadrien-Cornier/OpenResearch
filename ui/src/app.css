@@ -300,9 +300,9 @@
   }
 }
 
-/* Reserve room for the three compact workspace buttons. */
+/* Reserve room for the four compact workspace buttons: 4×2rem + 3×0.75rem gaps + 1rem. */
 .workspace-body > .chat-pane .chat-header {
-  padding-inline-end: 8.5rem;
+  padding-inline-end: 11.25rem;
 }
 
 .workspace-card-visible > .chat-pane {
