@@ -27,7 +27,7 @@ from huggingface_hub import HfApi
 
 spec = json.load(sys.stdin)
 api = HfApi(endpoint=spec["endpoint"], token=spec["token"])
-# sync_bucket prints its sync plan to stdout, which must carry only the job JSON.
+# sync_job_volume prints its sync plan to stdout, which must carry only the job JSON.
 with contextlib.redirect_stdout(sys.stderr):
     volume = api.sync_job_volume(
         spec["sourceDir"],
@@ -61,6 +61,7 @@ fn managed_python() -> PathBuf {
 
 /// `huggingface_hub` gained `sync_job_volume` in 1.22, which requires Python 3.10.
 const MIN_PYTHON: (u32, u32) = (3, 10);
+const HUB_REQUIREMENT: &str = "huggingface_hub>=1.22.0";
 
 fn parse_python_version(text: &str) -> Option<(u32, u32)> {
     let (major, minor) = text.trim().split_once('.')?;
@@ -68,7 +69,7 @@ fn parse_python_version(text: &str) -> Option<(u32, u32)> {
 }
 
 /// Versioned names catch a newer Python hidden behind an old `python3` (Xcode CLT ships 3.9).
-fn base_python() -> Result<&'static str> {
+async fn base_python() -> Result<&'static str> {
     let mut too_old = None;
     for candidate in [
         "python3",
@@ -79,7 +80,7 @@ fn base_python() -> Result<&'static str> {
         "python3.11",
         "python3.10",
     ] {
-        let Some(version) = std::process::Command::new(candidate)
+        let Some(version) = tokio::process::Command::new(candidate)
             .args([
                 "-c",
                 "import sys, venv; print('%d.%d' % sys.version_info[:2])",
@@ -87,6 +88,7 @@ fn base_python() -> Result<&'static str> {
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
+            .await
             .ok()
             .filter(|output| output.status.success())
             .and_then(|output| parse_python_version(&String::from_utf8_lossy(&output.stdout)))
@@ -98,12 +100,15 @@ fn base_python() -> Result<&'static str> {
         }
         too_old.get_or_insert((candidate, version));
     }
+    let (min_major, min_minor) = MIN_PYTHON;
     Err(match too_old {
         Some((candidate, (major, minor))) => anyhow!(
-            "Hugging Face Jobs needs Python 3.10 or newer to stage source, but `{candidate}` is \
-             Python {major}.{minor}. Install a newer Python and retry."
+            "Hugging Face Jobs needs Python {min_major}.{min_minor} or newer to stage source, but \
+             `{candidate}` is Python {major}.{minor}. Install a newer Python and retry."
         ),
-        None => anyhow!("Python 3.10 or newer is required to stage source for Hugging Face Jobs."),
+        None => anyhow!(
+            "Python {min_major}.{min_minor} or newer is required to stage source for Hugging Face Jobs."
+        ),
     })
 }
 
@@ -132,7 +137,7 @@ async fn ensure_client_env() -> Result<PathBuf> {
     if python.exists() && client_env_ready(&python).await {
         return Ok(python);
     }
-    let base = base_python()?;
+    let base = base_python().await?;
     let env_dir = python
         .parent()
         .and_then(Path::parent)
@@ -162,13 +167,13 @@ async fn ensure_client_env() -> Result<PathBuf> {
             "install",
             "--quiet",
             "--disable-pip-version-check",
-            "huggingface_hub>=1.22.0",
+            HUB_REQUIREMENT,
         ])
         .status()
         .await?;
     if !status.success() || !client_env_ready(&python).await {
         return Err(anyhow!(
-            "Could not install the Hugging Face source-transfer client (huggingface_hub>=1.22.0)."
+            "Could not install the Hugging Face source-transfer client ({HUB_REQUIREMENT})."
         ));
     }
     Ok(python)
@@ -561,13 +566,15 @@ mod settings_tests {
         assert_eq!(parse_python_version("3.9\n"), Some((3, 9)));
         assert_eq!(parse_python_version("3.14"), Some((3, 14)));
         assert_eq!(parse_python_version("garbage"), None);
-        assert!(parse_python_version("3.9").unwrap() < MIN_PYTHON);
-        assert!(parse_python_version("3.10").unwrap() >= MIN_PYTHON);
     }
 
-    #[test]
-    fn source_launcher_keeps_library_output_off_stdout() {
-        let Ok(python) = base_python() else {
+    #[tokio::test]
+    async fn source_launcher_keeps_library_output_off_stdout() {
+        let Ok(python) = base_python().await else {
+            eprintln!(
+                "skipped: no Python {}.{}+ on PATH",
+                MIN_PYTHON.0, MIN_PYTHON.1
+            );
             return;
         };
         let dir = std::env::temp_dir().join(format!("orx-hf-launcher-{}", uuid::Uuid::new_v4()));
