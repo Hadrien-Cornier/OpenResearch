@@ -215,6 +215,7 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
             }
             event = events.recv() => {
                 let event = event.ok_or_else(|| anyhow!("ACP process exited during the turn; the prompt was not replayed"))?;
+                deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
                 ctx.mark_delivery(DeliveryState::Accepted);
                 apply_event(ctx, event, &mut tools)?;
             }

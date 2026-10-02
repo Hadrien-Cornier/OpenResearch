@@ -4,7 +4,7 @@ import { saveAcpHarness, testAcpHarness, type AcpDefinition } from "../api";
 import { validAcpLaunch } from "../acp";
 import { m } from "../paraglide/messages.js";
 import { OptionPicker } from "./ModelPicker";
-import { Button, IconButton, Input, showAlert } from "./ui";
+import { Button, IconButton, Input } from "./ui";
 
 export const ACP_PRESETS = {
   custom: { name: "", executable: "", arguments: [], url: "https://agentclientprotocol.com/overview/agents" },
@@ -24,6 +24,7 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
   const [args, setArgs] = useState(definition?.arguments ?? []);
   const [busy, setBusy] = useState(false);
   const [connected, setConnected] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     const dialog = dialogRef.current;
     dialog?.showModal();
@@ -38,10 +39,12 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
     setExecutable(ACP_PRESETS[id].executable);
     setArgs(ACP_PRESETS[id].arguments);
     setConnected(null);
+    setError(null);
   };
   const run = async (test: boolean) => {
     setBusy(true);
     setConnected(null);
+    setError(null);
     try {
       if (test) {
         const result = await testAcpHarness(launch);
@@ -52,7 +55,7 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
         onClose();
       }
     } catch (error) {
-      showAlert(error instanceof Error ? error.message : String(error), "error");
+      setError(error instanceof Error ? error.message : String(error));
     } finally { setBusy(false); }
   };
   return (
@@ -75,6 +78,7 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
         </div>
         <p className="text-sm text-text">{m.acp_setup_help()} <a href={ACP_PRESETS[preset].url} target="_blank" rel="noreferrer" className="text-primary underline">{m.acp_setup_docs()}</a></p>
         {definition && <p className="text-sm text-subtext">{m.acp_edit_help()}</p>}
+        {error && <p role="alert" className="text-sm text-accent-red">{error}</p>}
         {connected !== null && <p role="status" className="text-sm text-accent-green">{m.settings_page_connected()}{connected ? ` · ${connected}` : ""}</p>}
         <div className="mt-2 flex flex-wrap justify-end gap-2">
           <Button type="button" disabled={busy || !valid} onClick={() => void run(true)}>{m.acp_test()}</Button>

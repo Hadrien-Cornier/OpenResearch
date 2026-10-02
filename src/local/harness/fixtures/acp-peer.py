@@ -2,6 +2,9 @@ import json
 import os
 import sys
 
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+
 mode = sys.argv[1] if len(sys.argv) > 1 else "normal"
 session = "peer-session"
 count = 0
@@ -39,6 +42,8 @@ for line in sys.stdin:
     method = request.get("method")
     params = request.get("params", {})
     if method == "initialize":
+        assert params["clientCapabilities"]["fs"] == {"readTextFile": True, "writeTextFile": True}
+        assert params["clientCapabilities"]["terminal"] is True
         if mode == "crash-init":
             sys.exit(3)
         if mode == "auth-init":
@@ -61,6 +66,7 @@ for line in sys.stdin:
         if params["value"] == "reject":
             send(dict(id=request["id"], error=dict(code=-32602, message="Rejected selection")))
         else:
+            update(dict(sessionUpdate="current_mode_update", currentModeId="agent-changed"))
             reply(request, dict(configOptions=config(params["value"])))
     elif method == "session/prompt":
         text = params["prompt"][0]["text"].split("ACP_TEST:", 1)[-1]
@@ -89,7 +95,7 @@ for line in sys.stdin:
             response = reverse("fs/read_text_file", dict(path="relative"))
             assert "error" in response
         if text == "terminal":
-            response = reverse("terminal/create", dict(command=sys.executable, args=["-c", "print('héllo' * 1000)"], outputByteLimit=100))
+            response = reverse("terminal/create", dict(command=sys.executable, args=["-X", "utf8", "-c", "print('héllo' * 1000)"], outputByteLimit=100))
             terminal = response["result"]["terminalId"]
             response = reverse("terminal/wait_for_exit", dict(terminalId=terminal))
             assert response["result"]["exitCode"] == 0, response

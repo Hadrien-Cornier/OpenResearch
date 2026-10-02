@@ -42,7 +42,19 @@ impl Store {
             }
             _ => return Ok(()),
         };
-        self.conn.execute("UPDATE acp_sessions SET configuration_json = json_set(configuration_json, ?2, json(?3)) WHERE session_id = ?1", params![session_id, path, value.to_string()])?;
+        self.set_acp_configuration_value(session_id, path, value)
+    }
+
+    pub fn set_acp_configuration_value(
+        &self,
+        session_id: &str,
+        path: &str,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let changed = self.conn.execute("UPDATE acp_sessions SET configuration_json = json_set(configuration_json, ?2, json(?3)) WHERE session_id = ?1", params![session_id, path, value.to_string()])?;
+        if changed != 1 {
+            return Err(anyhow!("ACP session no longer exists"));
+        }
         Ok(())
     }
 

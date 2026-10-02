@@ -57,6 +57,7 @@ def main():
         assert parts[1]["state"]["status"] == "completed", parts
         changed = api("POST", f"/api/chat/sessions/{sid}/configuration", {"optionId": "opaque-model", "value": "second"})
         assert changed["nativeConfiguration"]["configOptions"][1]["currentValue"] == "high", changed
+        assert changed["nativeConfiguration"]["modes"]["currentModeId"] == "agent-changed", changed
         try:
             api("POST", f"/api/chat/sessions/{sid}/configuration", {"optionId": "opaque-model", "value": "reject"})
             raise AssertionError("Rejected model was accepted")

@@ -3,10 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use agent_client_protocol::schema::{
-    v1::{ClientCapabilities, FileSystemCapabilities, InitializeRequest, RequestPermissionRequest},
-    ProtocolVersion,
-};
+use agent_client_protocol::schema::{v1::RequestPermissionRequest, ProtocolVersion};
 use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, Responder, UntypedMessage};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -89,7 +86,7 @@ impl Client {
             client: self,
             was_idle: self.idle_since.lock().unwrap().take().is_some(),
         };
-        let mut state = crate::store::Store::open()?
+        let state = crate::store::Store::open()?
             .acp_session_state(session_id)?
             .ok_or_else(|| anyhow!("ACP session no longer exists"))?;
         let native_id = self
@@ -115,7 +112,10 @@ impl Client {
             if !response["configOptions"].is_array() {
                 bail!("Agent did not return its updated configuration");
             }
-            state.configuration["configOptions"] = response["configOptions"].clone();
+            crate::store::Store::open()?.apply_acp_configuration_update(
+                session_id,
+                &json!({"sessionUpdate": "config_option_update", "configOptions": response["configOptions"]}),
+            )?;
         } else {
             let (section, available, current, method, key) = match option_id {
                 "mode" => (
@@ -147,9 +147,12 @@ impl Client {
             }
             self.request(method, json!({"sessionId": native_id, key: value}))
                 .await?;
-            state.configuration[section][current] = json!(value);
+            crate::store::Store::open()?.set_acp_configuration_value(
+                session_id,
+                &format!("$.{section}.{current}"),
+                &json!(value),
+            )?;
         }
-        crate::store::Store::open()?.set_acp_configuration(session_id, &state.configuration)?;
         Ok(())
     }
 
@@ -401,6 +404,18 @@ impl Host {
                 client.shutdown().await;
             }
         }
+        self.prune_slots();
+    }
+
+    fn prune_slots(&self) {
+        self.clients.lock().unwrap().retain(|_, slot| {
+            Arc::strong_count(slot) > 1
+                || slot.try_lock().map_or(true, |saved| {
+                    saved
+                        .as_ref()
+                        .is_some_and(|client| !*client.closed.borrow())
+                })
+        });
     }
 
     pub async fn shutdown(&self) {
@@ -426,6 +441,7 @@ impl Host {
                 let Some(host) = weak.upgrade() else {
                     break;
                 };
+                host.prune_slots();
                 let policy = crate::local::agent_lifecycle::IdlePolicy::current();
                 let slots: Vec<_> = host.clients.lock().unwrap().values().cloned().collect();
                 let mut idle = Vec::new();
@@ -595,15 +611,7 @@ async fn spawn(
             )
             .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
                 let initialized = connection
-                    .send_request(
-                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                            ClientCapabilities::new()
-                                .fs(FileSystemCapabilities::new()
-                                    .read_text_file(true)
-                                    .write_text_file(true))
-                                .terminal(true),
-                        ),
-                    )
+                    .send_request(super::initialization())
                     .block_task()
                     .await?;
                 if initialized.protocol_version != ProtocolVersion::V1 {
@@ -784,6 +792,7 @@ mod tests {
         second.end_turn();
         host.stop("first").await;
         assert!(host.connected("first").await.is_err());
+        assert!(!host.clients.lock().unwrap().contains_key("first"));
         assert!(host.connected("second").await.is_ok());
         host.shutdown().await;
         tokio::fs::remove_file(path).await.unwrap();

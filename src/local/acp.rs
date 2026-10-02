@@ -16,6 +16,20 @@ impl Drop for OwnedProcess {
     }
 }
 
+fn initialization() -> agent_client_protocol::schema::v1::InitializeRequest {
+    use agent_client_protocol::schema::{
+        v1::{ClientCapabilities, FileSystemCapabilities, InitializeRequest},
+        ProtocolVersion,
+    };
+    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+        ClientCapabilities::new()
+            .fs(FileSystemCapabilities::new()
+                .read_text_file(true)
+                .write_text_file(true))
+            .terminal(true),
+    )
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Definition {
@@ -93,7 +107,7 @@ pub fn remove(id: &str) -> Result<()> {
 }
 
 pub async fn test_connection(definition: &Definition) -> Result<serde_json::Value> {
-    use agent_client_protocol::schema::{v1::InitializeRequest, ProtocolVersion};
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::{Agent, ByteStreams, ConnectionTo};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -133,10 +147,7 @@ pub async fn test_connection(definition: &Definition) -> Result<serde_json::Valu
         agent_client_protocol::Client.builder().connect_with(
             transport,
             |connection: ConnectionTo<Agent>| async move {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await
+                connection.send_request(initialization()).block_task().await
             },
         ),
     )
@@ -167,6 +178,8 @@ assert sys.argv[1:] == ['two words', '\"quoted\"', '$(echo untouched)']
 request = json.loads(sys.stdin.readline())
 assert request['method'] == 'initialize'
 assert request['params']['protocolVersion'] == 1
+assert request['params']['clientCapabilities']['fs'] == {'readTextFile': True, 'writeTextFile': True}
+assert request['params']['clientCapabilities']['terminal'] is True
 print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': {
     'protocolVersion': 1, 'agentCapabilities': {},
     'agentInfo': {'name': 'deterministic-peer', 'version': '1.0'}
@@ -205,7 +218,10 @@ for line in sys.stdin:
         let definition = Definition {
             id: format!("acp:{}", uuid::Uuid::new_v4()),
             name: "Custom agent".into(),
-            executable: "/tmp/agent with spaces".into(),
+            executable: std::env::temp_dir()
+                .join("agent with spaces")
+                .to_string_lossy()
+                .into_owned(),
             arguments: vec![
                 "two words".into(),
                 "\"quoted\"".into(),

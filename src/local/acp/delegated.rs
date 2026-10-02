@@ -198,21 +198,25 @@ impl Delegated {
                 .min(MAX_OUTPUT as u64) as usize,
             truncated: false,
         }));
-        let stdout = tokio::spawn(drain(
+        let mut stdout = tokio::spawn(drain(
             process.child.stdout.take().expect("piped stdout"),
             output.clone(),
         ));
-        let stderr = tokio::spawn(drain(
+        let mut stderr = tokio::spawn(drain(
             process.child.stderr.take().expect("piped stderr"),
             output.clone(),
         ));
         let (kill, mut kill_receiver) = watch::channel(false);
         let (exit_sender, exit) = watch::channel(None);
         let id = uuid::Uuid::new_v4().to_string();
-        self.terminals
-            .lock()
-            .unwrap()
-            .insert(id.clone(), Arc::new(Terminal { output, kill, exit }));
+        self.terminals.lock().unwrap().insert(
+            id.clone(),
+            Arc::new(Terminal {
+                output: output.clone(),
+                kill,
+                exit,
+            }),
+        );
         tokio::spawn(async move {
             let status = tokio::select! {
                 status = process.child.wait() => status,
@@ -223,7 +227,17 @@ impl Delegated {
                 }
             };
             crate::local::chat::kill_shell_group(process.id.take());
-            let _ = tokio::join!(stdout, stderr);
+            // Detached descendants can retain the pipes after the owned process group exits.
+            if tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                let _ = tokio::join!(&mut stdout, &mut stderr);
+            })
+            .await
+            .is_err()
+            {
+                stdout.abort();
+                stderr.abort();
+                output.lock().unwrap().truncated = true;
+            }
             let status = match status {
                 Ok(status) => {
                     #[cfg(unix)]
@@ -342,6 +356,37 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_pipe_does_not_block_exit_or_release() {
+        let delegated = Delegated::new(&std::env::temp_dir());
+        let created = delegated.request("terminal/create", json!({"sessionId":"s", "command":"python3", "args":["-c", "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(5)'], start_new_session=True);print(p.pid,flush=True)"]})).await.unwrap();
+        let params = json!({"terminalId": created["terminalId"]});
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            delegated.request("terminal/wait_for_exit", params.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(exit["exitCode"], 0);
+        let output = delegated
+            .request("terminal/output", params.clone())
+            .await
+            .unwrap();
+        assert_eq!(output["truncated"], true);
+        let pid: u32 = output["output"].as_str().unwrap().trim().parse().unwrap();
+        crate::local::chat::kill_shell_group(Some(pid));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            delegated.request("terminal/release", params),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        delegated.shutdown().await;
     }
 
     #[test]
