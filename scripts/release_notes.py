@@ -54,8 +54,8 @@ DOWNLOAD_END = "<!-- desktop-downloads:end -->"
 DESKTOP_ASSETS = (
     ("OpenResearch.dmg", "Download for macOS — Apple silicon and Intel", "macos"),
     ("OpenResearch-Setup.exe", "Download for Windows", "windows"),
-    ("OpenResearch-x86_64.AppImage", "Download for Linux — Intel / AMD", "linux"),
-    ("OpenResearch-aarch64.AppImage", "Download for Linux — ARM64", None),
+    ("OpenResearch-x86_64.AppImage", "Download for Linux (x86)", "linux-x86"),
+    ("OpenResearch-aarch64.AppImage", "Download for Linux (ARM64)", "linux-arm64"),
 )
 
 
@@ -67,12 +67,9 @@ def downloads(assets=()):
         f'<source media="(prefers-color-scheme: dark)" srcset="{images}/download-{platform}-dark.svg">'
         f'<img src="{images}/download-{platform}.svg" alt="{label}" width="220" height="44" />'
         '</picture></a>'
-        for name, label, platform in DESKTOP_ASSETS if name in urls and platform
+        for name, label, platform in DESKTOP_ASSETS if name in urls
     ]
     links = ["<p>\n" + "\n".join(buttons) + "\n</p>"] if buttons else []
-    arm64 = urls.get("OpenResearch-aarch64.AppImage")
-    if arm64:
-        links.append(f"[Download for Linux — ARM64]({arm64})")
     if not links:
         links = ["[Download the desktop app](https://openresearch.sh/)"]
     return "\n\n".join((
