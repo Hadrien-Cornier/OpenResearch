@@ -279,6 +279,8 @@ pub struct LogBatch {
 }
 
 #[async_trait]
+// async-trait marks its boxed futures `#[must_use]`; clippy 1.99 flags that generated code.
+#[allow(clippy::double_must_use)]
 pub trait ComputeBackend: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     async fn preflight(&self, args: &crate::ExpRunArgs) -> Result<Preflight>;
@@ -808,17 +810,20 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         cancel_requested: false,
         chat_session_id: args.launching_chat_session(),
     };
+    let chat_harness = match &pending.chat_session_id {
+        Some(session) => store.get_chat_session(session)?.map(|chat| chat.harness),
+        None => None,
+    };
     let identity = args.invocation_identity()?;
     let report = (!args.telemetry_suppressed)
         .then(|| {
             crate::telemetry::pending_event_payload(
                 "experiment_finished",
-                serde_json::json!({
-                    "harness": identity.as_ref().map(|identity| &identity.harness),
-                    "model": identity.as_ref().map(|identity| &identity.model),
-                    "provider": identity.as_ref().and_then(|identity| identity.provider.as_ref()),
-                    "status": "failed",
-                }),
+                run_attribution(
+                    identity.as_ref(),
+                    chat_harness,
+                    args.agent_origin.as_deref(),
+                ),
             )
         })
         .flatten();
@@ -865,6 +870,57 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
             Err(error)
         }
     }
+}
+
+/// The run report's invoker: the forwarded native identity, else an explicit exception. A context
+/// inherited from another agent around the app never stands in for the launching chat's own.
+fn run_attribution(
+    identity: Option<&crate::store::InvocationIdentity>,
+    chat_harness: Option<String>,
+    agent_origin: Option<&str>,
+) -> serde_json::Value {
+    let identity = identity.filter(|identity| {
+        chat_harness
+            .as_ref()
+            .is_none_or(|harness| *harness == identity.harness)
+    });
+    let (harness, model, provider, attribution, reason) = match (identity, chat_harness) {
+        (Some(identity), _) => (
+            Some(identity.harness.clone()),
+            Some(identity.model.clone()),
+            identity.provider.clone(),
+            "exact",
+            None,
+        ),
+        (None, Some(harness)) => (
+            Some(harness),
+            None,
+            None,
+            "unresolved",
+            Some("invoker_not_linked"),
+        ),
+        // The origin can arrive over HTTP: only the known marker labels reach telemetry.
+        (None, None) => match agent_origin.filter(|origin| {
+            ["claude-code", "codex", "opencode", "cursor", "unknown"].contains(origin)
+        }) {
+            Some(origin) => (
+                Some(origin.to_string()).filter(|origin| origin != "unknown"),
+                None,
+                None,
+                "unresolved",
+                Some("external_agent"),
+            ),
+            None => (None, None, None, "manual", None),
+        },
+    };
+    serde_json::json!({
+        "harness": harness,
+        "model": model,
+        "provider": provider,
+        "attribution": attribution,
+        "attributionReason": reason,
+        "status": "failed",
+    })
 }
 
 fn reserve_run(
@@ -958,10 +1014,78 @@ fn not_ready(detail: impl Into<String>) -> Preflight {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn tinker_args() -> crate::ExpRunArgs {
+    #[test]
+    fn run_reports_name_the_native_invoker_or_an_explicit_exception() {
+        let identity = |harness: &str| crate::store::InvocationIdentity {
+            harness: harness.into(),
+            model: "m".into(),
+            provider: None,
+        };
+        let row = |value: serde_json::Value| {
+            (
+                value["harness"].clone(),
+                value["model"].clone(),
+                value["attribution"].clone(),
+                value["attributionReason"].clone(),
+            )
+        };
+        let cases = [
+            (
+                Some(identity("claude-code")),
+                Some("claude-code"),
+                None,
+                ("claude-code", "m", "exact", None),
+            ),
+            // A host Codex's context inside an OpenCode chat is not this chat's invoker.
+            (
+                Some(identity("codex")),
+                Some("opencode"),
+                Some("codex"),
+                ("opencode", "", "unresolved", Some("invoker_not_linked")),
+            ),
+            (
+                None,
+                None,
+                Some("cursor"),
+                ("cursor", "", "unresolved", Some("external_agent")),
+            ),
+            (
+                None,
+                None,
+                Some("unknown"),
+                ("", "", "unresolved", Some("external_agent")),
+            ),
+            (None, None, None, ("", "", "manual", None)),
+            (None, None, Some("<script>"), ("", "", "manual", None)),
+        ];
+        for (identity, chat, origin, (harness, model, attribution, reason)) in cases {
+            let opt = |text: &str| {
+                if text.is_empty() {
+                    serde_json::json!(null)
+                } else {
+                    serde_json::json!(text)
+                }
+            };
+            assert_eq!(
+                row(run_attribution(
+                    identity.as_ref(),
+                    chat.map(str::to_string),
+                    origin
+                )),
+                (
+                    opt(harness),
+                    opt(model),
+                    serde_json::json!(attribution),
+                    serde_json::json!(reason)
+                )
+            );
+        }
+    }
+
+    pub(crate) fn tinker_args() -> crate::ExpRunArgs {
         crate::ExpRunArgs {
             exp_id: "exp".into(),
             disk: None,
@@ -978,6 +1102,8 @@ mod tests {
             force: false,
             chat_session_id: None,
             invocation_context: None,
+            agent_origin: None,
+            forwarded: false,
             telemetry_suppressed: false,
         }
     }

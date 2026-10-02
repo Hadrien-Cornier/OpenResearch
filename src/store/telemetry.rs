@@ -92,6 +92,26 @@ impl TokenUsage {
     }
 }
 
+/// A chat report's explicit attribution from the native model label alone: `(attribution, reason)`.
+/// The model is reported only when exact; configured or selected models never reach here.
+fn chat_attribution(
+    harness: &str,
+    model: Option<&str>,
+    sampled: bool,
+    delivery: Option<&str>,
+) -> (&'static str, Option<&'static str>) {
+    match model {
+        Some("<synthetic>") if harness == "claude-code" => ("unresolved", Some("synthetic_model")),
+        Some(model) if harness == "cursor" && model.eq_ignore_ascii_case("auto") => {
+            ("auto_routing", None)
+        }
+        Some(_) => ("exact", None),
+        None if sampled => ("unresolved", Some("identity_not_reported")),
+        None if matches!(delivery, Some("not_sent" | "rejected")) => ("not_executed", None),
+        None => ("unresolved", Some("no_usage_reported")),
+    }
+}
+
 impl Store {
     pub(crate) fn native_invocation_identity(
         &self,
@@ -121,6 +141,18 @@ impl Store {
             return Err(anyhow!("Native tool identity changed after capture"));
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// A native turn's current model after a reroute; unlike tool invocations, a later reroute
+    /// replaces it.
+    pub(crate) fn record_native_reroute(
+        &self,
+        call_id: &str,
+        identity: &InvocationIdentity,
+    ) -> Result<()> {
+        identity.validate()?;
+        self.conn.execute("INSERT INTO native_invocation_identities (harness, call_id, identity_json, session_id, created_at) VALUES (?1, ?2, ?3, NULL, ?4) ON CONFLICT(harness, call_id) DO UPDATE SET identity_json = excluded.identity_json", params![identity.harness, call_id, serde_json::to_string(identity)?, now_ms()])?;
         Ok(())
     }
 
@@ -161,23 +193,70 @@ impl Store {
         Ok(())
     }
 
+    /// A native turn's last counted cumulative total, shared by every execution that sees the turn
+    /// (a sub-agent outliving its parent's turn, a resume replaying it). Stores from before the
+    /// shared row fall back to the turn's recorded sample ids (`{scope}:{turn}:{generation}:{total}`).
+    fn cumulative_baseline(
+        &self,
+        harness: &str,
+        native_scope: &str,
+        native_turn: &str,
+    ) -> Result<Option<CumulativeBaseline>> {
+        let shared: Option<String> = self.conn.query_row("SELECT totals_json FROM native_usage_baselines WHERE execution_id = ?1 AND prefix = ?2", params![harness, format!("cumulative:{native_scope}:{native_turn}")], |row| row.get(0)).optional()?.flatten();
+        if let Some(json) = shared {
+            return Ok(Some(serde_json::from_str(&json)?));
+        }
+        let ids = format!("{native_scope}:{native_turn}:");
+        let mut stmt = self.conn.prepare("SELECT substr(sample_id, length(?2) + 1) FROM chat_usage_samples WHERE harness = ?1 AND substr(sample_id, 1, length(?2)) = ?2")?;
+        let mut latest: Option<CumulativeBaseline> = None;
+        for rest in stmt.query_map(params![harness, ids], |row| row.get::<_, String>(0))? {
+            let rest = rest?;
+            let Some((generation, total)) = rest.split_once(':') else {
+                continue;
+            };
+            let recorded = CumulativeBaseline {
+                generation: generation.parse()?,
+                usage: serde_json::from_str(total)?,
+            };
+            if latest.as_ref().is_none_or(|latest| {
+                (recorded.generation, recorded.usage.total())
+                    > (latest.generation, latest.usage.total())
+            }) {
+                latest = Some(recorded);
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Whether `total` is already this native turn's counted total.
+    pub(crate) fn cumulative_counted(
+        &self,
+        harness: &str,
+        native_scope: &str,
+        native_turn: &str,
+        total: &TokenUsage,
+    ) -> Result<bool> {
+        Ok(self
+            .cumulative_baseline(harness, native_scope, native_turn)?
+            .is_some_and(|baseline| &baseline.usage == total))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_cumulative_usage(
         &self,
         execution_id: &str,
         harness: &str,
         native_scope: &str,
         native_turn: &str,
+        model: Option<&str>,
         total: &TokenUsage,
         last: &TokenUsage,
     ) -> Result<()> {
         total.validate()?;
         last.validate()?;
-        let prefix = format!("cumulative:{native_scope}");
+        let prefix = format!("cumulative:{native_scope}:{native_turn}");
         let tx = self.begin()?;
-        let previous: Option<String> = tx.query_row("SELECT totals_json FROM native_usage_baselines WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, prefix], |row| row.get(0)).optional()?.flatten();
-        let previous: Option<CumulativeBaseline> = previous
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?;
+        let previous = self.cumulative_baseline(harness, native_scope, native_turn)?;
         if previous
             .as_ref()
             .is_some_and(|previous| &previous.usage == total)
@@ -214,13 +293,16 @@ impl Store {
                 "{native_scope}:{native_turn}:{generation}:{}",
                 serde_json::to_string(total)?
             );
-            self.record_usage_sample(execution_id, &sample_id, harness, None, None, &delta)?;
+            self.record_usage_sample(execution_id, &sample_id, harness, model, None, &delta)?;
+            // A delta of two native totals covers its requests whole when both counters are known.
+            tx.execute("UPDATE chat_usage_samples SET complete = ?3 WHERE execution_id = ?1 AND sample_id = ?2", params![execution_id, sample_id, delta.input_tokens.is_some() && delta.output_tokens.is_some()])?;
         }
         let baseline = CumulativeBaseline {
             usage: total.clone(),
             generation,
         };
-        tx.execute("INSERT INTO native_usage_baselines (execution_id, prefix, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(execution_id, prefix) DO UPDATE SET totals_json = excluded.totals_json", params![execution_id, prefix, serde_json::to_string(&baseline)?])?;
+        // Keyed by harness, not execution: the baseline belongs to the native turn.
+        tx.execute("INSERT INTO native_usage_baselines (execution_id, prefix, totals_json) VALUES (?1, ?2, ?3) ON CONFLICT(execution_id, prefix) DO UPDATE SET totals_json = excluded.totals_json", params![harness, prefix, serde_json::to_string(&baseline)?])?;
         tx.commit()?;
         Ok(())
     }
@@ -273,7 +355,11 @@ impl Store {
                     tx.execute("UPDATE native_usage_baselines SET totals_json = NULL WHERE execution_id = ?1 AND prefix = ?2", params![execution_id, prefix])?;
                     tx.execute("UPDATE chat_usage_samples SET complete = 0 WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2", params![execution_id, prefix])?;
                 } else {
-                    tx.execute("DELETE FROM chat_usage_samples WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2", params![execution_id, prefix])?;
+                    // The aggregate counts every request: its models replace their messages, and any
+                    // other model keeps only its identity.
+                    let models: Vec<_> = samples.iter().map(|(model, _, _)| model).collect();
+                    tx.execute("DELETE FROM chat_usage_samples WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2 AND (model IS NULL OR model IN (SELECT value FROM json_each(?3)))", params![execution_id, prefix, serde_json::to_string(&models)?])?;
+                    tx.execute("UPDATE chat_usage_samples SET usage_json = ?3, complete = 0 WHERE execution_id = ?1 AND substr(sample_id, 1, length(?2)) = ?2", params![execution_id, prefix, serde_json::to_string(&TokenUsage::default())?])?;
                     for (model, provider, usage) in samples {
                         let zero = TokenUsage {
                             input_tokens: Some(0),
@@ -352,6 +438,18 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn finalize_usage_turns(&self, turn_prefix: &str, outcome: &str) -> Result<()> {
+        let turns: Vec<String> = self
+            .conn
+            .prepare("SELECT DISTINCT turn_id FROM chat_usage_executions WHERE outcome IS NULL AND substr(turn_id, 1, length(?1)) = ?1")?
+            .query_map([turn_prefix], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for turn in turns {
+            self.finalize_turn_usage(&turn, outcome)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn finalize_turn_usage(&self, turn_id: &str, outcome: &str) -> Result<()> {
         let mut stmt = self.conn.prepare("SELECT execution_id, harness, report_id, suppressed FROM chat_usage_executions WHERE turn_id = ?1 AND outcome IS NULL")?;
         let rows = stmt
@@ -365,6 +463,9 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for (execution_id, harness, report_id, suppressed) in rows {
+            // One write lock from reading samples to closing, so a hook's concurrent sample is
+            // either in this report or rejected as late.
+            let tx = self.begin_immediate()?;
             let mut samples = self.conn.prepare("SELECT s.model, s.provider, s.usage_json, s.complete, n.identity_json FROM chat_usage_samples s LEFT JOIN native_invocation_identities n ON n.harness = s.harness AND n.call_id = s.sample_id WHERE s.execution_id = ?1 ORDER BY s.sample_id")?;
             let mut grouped = std::collections::BTreeMap::<
                 (Option<String>, Option<String>, [bool; 5]),
@@ -400,9 +501,28 @@ impl Store {
                     .or_default()
                     .push((usage, complete));
             }
+            // A model seen without tokens joins that model and provider's measured requests, if any.
+            let measured: Vec<(Option<String>, Option<String>)> = grouped
+                .keys()
+                .filter(|(_, _, mask)| mask.contains(&true))
+                .map(|(model, provider, _)| (model.clone(), provider.clone()))
+                .collect();
+            grouped.retain(|(model, provider, mask), _| {
+                mask.contains(&true)
+                    || model.is_none()
+                    || !measured.contains(&(model.clone(), provider.clone()))
+            });
             if grouped.is_empty() {
                 grouped.insert((None, None, [false; 5]), Vec::new());
             }
+            let delivery: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT delivery_state FROM chat_turns WHERE id = ?1",
+                    [turn_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             let mut reports = Vec::new();
             if !suppressed {
                 for ((model, provider, _), samples) in grouped {
@@ -432,8 +552,17 @@ impl Store {
                     let mut properties = serde_json::to_value(&usage)?;
                     properties["reportId"] = serde_json::json!(report_id);
                     properties["harness"] = serde_json::json!(harness);
-                    properties["model"] = serde_json::json!(model);
-                    properties["provider"] = serde_json::json!(provider);
+                    let (attribution, reason) = chat_attribution(
+                        &harness,
+                        model.as_deref(),
+                        !samples.is_empty(),
+                        delivery.as_deref(),
+                    );
+                    let exact = attribution == "exact";
+                    properties["model"] = serde_json::json!(model.filter(|_| exact));
+                    properties["provider"] = serde_json::json!(provider.filter(|_| exact));
+                    properties["attribution"] = serde_json::json!(attribution);
+                    properties["attributionReason"] = serde_json::json!(reason);
                     properties["totalTokens"] = serde_json::json!(usage.total());
                     properties["outcome"] = serde_json::json!(outcome);
                     properties["coverage"] = serde_json::json!(if [
@@ -447,10 +576,9 @@ impl Store {
                     .all(Option::is_none)
                     {
                         "missing"
-                    } else if model.is_some()
-                        && samples.iter().all(|(usage, complete)| *complete
-                            && usage.input_tokens.is_some()
-                            && usage.output_tokens.is_some())
+                    } else if samples.iter().all(|(usage, complete)| *complete
+                        && usage.input_tokens.is_some()
+                        && usage.output_tokens.is_some())
                     {
                         "complete"
                     } else {
@@ -463,25 +591,26 @@ impl Store {
                     }
                 }
             }
+            drop(samples);
             self.finalize_usage_execution(&execution_id, outcome, reports)?;
+            tx.commit()?;
         }
         Ok(())
     }
 
+    /// Callers hold a write transaction.
     fn finalize_usage_execution(
         &self,
         execution_id: &str,
         outcome: &str,
         reports: Vec<(String, serde_json::Value)>,
     ) -> Result<()> {
-        let tx = self.begin_immediate()?;
-        let suppressed: Option<bool> = tx.query_row("UPDATE chat_usage_executions SET outcome = ?2 WHERE execution_id = ?1 AND outcome IS NULL RETURNING suppressed", params![execution_id, outcome], |row| row.get(0)).optional()?;
+        let suppressed: Option<bool> = self.conn.query_row("UPDATE chat_usage_executions SET outcome = ?2 WHERE execution_id = ?1 AND outcome IS NULL RETURNING suppressed", params![execution_id, outcome], |row| row.get(0)).optional()?;
         if suppressed == Some(false) {
             for (id, payload) in reports {
                 self.stage_telemetry(&id, &payload)?;
             }
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -540,7 +669,7 @@ impl Store {
         usage.validate()?;
         let model = model.filter(|label| valid_model_label(label));
         let provider = provider.filter(|label| valid_model_label(label));
-        self.conn.execute("INSERT INTO chat_usage_samples (execution_id, sample_id, harness, model, provider, usage_json) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL) ON CONFLICT(execution_id, sample_id) DO UPDATE SET model = excluded.model, provider = excluded.provider, usage_json = excluded.usage_json", params![execution_id, sample_id, harness, model, provider, serde_json::to_string(usage)?])?;
+        self.conn.execute("INSERT INTO chat_usage_samples (execution_id, sample_id, harness, model, provider, usage_json) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM chat_usage_executions WHERE execution_id = ?1 AND outcome IS NULL) ON CONFLICT(execution_id, sample_id) DO UPDATE SET model = COALESCE(excluded.model, model), provider = COALESCE(excluded.provider, provider), usage_json = CASE WHEN ?7 THEN excluded.usage_json ELSE usage_json END", params![execution_id, sample_id, harness, model, provider, serde_json::to_string(usage)?, usage != &TokenUsage::default()])?;
         Ok(())
     }
 }
@@ -581,6 +710,175 @@ mod tests {
             })
             .unwrap();
         assert_eq!(outcome, "done");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sub-agent outliving its parent's turn continues the native turn's shared baseline: the
+    /// late execution counts the increase since the parent's last total (requests between them
+    /// included), a replay adds nothing, a new native turn starts its own baseline, and a legacy
+    /// store's replayed total (no shared row) opens no execution.
+    #[test]
+    fn late_codex_child_usage_continues_from_its_parent_execution() {
+        let dir = std::env::temp_dir().join(format!("orx-late-child-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let models = std::sync::Mutex::new(std::collections::HashMap::new());
+        let record = |method: &str, params: serde_json::Value| {
+            crate::local::harness::codex::record_unowned_in(&store, "s", &models, method, &params)
+                .unwrap()
+        };
+        let counters = |n: u64| TokenUsage {
+            input_tokens: Some(n),
+            output_tokens: Some(n),
+            ..Default::default()
+        };
+        let usage = |turn: &str, total: u64, last: u64| {
+            serde_json::json!({"threadId": "child", "turnId": turn, "tokenUsage": {
+                "total": {"inputTokens": total, "outputTokens": total},
+                "last": {"inputTokens": last, "outputTokens": last}}})
+        };
+        let samples = |execution: &str| -> Vec<(Option<String>, u64)> {
+            store
+                .conn
+                .prepare("SELECT model, usage_json FROM chat_usage_samples WHERE execution_id = ?1")
+                .unwrap()
+                .query_map([execution], |row| {
+                    Ok((row.get(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .map(|row| {
+                    let (model, json) = row.unwrap();
+                    (
+                        model,
+                        serde_json::from_str::<TokenUsage>(&json)
+                            .unwrap()
+                            .input_tokens
+                            .unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let executions = || -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM chat_usage_executions WHERE execution_id LIKE 'codex-late:%'", [], |row| row.get(0))
+                .unwrap()
+        };
+        let safe = || Some("gpt-6-safe".to_string());
+        store
+            .begin_usage_execution("parent", "parent-turn", "codex")
+            .unwrap();
+        store
+            .record_cumulative_usage(
+                "parent",
+                "codex",
+                "child",
+                "ct",
+                safe().as_deref(),
+                &counters(10),
+                &counters(4),
+            )
+            .unwrap();
+        store.finalize_turn_usage("parent-turn", "done").unwrap();
+        crate::local::harness::codex::capture_reroute(
+            Some(&store),
+            &models,
+            &serde_json::json!({"threadId": "child", "turnId": "ct", "toModel": "gpt-6-safe"}),
+        );
+        models.lock().unwrap().clear();
+        record("thread/tokenUsage/updated", usage("ct", 10, 4));
+        assert_eq!(executions(), 0);
+        record("thread/tokenUsage/updated", usage("ct", 30, 5));
+        record("thread/tokenUsage/updated", usage("ct", 30, 5));
+        record(
+            "turn/completed",
+            serde_json::json!({"threadId": "child", "turn": {"id": "ct", "status": "completed"}}),
+        );
+        record("thread/tokenUsage/updated", usage("ct", 40, 5));
+        assert_eq!(samples("parent"), [(safe(), 4)]);
+        assert_eq!(samples("codex-late:s:child:ct"), [(safe(), 20)]);
+        let outcome: String = store
+            .conn
+            .query_row("SELECT outcome FROM chat_usage_executions WHERE execution_id = 'codex-late:s:child:ct'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outcome, "done");
+        models
+            .lock()
+            .unwrap()
+            .insert(("child".into(), "ct2".into()), "gpt-6-sol".into());
+        record("thread/tokenUsage/updated", usage("ct2", 47, 7));
+        assert_eq!(
+            samples("codex-late:s:child:ct2"),
+            [(Some("gpt-6-sol".into()), 7)]
+        );
+        // A store from before the shared baseline knows a finished turn only by its sample ids.
+        store
+            .begin_usage_execution("old", "old-turn", "codex")
+            .unwrap();
+        store
+            .record_cumulative_usage(
+                "old",
+                "codex",
+                "child",
+                "ct3",
+                None,
+                &counters(60),
+                &counters(3),
+            )
+            .unwrap();
+        store.finalize_turn_usage("old-turn", "done").unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM native_usage_baselines WHERE prefix = 'cumulative:child:ct3'",
+                [],
+            )
+            .unwrap();
+        record("thread/tokenUsage/updated", usage("ct3", 60, 3));
+        assert_eq!(executions(), 2);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A hook without a planner row may be a call that failed before running: its model is kept
+    /// as invocation evidence but never becomes an executed sample.
+    #[test]
+    fn antigravity_hooks_record_executed_models_only_with_a_planner() {
+        let dir = std::env::temp_dir().join(format!("orx-agy-planner-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let transcript = dir.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::json!({"step_index": 4, "type": "PLANNER_RESPONSE"}).to_string(),
+        )
+        .unwrap();
+        store
+            .begin_usage_execution("e", "t", "antigravity")
+            .unwrap();
+        for step in [3, 5] {
+            let payload = serde_json::json!({"conversationId": "c", "initialNumSteps": step,
+                "modelName": "gemini-3.8-flash-high", "transcriptPath": transcript});
+            crate::commands::mcp_gate::record_post_invocation(&store, &payload, Some("e")).unwrap();
+        }
+        let samples: Vec<(String, Option<String>)> = store
+            .conn
+            .prepare("SELECT sample_id, model FROM chat_usage_samples")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            samples,
+            [(
+                "antigravity:c:step:4".into(),
+                Some("gemini-3.8-flash-high".into())
+            )]
+        );
+        assert!(store
+            .native_invocation_identity("antigravity", "antigravity:c:invocation:5")
+            .unwrap()
+            .is_some());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -975,6 +1273,7 @@ mod tests {
                     "codex",
                     "thread",
                     "native-turn",
+                    None,
                     &usage(1100, 110),
                     &usage(100, 10),
                 )
@@ -986,6 +1285,7 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
+                None,
                 &usage(1200, 120),
                 &usage(100, 10),
             )
@@ -996,6 +1296,7 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
+                None,
                 &usage(1000, 100),
                 &usage(0, 0),
             )
@@ -1006,6 +1307,7 @@ mod tests {
                 "codex",
                 "thread",
                 "native-turn",
+                None,
                 &usage(1100, 110),
                 &usage(100, 10),
             )
@@ -1179,5 +1481,108 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    /// Only a native label is exact; reserved labels and missing evidence stay explicit, and a
+    /// model seen without tokens never erases measured usage (or the reverse).
+    #[test]
+    fn native_labels_attribute_and_identity_writes_keep_usage() {
+        for (harness, model, sampled, delivery, expected) in [
+            ("codex", Some("gpt-6-sol"), true, None, ("exact", None)),
+            ("cursor", Some("Auto"), true, None, ("auto_routing", None)),
+            (
+                "claude-code",
+                Some("<synthetic>"),
+                true,
+                None,
+                ("unresolved", Some("synthetic_model")),
+            ),
+            (
+                "codex",
+                None,
+                true,
+                None,
+                ("unresolved", Some("identity_not_reported")),
+            ),
+            (
+                "codex",
+                None,
+                false,
+                Some("rejected"),
+                ("not_executed", None),
+            ),
+            (
+                "codex",
+                None,
+                false,
+                Some("accepted"),
+                ("unresolved", Some("no_usage_reported")),
+            ),
+        ] {
+            assert_eq!(
+                chat_attribution(harness, model, sampled, delivery),
+                expected
+            );
+        }
+        let dir = std::env::temp_dir().join(format!("orx-identity-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store.begin_usage_execution("e", "t", "codex").unwrap();
+        let measured = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Default::default()
+        };
+        store
+            .record_usage_sample("e", "a", "codex", None, None, &measured)
+            .unwrap();
+        store
+            .record_usage_sample(
+                "e",
+                "a",
+                "codex",
+                Some("gpt-6-sol"),
+                None,
+                &TokenUsage::default(),
+            )
+            .unwrap();
+        store
+            .record_usage_sample("e", "a", "codex", None, None, &measured)
+            .unwrap();
+        let (model, usage): (Option<String>, String) = store
+            .conn
+            .query_row(
+                "SELECT model, usage_json FROM chat_usage_samples",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(
+            serde_json::from_str::<TokenUsage>(&usage).unwrap(),
+            measured
+        );
+        // A native cumulative delta with both counters covers its requests whole.
+        store
+            .record_cumulative_usage(
+                "e",
+                "codex",
+                "th",
+                "tu",
+                Some("gpt-6-sol"),
+                &measured,
+                &measured,
+            )
+            .unwrap();
+        let complete: bool = store
+            .conn
+            .query_row(
+                "SELECT complete FROM chat_usage_samples WHERE sample_id LIKE 'th:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(complete);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

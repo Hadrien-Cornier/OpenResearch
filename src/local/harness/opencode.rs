@@ -1890,6 +1890,15 @@ fn handle_event(
                     info.get("modelID").and_then(Value::as_str),
                     info.get("providerID").and_then(Value::as_str),
                 ) {
+                    // The model ran even if no step-finish (with tokens) follows.
+                    if !ctx.native_message_models.contains_key(id) {
+                        ctx.record_native_usage(
+                            id,
+                            Some(model),
+                            Some(provider),
+                            crate::store::TokenUsage::default(),
+                        );
+                    }
                     ctx.native_message_models.insert(
                         id.to_string(),
                         crate::store::InvocationIdentity {

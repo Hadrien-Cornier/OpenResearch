@@ -794,6 +794,14 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     Ok(())
 }
 
+/// A success ran the init model even without output or usage; an error without usage did not.
+fn result_usage(result: &Value, is_error: bool) -> Option<crate::store::TokenUsage> {
+    result
+        .get("usage")
+        .map(cursor_native_usage)
+        .or_else(|| (!is_error).then(crate::store::TokenUsage::default))
+}
+
 fn cursor_native_usage(usage: &Value) -> crate::store::TokenUsage {
     let field = |key| usage.get(key).and_then(Value::as_u64);
     crate::store::TokenUsage {
@@ -809,7 +817,10 @@ fn cursor_native_usage(usage: &Value) -> crate::store::TokenUsage {
 
 #[derive(Default)]
 struct TurnState {
-    reported_auto: bool,
+    /// Cursor's `system/init` model label (`Auto` included), announced before the request.
+    init_model: Option<String>,
+    /// The request produced output, so `init_model` names an execution.
+    executed: bool,
     native_session_id: Option<String>,
     text_part_id: Option<String>,
     reasoning_part_id: Option<String>,
@@ -824,12 +835,23 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
     if let Some(sid) = event.get("session_id").and_then(Value::as_str) {
         state.native_session_id = Some(sid.to_string());
     }
-    match event.get("type").and_then(Value::as_str) {
+    let kind = event.get("type").and_then(Value::as_str);
+    // Output proves the init model ran even if no result (with usage) follows.
+    if !state.executed && matches!(kind, Some("assistant" | "thinking" | "tool_call")) {
+        state.executed = true;
+        ctx.record_native_usage(
+            &format!("cursor-result-{}", ctx.attempt_count_for_usage()),
+            state.init_model.as_deref(),
+            None,
+            crate::store::TokenUsage::default(),
+        );
+    }
+    match kind {
         Some("system") if event.get("subtype").and_then(Value::as_str) == Some("init") => {
-            state.reported_auto = event
+            state.init_model = event
                 .get("model")
                 .and_then(Value::as_str)
-                .is_some_and(|model| model.eq_ignore_ascii_case("auto"));
+                .map(str::to_string);
             false
         }
         Some("thinking") => {
@@ -878,20 +900,20 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             false
         }
         Some("result") => {
-            if let Some(usage) = event.get("usage") {
-                ctx.record_native_usage(
-                    &format!("cursor-result-{}", ctx.attempt_count_for_usage()),
-                    state.reported_auto.then_some("Auto"),
-                    None,
-                    cursor_native_usage(usage),
-                );
-            }
             state.saw_result = true;
             let is_error = event
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
                 || event.get("subtype").and_then(Value::as_str) == Some("error");
+            if let Some(usage) = result_usage(event, is_error) {
+                ctx.record_native_usage(
+                    &format!("cursor-result-{}", ctx.attempt_count_for_usage()),
+                    state.init_model.as_deref(),
+                    None,
+                    usage,
+                );
+            }
             if is_error {
                 state.turn_errored = true;
                 let detail = event
@@ -1572,5 +1594,16 @@ ActionRequiredError: Named models unavailable Free plans can only use Auto. Swit
             .await
             .unwrap();
         assert!(matches!(reject, ResumeAction::Nothing));
+    }
+
+    #[test]
+    fn only_a_successful_or_measured_result_attests_the_init_model() {
+        let usage = serde_json::json!({"usage": {"inputTokens": 3, "outputTokens": 1}});
+        assert_eq!(
+            result_usage(&serde_json::json!({}), false),
+            Some(Default::default())
+        );
+        assert_eq!(result_usage(&serde_json::json!({}), true), None);
+        assert_eq!(result_usage(&usage, true).unwrap().output_tokens, Some(1));
     }
 }

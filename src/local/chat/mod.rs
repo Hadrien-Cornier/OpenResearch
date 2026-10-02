@@ -7173,6 +7173,7 @@ impl TurnCtx {
         &self,
         native_scope: &str,
         native_turn: &str,
+        model: Option<&str>,
         total: crate::store::TokenUsage,
         last: crate::store::TokenUsage,
     ) {
@@ -7185,6 +7186,7 @@ impl TurnCtx {
                 &self.harness,
                 native_scope,
                 native_turn,
+                model,
                 &total,
                 &last,
             )
@@ -7225,6 +7227,11 @@ impl TurnCtx {
         }) {
             eprintln!("orx up: could not reconcile native token usage: {error}");
         }
+    }
+
+    /// The execution native hooks record into; `None` when nothing is recorded.
+    pub(crate) fn usage_execution_id(&self) -> Option<&str> {
+        self.durable.then_some(self.usage_execution_id.as_str())
     }
 
     pub(crate) fn attempt_count_for_usage(&self) -> i64 {
@@ -8985,6 +8992,30 @@ mod session_env_tests {
 
         std::env::set_var(LOCAL_SESSION_ENV, "1");
         assert!(in_local_session());
+    }
+
+    /// `orx up` handling a caller's run reads launch evidence only from the request, never from
+    /// its own environment.
+    #[test]
+    fn forwarded_runs_ignore_the_servers_launch_environment() {
+        let _guard = EnvGuard::new(&[CHAT_SESSION_ENV, "ORX_INVOCATION_CONTEXT"]);
+        std::env::set_var(CHAT_SESSION_ENV, "server-session");
+        std::env::set_var(
+            "ORX_INVOCATION_CONTEXT",
+            r#"{"harness":"codex","model":"gpt-6-sol","provider":null}"#,
+        );
+        let local = crate::compute::tests::tinker_args();
+        assert_eq!(
+            local.launching_chat_session().as_deref(),
+            Some("server-session")
+        );
+        assert!(local.invocation_identity().unwrap().is_some());
+        let forwarded = crate::ExpRunArgs {
+            forwarded: true,
+            ..crate::compute::tests::tinker_args()
+        };
+        assert_eq!(forwarded.launching_chat_session(), None);
+        assert!(forwarded.invocation_identity().unwrap().is_none());
     }
 
     #[test]

@@ -1502,6 +1502,10 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             let inner = event.get("event").unwrap_or(&Value::Null);
             match inner.get("type").and_then(Value::as_str) {
                 Some("message_start") => {
+                    // An interrupt kills the child before `assistant`; the model is known here.
+                    if let Some(message) = inner.get("message") {
+                        record_message(ctx, message);
+                    }
                     // Sub-agent streams have their own message ids; namespace the
                     // stream mid per parent so a concurrent sub-agent's deltas
                     // don't collide with the main stream's.
@@ -1643,28 +1647,8 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             if let Some(message) = event.get("message") {
                 ctx.record_native_invocations(message);
             }
-            if let (Some(sample_id), Some(model), Some(usage)) = (
-                event.pointer("/message/id").and_then(Value::as_str),
-                event.pointer("/message/model").and_then(Value::as_str),
-                event.pointer("/message/usage"),
-            ) {
-                let field = |key| usage.get(key).and_then(Value::as_u64);
-                let input_tokens = field("input_tokens")
-                    .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
-                    .and_then(|input| input.checked_add(field("cache_creation_input_tokens")?));
-                ctx.record_native_usage(
-                    &format!("claude-{}:{sample_id}", ctx.attempt_count_for_usage()),
-                    Some(model),
-                    None,
-                    crate::store::TokenUsage {
-                        input_tokens,
-                        // Assistant output is a partial subtotal; terminal modelUsage includes reasoning.
-                        output_tokens: field("output_tokens"),
-                        cache_read_tokens: field("cache_read_input_tokens"),
-                        cache_write_tokens: field("cache_creation_input_tokens"),
-                        reasoning_tokens: None,
-                    },
-                );
+            if let Some(message) = event.get("message") {
+                record_message(ctx, message);
             }
             if event
                 .get("error")
@@ -1950,6 +1934,40 @@ fn mark_stream_final(ctx: &mut TurnCtx, state: &TurnState) {
         let prefix = format!("{mid}-");
         ctx.mark_final_text(|part| part.id.starts_with(&prefix));
     }
+}
+
+/// One native message's model and usage snapshot, recorded even when only one is reported.
+fn record_message(ctx: &TurnCtx, message: &Value) {
+    let (Some(id), model, usage) = (
+        message.get("id").and_then(Value::as_str),
+        message.get("model").and_then(Value::as_str),
+        message.get("usage"),
+    ) else {
+        return;
+    };
+    if model.is_none() && usage.is_none() {
+        return;
+    }
+    let field = |key| {
+        usage
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_u64)
+    };
+    ctx.record_native_usage(
+        &format!("claude-{}:{id}", ctx.attempt_count_for_usage()),
+        model,
+        None,
+        crate::store::TokenUsage {
+            input_tokens: field("input_tokens")
+                .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
+                .and_then(|input| input.checked_add(field("cache_creation_input_tokens")?)),
+            // Assistant output is a partial subtotal; terminal modelUsage includes reasoning.
+            output_tokens: field("output_tokens"),
+            cache_read_tokens: field("cache_read_input_tokens"),
+            cache_write_tokens: field("cache_creation_input_tokens"),
+            reasoning_tokens: None,
+        },
+    );
 }
 
 fn claude_result_usage_samples(
