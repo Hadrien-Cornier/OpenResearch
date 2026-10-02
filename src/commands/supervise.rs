@@ -374,9 +374,8 @@ async fn run_k8s(
     }
 }
 
-/// k8s twin of `tail_logs` — `kubectl logs -f` replays from the pod's start on
-/// each reconnect, so the same truncate-and-dedup contract applies. Tails the
-/// primary Job's leader pod (index 0 for Indexed jobs).
+/// k8s twin of `tail_logs`, resuming each reconnect from the last timestamp.
+/// Tails the primary Job's leader pod (index 0 for Indexed jobs).
 async fn tail_logs_k8s(
     context: Option<String>,
     namespace: String,
@@ -400,23 +399,22 @@ async fn tail_logs_k8s(
             return;
         }
     };
-    let mut seen = 0u64;
+    let mut resume = k8s::LogResume::default();
     loop {
         let mut sink = |line: &str| {
             let _ = writeln!(log_file, "{line}");
         };
-        match k8s::stream_logs(
+        if let Err(err) = k8s::stream_logs(
             context.as_deref(),
             &namespace,
             &job_name,
-            seen,
+            &mut resume,
             LOG_IDLE,
             &mut sink,
         )
         .await
         {
-            Ok(s) => seen = s,
-            Err(err) => eprintln!("supervise {run_id}: log stream error (will retry): {err}"),
+            eprintln!("supervise {run_id}: log stream error (will retry): {err}");
         }
         let _ = log_file.flush();
         if *done.borrow() {
