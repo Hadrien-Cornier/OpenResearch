@@ -780,18 +780,18 @@ fn sort_key(ts: &str) -> Option<String> {
     Some(format!("{secs}.{frac:0<9}{offset}"))
 }
 
-/// Where the run log left off: the newest kubelet timestamp written and how
-/// many lines carried it, so a reconnect resumes there even after log rotation.
+/// Where the run log left off: the newest kubelet timestamp written and the
+/// lines that carried it, so a reconnect resumes there even after log rotation.
 #[derive(Default)]
 pub struct LogResume {
     key: String,
-    ties: u64,
+    tied: Vec<String>,
 }
 
 /// One reconnect's progress through the lines kubelet replays.
 #[derive(Default)]
 struct Pass {
-    ties_seen: u64,
+    replayed_ties: Vec<bool>,
     caught_up: bool,
 }
 
@@ -809,17 +809,21 @@ impl LogResume {
             Ordering::Less if !pass.caught_up => return None,
             Ordering::Less => {}
             Ordering::Equal => {
+                // Match by text: rotation can drop part of the tied group.
                 if !pass.caught_up {
-                    pass.ties_seen += 1;
-                    if pass.ties_seen <= self.ties {
+                    pass.replayed_ties.resize(self.tied.len(), false);
+                    let written = (0..self.tied.len())
+                        .find(|&i| !pass.replayed_ties[i] && self.tied[i] == text);
+                    if let Some(i) = written {
+                        pass.replayed_ties[i] = true;
                         return None;
                     }
                 }
-                self.ties += 1;
+                self.tied.push(text.to_string());
             }
             Ordering::Greater => {
                 self.key = key;
-                self.ties = 1;
+                self.tied = vec![text.to_string()];
             }
         }
         pass.caught_up = true;
@@ -1136,6 +1140,16 @@ mod tests {
         // Rotated file: fewer lines than already written, all newer.
         let rotated = ["2026-10-01T12:01:00Z new 1", "2026-10-01T12:01:01Z new 2"];
         assert_eq!(reconnect(&mut resume, &rotated), ["new 1", "new 2"]);
+    }
+
+    #[test]
+    fn rotation_inside_a_timestamp_tie_keeps_new_tied_lines() {
+        let mut resume = LogResume::default();
+        let first = ["2026-10-01T12:00:00Z a", "2026-10-01T12:00:00Z b"];
+        assert_eq!(reconnect(&mut resume, &first), ["a", "b"]);
+
+        let rotated = ["2026-10-01T12:00:00Z b", "2026-10-01T12:00:00Z c"];
+        assert_eq!(reconnect(&mut resume, &rotated), ["c"]);
     }
 
     #[test]
