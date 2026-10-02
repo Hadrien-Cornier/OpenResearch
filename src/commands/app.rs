@@ -1214,6 +1214,34 @@ mod imp {
         let confirmed = alert.runModal() == NSAlertFirstButtonReturn;
         handler.call((Bool::new(confirmed),));
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_titlebar_message;
+        use tao::window::Theme;
+
+        #[test]
+        fn parses_titlebar_colors() {
+            assert_eq!(
+                parse_titlebar_message("titlebar:system:0e0c0c"),
+                Some((None, [0x0e, 0x0c, 0x0c]))
+            );
+            assert_eq!(
+                parse_titlebar_message("titlebar:dark:FfFfFf"),
+                Some((Some(Theme::Dark), [0xff, 0xff, 0xff]))
+            );
+            for message in [
+                "titlebar:drag",
+                "titlebar:dark:fff",
+                "titlebar:sepia:ffffff",
+                "titlebar:dark:zzzzzz",
+                "titlebar:dark:ffffé",
+                "theme:dark:ffffff",
+            ] {
+                assert_eq!(parse_titlebar_message(message), None, "{message}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
