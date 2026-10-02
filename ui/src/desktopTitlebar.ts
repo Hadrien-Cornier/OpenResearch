@@ -15,7 +15,7 @@ function opaqueHex(color: string): string | null {
   if (!swatch) return null;
   swatch.clearRect(0, 0, 1, 1);
   // An unparseable color leaves fillStyle as it was.
-  swatch.fillStyle = "#0000";
+  swatch.fillStyle = "transparent";
   swatch.fillStyle = color;
   swatch.fillRect(0, 0, 1, 1);
   const [r, g, b, a] = swatch.getImageData(0, 0, 1, 1).data;
