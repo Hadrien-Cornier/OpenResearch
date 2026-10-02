@@ -371,6 +371,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     cmd.env("NO_COLOR", "1");
     set_chat_session_env(&mut cmd, &ctx.session_id, "antigravity", Some(up_port));
     cmd.env("ORX_SESSION_ID", &ctx.session_id);
+    if let Some(execution) = ctx.usage_execution_id() {
+        cmd.env("ORX_USAGE_EXECUTION_ID", execution);
+    }
     cmd.env(
         "ORX_GATE_TOKEN",
         ctx.host
@@ -587,11 +590,12 @@ fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
         // prepare_env puts this executable's directory first on PATH.
         "orx antigravity-gate".to_string()
     };
+    // Without approval the gate still sees shell commands, to export their invoking model.
     object.insert(
         "openresearch-approval".into(),
         serde_json::json!({
-            "enabled": enabled,
-            "PreToolUse": [{"matcher":"*","hooks":[{"type":"command","command":command,"timeout":3600}]}]
+            "enabled": enabled || !cfg!(windows),
+            "PreToolUse": [{"matcher": if enabled { "*" } else { "run_command" },"hooks":[{"type":"command","command":command,"timeout":3600}]}]
         }),
     );
     object.insert(
@@ -719,20 +723,20 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         }
         "step_update" => {
             if let Some(step) = event.get("step_update") {
-                if let Some(cid) = step
+                // A forwarded sub-agent step names its own conversation; only the first is the root.
+                let own = step
                     .get("conversation_id")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    state.conversation_id = Some(cid.to_string());
+                    .filter(|id| !id.is_empty());
+                if state.conversation_id.is_none() {
+                    state.conversation_id = own.map(str::to_string);
                 }
                 if let (Some(index), Some(usage)) = (
                     step.get("step_index").and_then(Value::as_i64),
                     antigravity_step_usage(step),
                 ) {
-                    let sample_id = state
-                        .conversation_id
-                        .as_deref()
+                    let sample_id = own
+                        .or(state.conversation_id.as_deref())
                         .map(|conversation| invocation_sample_id(conversation, index))
                         .unwrap_or_else(|| {
                             format!("antigravity-{}:{index}", ctx.attempt_count_for_usage())
@@ -1178,7 +1182,11 @@ mod tests {
         let path = repo.join(".agents/hooks.json");
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(content["openresearch-approval"]["enabled"], false);
+        assert_eq!(content["openresearch-approval"]["enabled"], !cfg!(windows));
+        assert_eq!(
+            content["openresearch-approval"]["PreToolUse"][0]["matcher"],
+            "run_command"
+        );
         assert_eq!(content["openresearch-accounting"]["enabled"], true);
         assert_eq!(
             content["openresearch-accounting"]["PostInvocation"]

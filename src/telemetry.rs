@@ -1024,6 +1024,38 @@ pub(crate) enum ProjectCreationMode {
     Paper,
 }
 
+/// How `orx up` presents the dashboard. The desktop app reports `app_started` instead.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpLaunchMode {
+    Browser,
+    NoBrowser,
+    /// Plain `orx up` inside an SSH session, which prints forwarding steps instead.
+    Ssh,
+    Remote,
+    RemoteHost,
+}
+
+impl UpLaunchMode {
+    pub(crate) fn of(args: &crate::UpArgs) -> Self {
+        if args.remote_host {
+            Self::RemoteHost
+        } else if args.remote.is_some() {
+            Self::Remote
+        } else if args.no_browser {
+            Self::NoBrowser
+        } else if crate::remote::detect_ssh_session().is_some() {
+            Self::Ssh
+        } else {
+            Self::Browser
+        }
+    }
+}
+
+pub(crate) fn capture_browser_open_failed(mode: UpLaunchMode) {
+    capture("browser_open_failed", json!({ "mode": mode }));
+}
+
 pub(crate) fn capture_project_created(local: bool, mode: Option<ProjectCreationMode>) {
     let mut properties = json!({ "local": local });
     if let Some(mode) = mode {
@@ -1088,11 +1120,15 @@ impl TelemetrySession {
     /// The `--no-telemetry` flag is read from the process-global (set in `main`
     /// before this is called), matching every other event path. The handle is
     /// registered in the pending set and flushed by `finish`.
-    pub(crate) fn start(command: Option<&str>) -> TelemetrySession {
+    pub(crate) fn start(command: Option<&str>, mode: Option<UpLaunchMode>) -> TelemetrySession {
         retry_outbox();
         if let Some(command) = command {
             // Bare base name; `build_payload` prefixes it → wire event `cli_command`.
-            capture("command", json!({ "command": command }));
+            let mut properties = json!({ "command": command });
+            if let Some(mode) = mode {
+                properties["mode"] = json!(mode);
+            }
+            capture("command", properties);
         }
         TelemetrySession
     }
@@ -2100,9 +2136,34 @@ mod tests {
                 json!({ "kind": "run", "local": true, "computeTarget": "local" }),
             ),
         ];
+        let launch_modes = [
+            UpLaunchMode::Browser,
+            UpLaunchMode::NoBrowser,
+            UpLaunchMode::Ssh,
+            UpLaunchMode::Remote,
+            UpLaunchMode::RemoteHost,
+        ];
+        let launch_payloads = launch_modes.into_iter().flat_map(|mode| {
+            [
+                build_payload(
+                    "command",
+                    "cli-release-contract-test",
+                    json!({ "command": "up", "mode": mode }),
+                ),
+                build_payload(
+                    "browser_open_failed",
+                    "cli-release-contract-test",
+                    json!({ "mode": mode }),
+                ),
+            ]
+        });
         let mut localized = build_payload("app_started", "cli-release-contract-test", json!({}));
         localized["context"]["locale"] = json!("zh-CN");
-        for payload in payloads.into_iter().chain([localized]) {
+        for payload in payloads
+            .into_iter()
+            .chain(launch_payloads)
+            .chain([localized])
+        {
             assert_eq!(post_payload(&payload).await, DeliveryOutcome::Acknowledged);
         }
     }
@@ -2241,6 +2302,33 @@ mod tests {
         assert!(serde_json::from_value::<ProjectCreationMode>(json!("/private/path")).is_err());
     }
 
+    #[test]
+    fn up_launch_modes_follow_the_dashboard_code_paths() {
+        let _g = EnvGuard::new(&["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]);
+        let args = |argv: &[&str]| {
+            use clap::Parser;
+            match crate::Cli::parse_from(argv).command {
+                Some(crate::Command::Up(args)) => UpLaunchMode::of(&args),
+                _ => unreachable!(),
+            }
+        };
+        let cases = [
+            (&["orx", "up"][..], "browser"),
+            (&["orx", "up", "--no-browser"], "no_browser"),
+            (&["orx", "up", "--remote", "box"], "remote"),
+            (
+                &["orx", "up", "--no-browser", "--remote-host"],
+                "remote_host",
+            ),
+        ];
+        for (argv, mode) in cases {
+            assert_eq!(json!(args(argv)), json!(mode), "{argv:?}");
+        }
+        std::env::set_var("SSH_CONNECTION", "1.2.3.4 5 6.7.8.9 22");
+        assert_eq!(args(&["orx", "up"]), UpLaunchMode::Ssh);
+        assert_eq!(json!(UpLaunchMode::Ssh), json!("ssh"));
+    }
+
     #[tokio::test]
     async fn environment_disabled_consent_never_creates_an_install_id() {
         let _g = EnvGuard::new(OPT_VARS);
@@ -2271,12 +2359,13 @@ mod tests {
         }
         assert!(environment_disabled_reason().is_some());
 
-        let session = TelemetrySession::start(Some("up"));
+        let session = TelemetrySession::start(Some("up"), Some(UpLaunchMode::Browser));
         harness::capture_initial(&json!({"harnesses":[]}));
         harness::SetupAttempt::new("opencode", "install", "automatic");
         capture_onboarding_completed();
         capture_onboarding_research_profile(&ResearchProfile::default());
         capture_project_created(true, Some(ProjectCreationMode::Blank));
+        capture_browser_open_failed(UpLaunchMode::Browser);
         capture_demo_welcome_choice("explore_demo");
         capture_chat_session_started("codex");
         capture_chat_message_sent("codex");

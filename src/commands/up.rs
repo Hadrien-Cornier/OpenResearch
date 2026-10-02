@@ -82,7 +82,11 @@ pub async fn run(args: UpArgs) -> Result<()> {
             let url = format!("http://127.0.0.1:{port}");
             eprintln!("orx up: already running — opening {url}");
             if !args.no_browser {
-                browser::open_browser(&url);
+                if let Some(watch) =
+                    browser::open_dashboard(&url, crate::telemetry::UpLaunchMode::of(&args))
+                {
+                    let _ = watch.await;
+                }
             }
             return Ok(());
         }
@@ -229,7 +233,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
             eprintln!("orx up: warning: {warning}");
         }
         if !args.no_browser {
-            browser::open_browser(&url);
+            browser::open_dashboard(&url, crate::telemetry::UpLaunchMode::of(&args));
         }
     }
 
@@ -2097,6 +2101,7 @@ struct CreateRunReq {
     #[serde(default)]
     force: bool,
     chat_session_id: Option<String>,
+    agent_origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2181,6 +2186,7 @@ pub(crate) async fn submit_run_via_up(
         disk: args.disk,
         force: args.force,
         chat_session_id: args.launching_chat_session(),
+        agent_origin: args.agent_origin.clone(),
     };
     let response =
         authenticate_up_request(local_client()?.post(format!("http://127.0.0.1:{port}/api/runs")))
@@ -2264,6 +2270,8 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
         timeout: req.timeout,
         force: req.force,
         chat_session_id: req.chat_session_id,
+        agent_origin: req.agent_origin,
+        forwarded: true,
     };
     crate::compute::validate_run_args(&args).map_err(bad_request)?;
     let run = crate::compute::submit(&args).await.map_err(bad_request)?;
@@ -8509,6 +8517,7 @@ mod tests {
             disk: None,
             force: true,
             chat_session_id: Some("session-1".into()),
+            agent_origin: None,
         };
 
         let value = serde_json::to_value(&request).unwrap();

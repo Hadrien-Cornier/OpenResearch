@@ -2836,6 +2836,8 @@ impl Store {
     /// On server startup no in-flight task survives. Convert unfinished rows
     /// into explicit, user-recoverable terminal states without replaying them.
     pub fn reconcile_unfinished_chat_turns(&self) -> Result<Vec<StoredChatTurn>> {
+        // Sub-agent usage outliving its parent turn: its native connection died with the server.
+        self.finalize_usage_turns("codex-late:", "cancelled")?;
         self.reconcile_unfinished_chat_turns_inner(true)
     }
 

@@ -211,6 +211,9 @@ pub struct CodexClient {
     /// child (crash/restart replacement) — the DB signal covers that case.
     last_collab_mode: std::sync::Mutex<Option<&'static str>>,
     native_store: NativeStore,
+    session_id: String,
+    /// Each native (thread, turn)'s model, outliving any one orx turn: sub-agents do.
+    turn_models: std::sync::Mutex<HashMap<(String, String), String>>,
     /// Last time this child was handed out, reported thread work, or ended a
     /// turn — the idle reaper's clock.
     last_active: std::sync::Mutex<Instant>,
@@ -428,6 +431,14 @@ impl CodexClient {
         self.native_store
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn turn_models(&self) -> &std::sync::Mutex<HashMap<(String, String), String>> {
+        &self.turn_models
+    }
+
     pub fn set_active_turn(&self, turn_id: &str) {
         *self.active_turn.lock().unwrap() = Some(turn_id.to_string());
     }
@@ -577,6 +588,13 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
                             .remove(&request_id.to_string());
                     }
                 }
+                if method == "model/rerouted" {
+                    crate::local::harness::codex::capture_reroute(
+                        None,
+                        &client.turn_models,
+                        &params,
+                    );
+                }
                 let turn = client.turn.lock().unwrap();
                 // Raw event tracing for sub-agent lifecycle debugging; enable
                 // with ORX_CODEX_EVENT_LOG=1 on the backend (dev only). The
@@ -600,8 +618,19 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
                             .unwrap_or("-")
                     );
                 }
-                if let Some(tx) = turn.as_ref() {
-                    let _ = tx.send(TurnEvent::Notification { method, params });
+                let event = TurnEvent::Notification { method, params };
+                let unsent = match turn.as_ref() {
+                    Some(tx) => tx.send(event).err().map(|error| error.0),
+                    None => Some(event),
+                };
+                drop(turn);
+                if let Some(TurnEvent::Notification { method, params }) = unsent {
+                    crate::local::harness::codex::record_unowned(
+                        &client.session_id,
+                        &client.turn_models,
+                        &method,
+                        &params,
+                    );
                 }
             }
             Line::Junk => {}
@@ -618,6 +647,7 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
     if let Some(tx) = client.turn.lock().unwrap().as_ref() {
         let _ = tx.send(TurnEvent::Closed);
     }
+    crate::local::harness::codex::close_unowned(&client.session_id);
 }
 
 /// Spawn `codex app-server` (no handshake yet — see `CodexHost::ensure`, which
@@ -694,6 +724,8 @@ async fn spawn_client(
         thread_model: std::sync::Mutex::new(None),
         last_collab_mode: std::sync::Mutex::new(None),
         native_store,
+        session_id: session_id.to_string(),
+        turn_models: std::sync::Mutex::new(HashMap::new()),
         last_active: std::sync::Mutex::new(Instant::now()),
     });
     tokio::spawn(read_loop(client.clone(), stdout));
@@ -1016,6 +1048,8 @@ mod tests {
             thread_model: std::sync::Mutex::new(None),
             last_collab_mode: std::sync::Mutex::new(None),
             native_store: NativeStore::Isolated,
+            session_id: String::new(),
+            turn_models: std::sync::Mutex::new(HashMap::new()),
             last_active: std::sync::Mutex::new(last_active),
         })
     }
@@ -1144,6 +1178,8 @@ mod tests {
             thread_model: std::sync::Mutex::new(None),
             last_collab_mode: std::sync::Mutex::new(None),
             native_store: NativeStore::Isolated,
+            session_id: String::new(),
+            turn_models: std::sync::Mutex::new(HashMap::new()),
             last_active: std::sync::Mutex::new(Instant::now()),
         };
 
