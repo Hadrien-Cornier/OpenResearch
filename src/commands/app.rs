@@ -580,7 +580,7 @@ mod imp {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, StartCause, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
-    use tao::window::{Window, WindowBuilder};
+    use tao::window::{Theme, Window, WindowBuilder};
     use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 
     #[cfg(target_os = "macos")]
@@ -701,6 +701,15 @@ mod imp {
             .with_min_inner_size(LogicalSize::new(720.0, 480.0))
             // Shown once the dashboard has loaded, so it rarely flashes blank.
             .with_visible(false);
+        // The dashboard runs under the titlebar, leaving only the traffic lights.
+        #[cfg(target_os = "macos")]
+        let window = {
+            use tao::platform::macos::WindowBuilderExtMacOS;
+            window
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true)
+        };
         #[cfg(windows)]
         let window = {
             use tao::platform::windows::IconExtWindows;
@@ -716,6 +725,16 @@ mod imp {
                 return;
             }
         };
+        // The dashboard's --base until the page reports what it shows under the titlebar.
+        #[cfg(not(target_os = "linux"))]
+        set_titlebar_color(
+            &window,
+            None,
+            match window.theme() {
+                Theme::Dark => [0x0e, 0x0c, 0x0c],
+                _ => [0xff, 0xff, 0xff],
+            },
+        );
 
         let shown = Rc::new(Cell::new(false));
         let replaced = Rc::new(RefCell::new(HashMap::new()));
@@ -757,6 +776,31 @@ mod imp {
                     }
                 }
             });
+        let builder = builder.with_ipc_handler({
+            #[cfg(not(target_os = "linux"))]
+            let titlebar = window.clone();
+            #[cfg(target_os = "linux")]
+            let titlebar = titlebar_css();
+            move |request| {
+                #[cfg(target_os = "macos")]
+                match request.body().as_str() {
+                    "titlebar:drag" => {
+                        let _ = titlebar.drag_window();
+                        return;
+                    }
+                    "titlebar:zoom" => {
+                        titlebar.set_maximized(!titlebar.is_maximized());
+                        return;
+                    }
+                    _ => {}
+                }
+                if let Some((appearance, color)) = parse_titlebar_message(request.body()) {
+                    set_titlebar_color(&titlebar, appearance, color);
+                }
+            }
+        });
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_initialization_script("window.__ORX_MAC_TITLEBAR__ = true;");
         #[cfg(not(target_os = "linux"))]
         let webview = builder.build(&*window);
         // `build` supports only X11 on Linux.
@@ -886,6 +930,86 @@ mod imp {
         let id = super::wide("alphaXiv.OpenResearch");
         // SAFETY: the string is NUL-terminated and outlives the call.
         unsafe { SetCurrentProcessExplicitAppUserModelID(id.as_ptr()) };
+    }
+
+    /// Reads desktopTitlebar.ts's `titlebar:<preference>:<rrggbb>` message. A "system"
+    /// preference leaves the appearance unforced so the page still sees OS changes.
+    fn parse_titlebar_message(message: &str) -> Option<(Option<Theme>, [u8; 3])> {
+        let (preference, hex) = message.strip_prefix("titlebar:")?.split_once(':')?;
+        let appearance = match preference {
+            "system" => None,
+            "light" => Some(Theme::Light),
+            "dark" => Some(Theme::Dark),
+            _ => return None,
+        };
+        if hex.len() != 6 {
+            return None;
+        }
+        let channel = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+        Some((appearance, [channel(0)?, channel(2)?, channel(4)?]))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_titlebar_color(window: &Window, appearance: Option<Theme>, [r, g, b]: [u8; 3]) {
+        window.set_theme(appearance);
+        window.set_background_color(Some((r, g, b, 0xff)));
+    }
+
+    #[cfg(windows)]
+    fn set_titlebar_color(window: &Window, appearance: Option<Theme>, [r, g, b]: [u8; 3]) {
+        use tao::platform::windows::WindowExtWindows;
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR};
+
+        window.set_theme(appearance);
+        let colorref = u32::from_le_bytes([r, g, b, 0]);
+        // Windows 10 has no caption color and refuses this, keeping the dark or light caption.
+        // SAFETY: the handle is this live window's, and the COLORREF outlives the call.
+        unsafe {
+            DwmSetWindowAttribute(
+                window.hwnd() as HWND,
+                DWMWA_CAPTION_COLOR as u32,
+                std::ptr::from_ref(&colorref).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+    }
+
+    /// GTK draws the titlebar on GNOME and Wayland; window managers that draw
+    /// their own ignore this.
+    #[cfg(target_os = "linux")]
+    fn titlebar_css() -> gtk::CssProvider {
+        let provider = gtk::CssProvider::new();
+        if let Some(screen) = gtk::gdk::Screen::default() {
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+        provider
+    }
+
+    /// tao keeps GTK's dark preference on the desktop's color scheme, which is also
+    /// what the page's "system" theme reads, so the appearance is left alone.
+    #[cfg(target_os = "linux")]
+    fn set_titlebar_color(css: &gtk::CssProvider, _appearance: Option<Theme>, [r, g, b]: [u8; 3]) {
+        use gtk::prelude::*;
+
+        // The dashboard's --text for a light or dark surface.
+        let luma = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
+        let [tr, tg, tb] = if luma < 128_000 {
+            [0xe6, 0xe1, 0xe0]
+        } else {
+            [0x1d, 0x1b, 0x1a]
+        };
+        let rule = format!(
+            ".titlebar, .titlebar:backdrop {{ background: rgb({r}, {g}, {b}); \
+             color: rgb({tr}, {tg}, {tb}); border-color: transparent; box-shadow: none; }}"
+        );
+        if let Err(err) = css.load_from_data(rule.as_bytes()) {
+            eprintln!("openresearch app: could not style the titlebar: {err}");
+        }
     }
 
     #[cfg(target_os = "macos")]
