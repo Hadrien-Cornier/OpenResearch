@@ -14,9 +14,9 @@
 //! to the process environment unchanged. The Linux AppImage also hands host
 //! programs the session's GTK settings ([`host_gui_env`]).
 //!
-//! Scope is orx's own resolution, the children it spawns, and the dashboard's
-//! PTY terminals. The other things orx shells out to — `git`, `kubectl`, and
-//! `ssh` — still inherit the process environment.
+//! Scope is orx's own resolution, the children it spawns (including `git`), and
+//! the dashboard's PTY terminals. `kubectl` and `ssh` still inherit the process
+//! environment.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};

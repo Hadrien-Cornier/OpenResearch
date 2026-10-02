@@ -4986,7 +4986,7 @@ fn reject_if_stopping(state: &AppState) -> std::result::Result<(), ApiError> {
 // --- git settings -----------------------------------------------------------
 
 fn git_out(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").args(args).output().ok()?;
+    let out = local::git::git_command().args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -5065,7 +5065,7 @@ async fn set_git_settings(Json(req): Json<SetGitSettingsReq>) -> ApiResult {
     tokio::task::spawn_blocking(move || {
         for (key, value) in [("user.name", name), ("user.email", email)] {
             if let Some(v) = value.filter(|v| !v.is_empty()) {
-                let ok = std::process::Command::new("git")
+                let ok = local::git::git_command()
                     .args(["config", "--global", key, &v])
                     .status()
                     .map(|s| s.success())

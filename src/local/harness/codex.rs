@@ -3593,7 +3593,7 @@ async fn start_thread(ctx: &mut TurnCtx, client: &CodexClient, params: Value) ->
 /// clone and worktree). Canonicalized because codex requires absolute roots
 /// and seatbelt matches real paths (`/var` vs `/private/var`).
 async fn shared_git_dir(workspace: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
+    let out = Command::from(crate::local::git::git_command())
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(workspace)
         .stdin(Stdio::null())
