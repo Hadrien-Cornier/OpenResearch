@@ -127,6 +127,22 @@ async fn client_env_ready(python: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Serializes installs across orx processes so one can't delete another's in-progress env.
+/// Best-effort, like the settings lock: a filesystem without locks shouldn't block launches.
+async fn lock_client_env(env_dir: &Path) -> Option<std::fs::File> {
+    let lock_path = env_dir.with_extension("lock");
+    std::fs::create_dir_all(lock_path.parent()?).ok()?;
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    tokio::task::spawn_blocking(move || lock_file.lock().map(|()| lock_file).ok())
+        .await
+        .ok()?
+}
+
 async fn ensure_client_env() -> Result<PathBuf> {
     static INSTALL_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     let _install = INSTALL_LOCK
@@ -134,14 +150,15 @@ async fn ensure_client_env() -> Result<PathBuf> {
         .lock()
         .await;
     let python = managed_python();
-    if python.exists() && client_env_ready(&python).await {
-        return Ok(python);
-    }
-    let base = base_python().await?;
     let env_dir = python
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| anyhow!("Invalid managed Hugging Face environment path."))?;
+    let _env_lock = lock_client_env(env_dir).await;
+    if python.exists() && client_env_ready(&python).await {
+        return Ok(python);
+    }
+    let base = base_python().await?;
     // An unusable env may be pinned to an interpreter too old to upgrade, so rebuild it.
     if env_dir.exists() {
         std::fs::remove_dir_all(env_dir)?;
