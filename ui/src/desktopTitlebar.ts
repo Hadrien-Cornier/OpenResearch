@@ -3,6 +3,10 @@
 
 import type { ThemePreference } from "./theme";
 
+const MAC_TITLEBAR = "__ORX_MAC_TITLEBAR__" in window;
+// Windows has no native titlebar left to paint; the page draws it (WindowControls).
+const WINDOWS_TITLEBAR = "__ORX_WIN_TITLEBAR__" in window;
+
 let preference: ThemePreference = "system";
 let sent = "";
 let pending = false;
@@ -39,7 +43,7 @@ function topEdgeColor(): string | null {
 /** Re-sends the titlebar color; pass the theme preference when it changes. */
 export function syncDesktopTitlebar(nextPreference?: ThemePreference): void {
   if (nextPreference) preference = nextPreference;
-  if (!window.ipc || pending) return;
+  if (!window.ipc || WINDOWS_TITLEBAR || pending) return;
   pending = true;
   setTimeout(() => {
     pending = false;
@@ -51,7 +55,7 @@ export function syncDesktopTitlebar(nextPreference?: ThemePreference): void {
   }, 100);
 }
 
-if (window.ipc) {
+if (window.ipc && !WINDOWS_TITLEBAR) {
   new MutationObserver(() => syncDesktopTitlebar()).observe(
     document.documentElement,
     {
@@ -67,12 +71,13 @@ if (window.ipc) {
 const INTERACTIVE =
   "a, button, input, select, textarea, label, summary, [role='button'], [role='tab'], [role='menuitem'], [role='option'], [role='switch'], [role='checkbox'], [contenteditable]:not([contenteditable='false']), [tabindex]:not([tabindex='-1'])";
 
-// The macOS app runs the page under its titlebar, so the page's top strip
-// drags and zooms the window in its place.
-if ("__ORX_MAC_TITLEBAR__" in window) {
-  document.documentElement.classList.add("mac-titlebar");
+// The macOS and Windows apps run the page under the titlebar, so the page's top
+// strip drags and zooms the window in its place.
+const DRAG_STRIP_HEIGHT = MAC_TITLEBAR ? 28 : WINDOWS_TITLEBAR ? 32 : 0;
+if (DRAG_STRIP_HEIGHT) {
+  document.documentElement.classList.add(MAC_TITLEBAR ? "mac-titlebar" : "win-titlebar");
   window.addEventListener("mousedown", (event) => {
-    if (event.button !== 0 || event.defaultPrevented || event.clientY >= 28) return;
+    if (event.button !== 0 || event.defaultPrevented || event.clientY >= DRAG_STRIP_HEIGHT) return;
     if (event.target instanceof Element && event.target.closest(INTERACTIVE)) return;
     window.ipc?.postMessage(event.detail === 2 ? "titlebar:zoom" : "titlebar:drag");
   });

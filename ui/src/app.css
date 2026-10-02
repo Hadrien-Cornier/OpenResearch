@@ -317,6 +317,10 @@
   top: 1.25rem;
 }
 
+.win-titlebar .workspace-card-visible .workspace-tools {
+  top: 2.5rem;
+}
+
 .code-source-text,
 .openresearch-diff .diff-line {
   @apply font-mono text-sm leading-[1.55] [tab-size:4];

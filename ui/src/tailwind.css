@@ -11,5 +11,7 @@
 @import "tailwindcss/utilities.css" layer(utilities) source(none);
 /* The macOS app, where the page runs under the titlebar's traffic lights. */
 @custom-variant mac-titlebar (&:where(.mac-titlebar *));
+/* The Windows app, where the page draws the caption buttons at the top-right. */
+@custom-variant win-titlebar (&:where(.win-titlebar *));
 @source "../index.html";
 @source ".";

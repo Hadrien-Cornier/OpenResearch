@@ -1263,5 +1263,9 @@
   "side_chat_empty": "साइड चैट उन्हें बंद करने या ऐप से बाहर निकलने पर हटा दी जाती हैं।",
   "workspace_more_tools": "और टूल",
   "side_chat_nested": "साइड चैट अपनी खुद की साइड चैट नहीं खोल सकती।",
-  "side_chat_close_failed": "साइड चैट हटाई नहीं जा सकी: {error}"
+  "side_chat_close_failed": "साइड चैट हटाई नहीं जा सकी: {error}",
+  "window_minimize": "छोटा करें",
+  "window_maximize": "बड़ा करें",
+  "window_restore": "पुनर्स्थापित करें",
+  "window_close": "बंद करें"
 }

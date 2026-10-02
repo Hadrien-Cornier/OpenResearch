@@ -580,7 +580,9 @@ mod imp {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, StartCause, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
-    use tao::window::{Theme, Window, WindowBuilder};
+    #[cfg(not(windows))]
+    use tao::window::Theme;
+    use tao::window::{Window, WindowBuilder};
     use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 
     #[cfg(target_os = "macos")]
@@ -606,6 +608,10 @@ mod imp {
         Menu(MenuId),
         #[cfg(not(target_os = "macos"))]
         Focus,
+        #[cfg(windows)]
+        Close,
+        #[cfg(windows)]
+        SyncMaximized,
     }
 
     enum Quit {
@@ -712,9 +718,13 @@ mod imp {
         };
         #[cfg(windows)]
         let window = {
-            use tao::platform::windows::IconExtWindows;
-            // Resource 1 is the icon build.rs embeds in orx.exe.
-            window.with_window_icon(tao::window::Icon::from_resource(1, None).ok())
+            use tao::platform::windows::{IconExtWindows, WindowBuilderExtWindows};
+            // The dashboard draws the titlebar and its caption buttons itself.
+            window
+                .with_decorations(false)
+                .with_undecorated_shadow(true)
+                // Resource 1 is the icon build.rs embeds in orx.exe.
+                .with_window_icon(tao::window::Icon::from_resource(1, None).ok())
         };
         #[cfg(target_os = "linux")]
         let window = window.with_window_icon(linux_window_icon());
@@ -738,7 +748,7 @@ mod imp {
             window.gtk_window().set_titlebar(Some(&header));
         }
         // The dashboard's --base until the page reports what it shows under the titlebar.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         set_titlebar_color(
             &window,
             None,
@@ -778,7 +788,13 @@ mod imp {
                 let window = window.clone();
                 let origin = origin.clone();
                 let shown = shown.clone();
+                #[cfg(windows)]
+                let proxy = event_loop.create_proxy();
                 move |event, url| {
+                    #[cfg(windows)]
+                    if matches!(event, PageLoadEvent::Finished) {
+                        let _ = proxy.send_event(UserEvent::SyncMaximized);
+                    }
                     if matches!(event, PageLoadEvent::Finished)
                         && super::is_dashboard_url(&url, &origin)
                         && !shown.replace(true)
@@ -790,29 +806,51 @@ mod imp {
             });
         let builder = builder.with_ipc_handler({
             #[cfg(not(target_os = "linux"))]
-            let titlebar = window.clone();
+            let window = window.clone();
             #[cfg(target_os = "linux")]
-            let titlebar = titlebar_css();
+            let css = titlebar_css();
+            #[cfg(windows)]
+            let proxy = event_loop.create_proxy();
             move |request| {
-                #[cfg(target_os = "macos")]
-                match request.body().as_str() {
+                let message = request.body().as_str();
+                #[cfg(not(target_os = "linux"))]
+                match message {
                     "titlebar:drag" => {
-                        let _ = titlebar.drag_window();
-                        return;
+                        let _ = window.drag_window();
                     }
-                    "titlebar:zoom" => {
-                        titlebar.set_maximized(!titlebar.is_maximized());
-                        return;
+                    "titlebar:zoom" => window.set_maximized(!window.is_maximized()),
+                    #[cfg(windows)]
+                    "titlebar:minimize" => window.set_minimized(true),
+                    #[cfg(windows)]
+                    "titlebar:close" => {
+                        let _ = proxy.send_event(UserEvent::Close);
                     }
-                    _ => {}
+                    #[cfg(windows)]
+                    _ => {
+                        if let Some(direction) = message
+                            .strip_prefix("titlebar:resize:")
+                            .and_then(top_resize_direction)
+                        {
+                            let _ = window.drag_resize_window(direction);
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    _ => {
+                        if let Some((appearance, color)) = parse_titlebar_message(message) {
+                            set_titlebar_color(&window, appearance, color);
+                        }
+                    }
                 }
-                if let Some((appearance, color)) = parse_titlebar_message(request.body()) {
-                    set_titlebar_color(&titlebar, appearance, color);
+                #[cfg(target_os = "linux")]
+                if let Some((appearance, color)) = parse_titlebar_message(message) {
+                    set_titlebar_color(&css, appearance, color);
                 }
             }
         });
         #[cfg(target_os = "macos")]
         let builder = builder.with_initialization_script("window.__ORX_MAC_TITLEBAR__ = true;");
+        #[cfg(windows)]
+        let builder = builder.with_initialization_script("window.__ORX_WIN_TITLEBAR__ = true;");
         #[cfg(not(target_os = "linux"))]
         let webview = builder.build(&*window);
         // `build` supports only X11 on Linux.
@@ -864,6 +902,16 @@ mod imp {
                 window.set_visible(true);
                 window.set_focus();
             }
+            #[cfg(windows)]
+            Event::UserEvent(UserEvent::Close) => {
+                begin_quit(&mut quit, &window, &webview, control_flow);
+            }
+            #[cfg(windows)]
+            Event::UserEvent(UserEvent::SyncMaximized)
+            | Event::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => sync_maximized(&window, &webview),
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::Menu(id)) if id == quit_item.id() => {
                 begin_quit(&mut quit, &window, &webview, control_flow);
@@ -946,6 +994,7 @@ mod imp {
 
     /// Reads desktopTitlebar.ts's `titlebar:<preference>:<rrggbb>` message. A "system"
     /// preference leaves the appearance unforced so the page still sees OS changes.
+    #[cfg(not(windows))]
     fn parse_titlebar_message(message: &str) -> Option<(Option<Theme>, [u8; 3])> {
         let (preference, hex) = message.strip_prefix("titlebar:")?.split_once(':')?;
         let appearance = match preference {
@@ -967,24 +1016,27 @@ mod imp {
         window.set_background_color(Some((r, g, b, 0xff)));
     }
 
+    /// The top edge only: the shadow frame tao keeps around an undecorated window
+    /// resizes the others, but the webview covers the top.
     #[cfg(windows)]
-    fn set_titlebar_color(window: &Window, appearance: Option<Theme>, [r, g, b]: [u8; 3]) {
-        use tao::platform::windows::WindowExtWindows;
-        use windows_sys::Win32::Foundation::HWND;
-        use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR};
+    fn top_resize_direction(edge: &str) -> Option<tao::window::ResizeDirection> {
+        use tao::window::ResizeDirection;
+        match edge {
+            "n" => Some(ResizeDirection::North),
+            "ne" => Some(ResizeDirection::NorthEast),
+            "nw" => Some(ResizeDirection::NorthWest),
+            _ => None,
+        }
+    }
 
-        window.set_theme(appearance);
-        let colorref = u32::from_le_bytes([r, g, b, 0]);
-        // Windows 10 has no caption color and refuses this, keeping the dark or light caption.
-        // SAFETY: the handle is this live window's, and the COLORREF outlives the call.
-        unsafe {
-            DwmSetWindowAttribute(
-                window.hwnd() as HWND,
-                DWMWA_CAPTION_COLOR as u32,
-                std::ptr::from_ref(&colorref).cast(),
-                std::mem::size_of::<u32>() as u32,
-            )
-        };
+    /// The page swaps its maximize and restore buttons on this.
+    #[cfg(windows)]
+    fn sync_maximized(window: &Window, webview: &WebView) {
+        let script = format!(
+            "document.documentElement.toggleAttribute('data-maximized', {});",
+            window.is_maximized()
+        );
+        let _ = webview.evaluate_script(&script);
     }
 
     #[cfg(target_os = "linux")]
@@ -1226,7 +1278,7 @@ mod imp {
         handler.call((Bool::new(confirmed),));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     mod tests {
         use super::parse_titlebar_message;
         use tao::window::Theme;

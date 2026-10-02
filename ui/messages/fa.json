@@ -1263,5 +1263,9 @@
   "side_chat_empty": "گفت‌وگوهای جانبی با بستن آن‌ها یا خروج از برنامه حذف می‌شوند.",
   "workspace_more_tools": "ابزارهای بیشتر",
   "side_chat_nested": "گفت‌وگوی جانبی نمی‌تواند گفت‌وگوی جانبی خودش را باز کند.",
-  "side_chat_close_failed": "حذف گفت‌وگوی جانبی ممکن نشد: {error}"
+  "side_chat_close_failed": "حذف گفت‌وگوی جانبی ممکن نشد: {error}",
+  "window_minimize": "کوچک کردن",
+  "window_maximize": "بزرگ کردن",
+  "window_restore": "بازگردانی",
+  "window_close": "بستن"
 }
