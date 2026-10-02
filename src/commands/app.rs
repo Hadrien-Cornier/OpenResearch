@@ -580,7 +580,7 @@ mod imp {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, StartCause, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     use tao::window::Theme;
     use tao::window::{Window, WindowBuilder};
     use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
@@ -735,21 +735,6 @@ mod imp {
                 return;
             }
         };
-        #[cfg(target_os = "linux")]
-        {
-            use gtk::prelude::*;
-            use tao::platform::unix::WindowExtUnix;
-            // The AppImage forces X11, where the window manager's own titlebar ignores
-            // GTK styling; a header bar puts the titlebar in GTK's hands.
-            let header = gtk::HeaderBar::new();
-            // Empty, so the page title the window still carries stays off the bar.
-            header.set_custom_title(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
-            header.set_show_close_button(true);
-            // Scopes titlebar_css to this window, not the save dialog's header bar.
-            header.style_context().add_class("orx-titlebar");
-            header.show();
-            window.gtk_window().set_titlebar(Some(&header));
-        }
         // The dashboard's --base until the page reports what it shows under the titlebar.
         #[cfg(target_os = "macos")]
         set_titlebar_color(
@@ -805,16 +790,13 @@ mod imp {
                     }
                 }
             });
+        #[cfg(not(target_os = "linux"))]
         let builder = builder.with_ipc_handler({
-            #[cfg(not(target_os = "linux"))]
             let window = window.clone();
-            #[cfg(target_os = "linux")]
-            let css = titlebar_css();
             #[cfg(windows)]
             let proxy = event_loop.create_proxy();
             move |request| {
                 let message = request.body().as_str();
-                #[cfg(not(target_os = "linux"))]
                 match message {
                     "titlebar:drag" => {
                         let _ = window.drag_window();
@@ -841,10 +823,6 @@ mod imp {
                             set_titlebar_color(&window, appearance, color);
                         }
                     }
-                }
-                #[cfg(target_os = "linux")]
-                if let Some((appearance, color)) = parse_titlebar_message(message) {
-                    set_titlebar_color(&css, appearance, color);
                 }
             }
         });
@@ -1005,7 +983,7 @@ mod imp {
 
     /// Reads desktopTitlebar.ts's `titlebar:<preference>:<rrggbb>` message. A "system"
     /// preference leaves the appearance unforced so the page still sees OS changes.
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     fn parse_titlebar_message(message: &str) -> Option<(Option<Theme>, [u8; 3])> {
         let (preference, hex) = message.strip_prefix("titlebar:")?.split_once(':')?;
         let appearance = match preference {
@@ -1046,54 +1024,6 @@ mod imp {
         let script =
             format!("document.documentElement.toggleAttribute('data-maximized', {maximized});");
         let _ = webview.evaluate_script(&script);
-    }
-
-    /// A compact bar: the theme's header bar is sized for a title and toolbar buttons.
-    #[cfg(target_os = "linux")]
-    const TITLEBAR_LAYOUT_CSS: &str = ".orx-titlebar { min-height: 0; padding-top: 0; padding-bottom: 0; } \
-        .orx-titlebar button.titlebutton { min-height: 0; min-width: 0; padding: 4px; margin: 2px 0; }";
-
-    #[cfg(target_os = "linux")]
-    fn load_titlebar_css(css: &gtk::CssProvider, rules: &str) {
-        use gtk::prelude::*;
-
-        if let Err(err) = css.load_from_data(rules.as_bytes()) {
-            eprintln!("openresearch app: could not style the titlebar: {err}");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn titlebar_css() -> gtk::CssProvider {
-        let provider = gtk::CssProvider::new();
-        load_titlebar_css(&provider, TITLEBAR_LAYOUT_CSS);
-        if let Some(screen) = gtk::gdk::Screen::default() {
-            gtk::StyleContext::add_provider_for_screen(
-                &screen,
-                &provider,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-        }
-        provider
-    }
-
-    /// tao keeps GTK's dark preference on the desktop's color scheme, which is also
-    /// what the page's "system" theme reads, so the appearance is left alone.
-    #[cfg(target_os = "linux")]
-    fn set_titlebar_color(css: &gtk::CssProvider, _appearance: Option<Theme>, [r, g, b]: [u8; 3]) {
-        // The dashboard's --text for a light or dark surface.
-        let luma = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
-        let [tr, tg, tb] = if luma < 128_000 {
-            [0xe6, 0xe1, 0xe0]
-        } else {
-            [0x1d, 0x1b, 0x1a]
-        };
-        let rules = format!(
-            "{TITLEBAR_LAYOUT_CSS} \
-             .orx-titlebar, .orx-titlebar:backdrop {{ background: rgb({r}, {g}, {b}); \
-             border-color: transparent; box-shadow: none; }} \
-             .orx-titlebar * {{ color: rgb({tr}, {tg}, {tb}); }}"
-        );
-        load_titlebar_css(css, &rules);
     }
 
     #[cfg(target_os = "macos")]
@@ -1299,7 +1229,7 @@ mod imp {
         handler.call((Bool::new(confirmed),));
     }
 
-    #[cfg(all(test, not(windows)))]
+    #[cfg(all(test, target_os = "macos"))]
     mod tests {
         use super::parse_titlebar_message;
         use tao::window::Theme;

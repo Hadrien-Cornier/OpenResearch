@@ -1,10 +1,10 @@
-// The desktop app paints its native titlebar with the color the page shows
-// beneath it (src/commands/app.rs), so the two read as one surface.
+// The macOS app gives its window the color the page shows under the titlebar
+// (src/commands/app.rs), so the two read as one surface.
 
 import type { ThemePreference } from "./theme";
 
 const MAC_TITLEBAR = "__ORX_MAC_TITLEBAR__" in window;
-// Windows has no native titlebar left to paint; the page draws it (WindowControls).
+// Windows has no native titlebar; the page draws it (WindowControls).
 export const WINDOWS_TITLEBAR = "__ORX_WIN_TITLEBAR__" in window;
 
 let preference: ThemePreference = "system";
@@ -43,7 +43,7 @@ function topEdgeColor(): string | null {
 /** Re-sends the titlebar color; pass the theme preference when it changes. */
 export function syncDesktopTitlebar(nextPreference?: ThemePreference): void {
   if (nextPreference) preference = nextPreference;
-  if (!window.ipc || WINDOWS_TITLEBAR || pending) return;
+  if (!MAC_TITLEBAR || pending) return;
   pending = true;
   setTimeout(() => {
     pending = false;
@@ -55,7 +55,7 @@ export function syncDesktopTitlebar(nextPreference?: ThemePreference): void {
   }, 100);
 }
 
-if (window.ipc && !WINDOWS_TITLEBAR) {
+if (MAC_TITLEBAR) {
   new MutationObserver(() => syncDesktopTitlebar()).observe(
     document.documentElement,
     {
