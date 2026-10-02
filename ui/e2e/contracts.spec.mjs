@@ -4,6 +4,8 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { project, session, paneUrl, sql, post } from "./fixtures.mjs";
 
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+
 for (const action of ["compile", "sync", "link", "open"]) {
   test(`restored paper stays passive until ${action}`, async ({ page, request }, info) => {
     sql("UPDATE ui_state SET onboarding_completed=1,tour_completed=1;");

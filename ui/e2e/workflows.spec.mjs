@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fixture, data, sqlValue, sql, paneUrl, post, project, session } from "./fixtures.mjs";
 
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+
 async function pickModel(page, model) {
   await page.locator(".model-picker > button").click();
   await page.getByRole("button", { name: /^Model/ }).click();
@@ -15,10 +17,13 @@ async function pickModel(page, model) {
   }
 }
 async function send(page, text) {
+  const replies = page.getByText(/E2E reply using/);
+  const before = await replies.count();
   await page.locator(".composer-input textarea").fill(text);
   await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(replies).toHaveCount(before + 1);
   await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
-  await expect(page.getByText(/E2E reply using/).last()).toBeVisible();
+  await expect(replies.last()).toBeVisible();
 }
 
 test.beforeEach(async ({ request }) => {
@@ -109,12 +114,15 @@ test("run links select the matching log and never substitute missing or foreign 
     if (expected) {
       await expect.poll(() => logs.some((url) => url.includes(expected.id))).toBe(true);
       await expect(page.locator(".xterm-screen")).toBeVisible();
+      await expect(page.locator(".xterm-rows")).toContainText(`E2E ${expected.name} log`);
       expect(logs.every((url) => url.includes(expected.id))).toBe(true);
     } else {
       await expect(page.getByRole("complementary").getByText("Unavailable", { exact: true })).toBeVisible();
       expect(logs).toHaveLength(0);
     }
   }
+  await page.goto(paneUrl(p, { kind: "experiment", experimentId: experiment, view: "overview" }));
+  await expect(page.getByRole("complementary").locator(".tinker-logo")).toBeVisible();
   await info.attach("run-fixture", { body: JSON.stringify({ project: p.id, experiment, runs }, null, 2), contentType: "application/json" });
 });
 
@@ -178,6 +186,9 @@ test("long conversations retain selections, expose full history, and reset scrol
   await page.goto(`/projects/${p.id}/tasks/${sessions[1].id}`);
   await expect(first).toHaveCount(0);
   await expect(thread.getByText(`Transcript ${sessions[1].id} line 79`, { exact: true })).toBeVisible();
+  await expect.poll(() => thread.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(80);
+  await page.setViewportSize({ width: 1200, height: 720 });
+  await expect.poll(() => thread.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(80);
   await info.attach("conversation-fixture", { body: JSON.stringify({ project: p.id, sessions: sessions.map((s) => s.id), messagesPerSession: 80 }), contentType: "application/json" });
 });
 

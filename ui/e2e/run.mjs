@@ -57,16 +57,25 @@ try {
   if (run.error) throw run.error;
   process.exitCode = run.status ?? 1;
 } finally {
+  const errors = [];
+  try { console.log(slot("stop")); } catch (error) { errors.push(error); }
   try {
-    console.log(slot("stop"));
     if (state) {
       cpSync(dataDir, join(results, "data"), { recursive: true });
       cpSync(state.backendLog, join(results, "backend.log"));
       cpSync(state.uiLog, join(results, "ui.log"));
     }
     cpSync(join(fixture, "native-requests.jsonl"), join(results, "native-requests.jsonl"));
-  } finally {
+  } catch (error) { errors.push(error); }
+  if (errors.length) {
+    console.error(`Fixture preserved for diagnosis: ${fixture}`);
+    throw new AggregateError(errors, "E2E shutdown or evidence collection failed");
+  }
+  try {
     console.log(slot("cleanup"));
     rmSync(fixture, { recursive: true, force: true });
+  } catch (error) {
+    console.error(`Fixture preserved for diagnosis: ${fixture}`);
+    throw error;
   }
 }
