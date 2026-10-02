@@ -33,7 +33,7 @@ class ReleaseNotesTest(unittest.TestCase):
     def test_desktop_downloads_only_link_uploaded_assets(self):
         assets = [
             {"name": name, "browser_download_url": f"https://github.com/alphaXiv/OpenResearch/releases/download/v0.2.14/{name}"}
-            for name, _ in DESKTOP_ASSETS
+            for name, _, _ in DESKTOP_ASSETS
         ]
         assets.append({"name": "openresearch-cli-installer.sh", "browser_download_url": "https://example.com/installer.sh"})
         body = compose("## What's Changed\n\nChanges.", [], "## Highlights\n\nHighlights.", "")
@@ -43,8 +43,12 @@ class ReleaseNotesTest(unittest.TestCase):
         self.assertIn("OpenResearch.dmg", partial)
         self.assertNotIn("OpenResearch-Setup.exe", partial)
         refreshed = refresh_downloads(partial, assets)
-        for name, _ in DESKTOP_ASSETS:
+        for name, _, _ in DESKTOP_ASSETS:
             self.assertIn(name, refreshed)
+        self.assertEqual(refreshed.count('<picture>'), 3)
+        self.assertIn('download-macos-dark.svg', refreshed)
+        self.assertIn('alt="Download for Linux — Intel / AMD"', refreshed)
+        self.assertIn('[Download for Linux — ARM64]', refreshed)
         self.assertNotIn("installer.sh", refreshed)
         self.assertNotIn("https://openresearch.sh/", refreshed)
         self.assertTrue(refreshed.endswith("## Highlights\n\nHighlights.\n\n## What's Changed\n\nChanges.\n"))

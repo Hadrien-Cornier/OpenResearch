@@ -2,6 +2,7 @@
 """Compose desktop-first release notes and refresh published download links."""
 
 import json
+from html import escape
 import os
 import re
 import subprocess
@@ -51,23 +52,34 @@ def fixed_issues(notes, repository):
 DOWNLOAD_START = "<!-- desktop-downloads:start -->"
 DOWNLOAD_END = "<!-- desktop-downloads:end -->"
 DESKTOP_ASSETS = (
-    ("OpenResearch.dmg", "Download for macOS — Apple silicon and Intel"),
-    ("OpenResearch-Setup.exe", "Download for Windows"),
-    ("OpenResearch-x86_64.AppImage", "Download for Linux — Intel / AMD"),
-    ("OpenResearch-aarch64.AppImage", "Download for Linux — ARM64"),
+    ("OpenResearch.dmg", "Download for macOS — Apple silicon and Intel", "macos"),
+    ("OpenResearch-Setup.exe", "Download for Windows", "windows"),
+    ("OpenResearch-x86_64.AppImage", "Download for Linux — Intel / AMD", "linux"),
+    ("OpenResearch-aarch64.AppImage", "Download for Linux — ARM64", None),
 )
 
 
 def downloads(assets=()):
     urls = {asset["name"]: asset["browser_download_url"] for asset in assets}
-    links = [f"- [{label}]({urls[name]})" for name, label in DESKTOP_ASSETS if name in urls]
+    images = "https://raw.githubusercontent.com/alphaXiv/OpenResearch/main/.github/readme-assets"
+    buttons = [
+        f'<a href="{escape(urls[name], quote=True)}"><picture>'
+        f'<source media="(prefers-color-scheme: dark)" srcset="{images}/download-{platform}-dark.svg">'
+        f'<img src="{images}/download-{platform}.svg" alt="{label}" width="220" height="44" />'
+        '</picture></a>'
+        for name, label, platform in DESKTOP_ASSETS if name in urls and platform
+    ]
+    links = ["<p>\n" + "\n".join(buttons) + "\n</p>"] if buttons else []
+    arm64 = urls.get("OpenResearch-aarch64.AppImage")
+    if arm64:
+        links.append(f"[Download for Linux — ARM64]({arm64})")
     if not links:
         links = ["[Download the desktop app](https://openresearch.sh/)"]
     return "\n\n".join((
         DOWNLOAD_START,
         "## Download OpenResearch",
         "Install the desktop app to get everything you need. No separate installation or terminal setup required.",
-        "\n".join(links),
+        "\n\n".join(links),
         DOWNLOAD_END,
     ))
 
