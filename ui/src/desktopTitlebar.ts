@@ -5,7 +5,7 @@ import type { ThemePreference } from "./theme";
 
 const MAC_TITLEBAR = "__ORX_MAC_TITLEBAR__" in window;
 // Windows has no native titlebar left to paint; the page draws it (WindowControls).
-const WINDOWS_TITLEBAR = "__ORX_WIN_TITLEBAR__" in window;
+export const WINDOWS_TITLEBAR = "__ORX_WIN_TITLEBAR__" in window;
 
 let preference: ThemePreference = "system";
 let sent = "";
@@ -76,9 +76,21 @@ const INTERACTIVE =
 const DRAG_STRIP_HEIGHT = MAC_TITLEBAR ? 28 : WINDOWS_TITLEBAR ? 32 : 0;
 if (DRAG_STRIP_HEIGHT) {
   document.documentElement.classList.add(MAC_TITLEBAR ? "mac-titlebar" : "win-titlebar");
+  // Dragging starts on the first move: the OS move loop would swallow a double-click's second press.
+  let pressed = false;
   window.addEventListener("mousedown", (event) => {
+    pressed = false;
     if (event.button !== 0 || event.defaultPrevented || event.clientY >= DRAG_STRIP_HEIGHT) return;
     if (event.target instanceof Element && event.target.closest(INTERACTIVE)) return;
-    window.ipc?.postMessage(event.detail === 2 ? "titlebar:zoom" : "titlebar:drag");
+    if (event.detail === 2) window.ipc?.postMessage("titlebar:zoom");
+    else pressed = true;
+  });
+  window.addEventListener("mousemove", (event) => {
+    if (!pressed || event.buttons !== 1) return;
+    pressed = false;
+    window.ipc?.postMessage("titlebar:drag");
+  });
+  window.addEventListener("mouseup", () => {
+    pressed = false;
   });
 }

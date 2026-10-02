@@ -744,6 +744,8 @@ mod imp {
             let header = gtk::HeaderBar::new();
             header.set_title(Some("OpenResearch"));
             header.set_show_close_button(true);
+            // Scopes titlebar_css to this window, not the save dialog's header bar.
+            header.style_context().add_class("orx-titlebar");
             header.show();
             window.gtk_window().set_titlebar(Some(&header));
         }
@@ -791,14 +793,12 @@ mod imp {
                 #[cfg(windows)]
                 let proxy = event_loop.create_proxy();
                 move |event, url| {
-                    #[cfg(windows)]
-                    if matches!(event, PageLoadEvent::Finished) {
-                        let _ = proxy.send_event(UserEvent::SyncMaximized);
+                    if !matches!(event, PageLoadEvent::Finished) {
+                        return;
                     }
-                    if matches!(event, PageLoadEvent::Finished)
-                        && super::is_dashboard_url(&url, &origin)
-                        && !shown.replace(true)
-                    {
+                    #[cfg(windows)]
+                    let _ = proxy.send_event(UserEvent::SyncMaximized);
+                    if super::is_dashboard_url(&url, &origin) && !shown.replace(true) {
                         window.set_visible(true);
                         window.set_focus();
                     }
@@ -874,6 +874,9 @@ mod imp {
         add_confirm_panel(&webview);
 
         let mut quit = Quit::No;
+        // What the loaded page was last told; a new page starts unmaximized.
+        #[cfg(windows)]
+        let mut page_maximized = false;
         event_loop.run(move |event, _, control_flow| match event {
             Event::NewEvents(StartCause::Init) => {
                 *control_flow = ControlFlow::Wait;
@@ -907,11 +910,18 @@ mod imp {
                 begin_quit(&mut quit, &window, &webview, control_flow);
             }
             #[cfg(windows)]
-            Event::UserEvent(UserEvent::SyncMaximized)
-            | Event::WindowEvent {
+            Event::UserEvent(UserEvent::SyncMaximized) => {
+                page_maximized = window.is_maximized();
+                sync_maximized(&webview, page_maximized);
+            }
+            #[cfg(windows)]
+            Event::WindowEvent {
                 event: WindowEvent::Resized(_),
                 ..
-            } => sync_maximized(&window, &webview),
+            } if window.is_maximized() != page_maximized => {
+                page_maximized = !page_maximized;
+                sync_maximized(&webview, page_maximized);
+            }
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::Menu(id)) if id == quit_item.id() => {
                 begin_quit(&mut quit, &window, &webview, control_flow);
@@ -1031,11 +1041,9 @@ mod imp {
 
     /// The page swaps its maximize and restore buttons on this.
     #[cfg(windows)]
-    fn sync_maximized(window: &Window, webview: &WebView) {
-        let script = format!(
-            "document.documentElement.toggleAttribute('data-maximized', {});",
-            window.is_maximized()
-        );
+    fn sync_maximized(webview: &WebView, maximized: bool) {
+        let script =
+            format!("document.documentElement.toggleAttribute('data-maximized', {maximized});");
         let _ = webview.evaluate_script(&script);
     }
 
@@ -1066,9 +1074,9 @@ mod imp {
             [0x1d, 0x1b, 0x1a]
         };
         let rule = format!(
-            ".titlebar, .titlebar:backdrop {{ background: rgb({r}, {g}, {b}); \
+            ".orx-titlebar, .orx-titlebar:backdrop {{ background: rgb({r}, {g}, {b}); \
              border-color: transparent; box-shadow: none; }} \
-             .titlebar *, .titlebar:backdrop * {{ color: rgb({tr}, {tg}, {tb}); }}"
+             .orx-titlebar * {{ color: rgb({tr}, {tg}, {tb}); }}"
         );
         if let Err(err) = css.load_from_data(rule.as_bytes()) {
             eprintln!("openresearch app: could not style the titlebar: {err}");

@@ -1266,6 +1266,6 @@
   "side_chat_close_failed": "حذف گفت‌وگوی جانبی ممکن نشد: {error}",
   "window_minimize": "کوچک کردن",
   "window_maximize": "بزرگ کردن",
-  "window_restore": "بازگردانی",
+  "window_restore": "بازیابی",
   "window_close": "بستن"
 }
