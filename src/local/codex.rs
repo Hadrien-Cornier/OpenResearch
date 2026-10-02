@@ -3,7 +3,7 @@
 //! the Codex TUI/IDE use; `jsonrpc` field omitted on the wire, requests flow
 //! in BOTH directions — the server sends us approval requests we must answer
 //! by id). Mirrors `AgentHost` (opencode.rs): spawn on demand, reap on read,
-//! kill on session delete / shutdown.
+//! release when idle (`agent_lifecycle`), kill on session delete / shutdown.
 //!
 //! Wire shapes were pinned against codex-cli 0.144.0 via
 //! `codex app-server generate-json-schema` plus a live spike (see the fixture
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +26,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{anyhow, Result};
+use crate::local::agent_lifecycle::{IdlePolicy, REAPER_INTERVAL};
 use crate::local::harness::codex::{ensure_orx_data_dir, find_codex_required};
 use crate::local::native_store::{self, NativeStore};
 
@@ -213,6 +214,9 @@ pub struct CodexClient {
     session_id: String,
     /// Each native (thread, turn)'s model, outliving any one orx turn: sub-agents do.
     turn_models: std::sync::Mutex<HashMap<(String, String), String>>,
+    /// Last time this child was handed out, reported thread work, or ended a
+    /// turn — the idle reaper's clock.
+    last_active: std::sync::Mutex<Instant>,
 }
 
 impl CodexClient {
@@ -240,23 +244,16 @@ impl CodexClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        let sent = self
-            .write_line(&json!({ "id": id, "method": method, "params": params }))
-            .await;
-        if let Err(e) = sent {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(e);
-        }
+        let _pending = PendingRequest { client: self, id };
+        self.write_line(&json!({ "id": id, "method": method, "params": params }))
+            .await?;
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(anyhow!("codex app-server closed during {method}")),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(anyhow!(
-                    "codex app-server did not answer {method} within {}s",
-                    timeout.as_secs()
-                ))
-            }
+            Err(_) => Err(anyhow!(
+                "codex app-server did not answer {method} within {}s",
+                timeout.as_secs()
+            )),
         }
     }
 
@@ -382,6 +379,21 @@ impl CodexClient {
         }
     }
 
+    fn touch(&self) {
+        *self.last_active.lock().unwrap() = Instant::now();
+    }
+
+    /// When this child was last used, or `None` while a turn or request is in flight.
+    fn idle_since(&self) -> Option<Instant> {
+        if self.terminated.load(Ordering::Acquire)
+            || self.turn.lock().unwrap().is_some()
+            || !self.pending.lock().unwrap().is_empty()
+        {
+            return None;
+        }
+        Some(*self.last_active.lock().unwrap())
+    }
+
     /// The thread this child has already started/resumed, if any.
     pub fn resumed_thread(&self) -> Option<String> {
         self.resumed_thread.lock().unwrap().clone()
@@ -476,6 +488,19 @@ impl CodexClient {
     }
 }
 
+/// Removes a request's `pending` entry however its caller exits, including
+/// cancellation by an outer timeout; a stale entry would mark the child busy forever.
+struct PendingRequest<'a> {
+    client: &'a CodexClient,
+    id: i64,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.client.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// RAII turn registration — dropping (normal exit or task abort) detaches the
 /// event sink so a dangling turn can't receive another turn's events. An
 /// aborted task's guard drops *asynchronously*, possibly after a successor
@@ -493,6 +518,7 @@ impl Drop for TurnRoute {
             *turn = None;
             drop(turn);
             *self.client.active_turn.lock().unwrap() = None;
+            self.client.touch();
         }
     }
 }
@@ -504,11 +530,13 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
     while let Ok(Some(line)) = lines.next_line().await {
         match classify_line(&line) {
             Line::Response { id, result } => {
+                client.touch();
                 if let Some(tx) = client.pending.lock().unwrap().remove(&id) {
                     let _ = tx.send(result);
                 }
             }
             Line::Request { id, method, params } => {
+                client.touch();
                 let kind = server_req_kind(&method);
                 client
                     .unanswered
@@ -544,6 +572,10 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
                 }
             }
             Line::Notification { method, params } => {
+                // Thread work (incl. sub-agent tails) is activity; account/status chatter is not.
+                if params.get("threadId").is_some() {
+                    client.touch();
+                }
                 // Codex settled a request itself (approval deadline, answer
                 // raced): the id is no longer answerable — drop it from the
                 // pending set so the stale-answer guard stays truthful.
@@ -694,6 +726,7 @@ async fn spawn_client(
         native_store,
         session_id: session_id.to_string(),
         turn_models: std::sync::Mutex::new(HashMap::new()),
+        last_active: std::sync::Mutex::new(Instant::now()),
     });
     tokio::spawn(read_loop(client.clone(), stdout));
     Ok(client)
@@ -787,6 +820,7 @@ impl CodexHost {
                 if client.native_store() == native_store
                     && matches!(client.child.lock().await.try_wait(), Ok(None))
                 {
+                    client.touch();
                     return Ok(client.clone());
                 }
             }
@@ -837,6 +871,7 @@ impl CodexHost {
         let mut guard = self.inner.lock().await;
         let client = guard.get(session_id)?;
         if matches!(client.child.lock().await.try_wait(), Ok(None)) {
+            client.touch();
             return Some(client.clone());
         }
         let dead = guard.remove(session_id)?;
@@ -874,6 +909,95 @@ impl CodexHost {
         items
     }
 
+    pub fn start_reaper(self: &Arc<Self>) {
+        let host = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(REAPER_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(host) = host.upgrade() else {
+                    break;
+                };
+                host.reap_idle_at(Instant::now(), IdlePolicy::current())
+                    .await;
+            }
+        });
+    }
+
+    /// Release exited children and those idle past the policy's timeout or over
+    /// its idle limit; the next turn respawns and `thread/resume`s.
+    async fn reap_idle_at(&self, now: Instant, policy: IdlePolicy) {
+        let clients = self
+            .inner
+            .lock()
+            .await
+            .iter()
+            .map(|(session_id, client)| (session_id.clone(), client.clone()))
+            .collect::<Vec<_>>();
+        let mut doomed = Vec::new();
+        let mut idle = Vec::new();
+        for (session_id, client) in clients {
+            if client.terminated.load(Ordering::Acquire) {
+                continue;
+            }
+            let exited = !matches!(client.child.lock().await.try_wait(), Ok(None));
+            let Some(idle_since) = client.idle_since() else {
+                continue;
+            };
+            // An exited npm wrapper can leave its native app-server running: release
+            // it now rather than let it hold the warm slot.
+            if exited {
+                doomed.push((session_id, client, idle_since, "exited"));
+            } else {
+                idle.push((session_id, client, idle_since));
+            }
+        }
+        let idle_for = idle
+            .iter()
+            .map(|(_, _, idle_since)| now.duration_since(*idle_since))
+            .collect::<Vec<_>>();
+        let (expired, warm): (Vec<usize>, Vec<usize>) =
+            (0..idle.len()).partition(|&index| idle_for[index] >= policy.idle_timeout);
+        let warm_idle_for = warm
+            .iter()
+            .map(|&index| idle_for[index])
+            .collect::<Vec<_>>();
+        let released = expired
+            .into_iter()
+            .map(|index| (index, "idle-expired"))
+            .chain(
+                policy
+                    .over_limit(&warm_idle_for)
+                    .into_iter()
+                    .map(|index| (warm[index], "idle-limit")),
+            )
+            .collect::<Vec<_>>();
+        for (index, reason) in released {
+            let (session_id, client, idle_since) = idle[index].clone();
+            doomed.push((session_id, client, idle_since, reason));
+        }
+        for (session_id, client, idle_since, reason) in doomed {
+            let removed = {
+                // Atomic with the touch in `ensure`/`client_for`: a child handed out since
+                // the snapshot is spared.
+                let mut guard = self.inner.lock().await;
+                let untouched = guard
+                    .get(&session_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &client))
+                    && client.idle_since() == Some(idle_since);
+                untouched.then(|| guard.remove(&session_id)).flatten()
+            };
+            if let Some(client) = removed {
+                eprintln!(
+                    "orx up: stopping codex app-server session={session_id} reason={reason} idle_s={}",
+                    now.duration_since(idle_since).as_secs()
+                );
+                client.terminate().await;
+            }
+        }
+    }
+
     /// Kill and reap one session's child (on session delete).
     pub async fn kill_session(&self, session_id: &str) {
         if let Some(client) = self.inner.lock().await.remove(session_id) {
@@ -892,6 +1016,136 @@ impl CodexHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn idle_test_client(last_active: Instant) -> Arc<CodexClient> {
+        test_client_running("sleep 600", last_active)
+    }
+
+    #[cfg(unix)]
+    fn test_client_running(shell: &str, last_active: Instant) -> Arc<CodexClient> {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", shell])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group_id = child.id().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        Arc::new(CodexClient {
+            child: Mutex::new(child),
+            process_group_id,
+            terminated: AtomicBool::new(false),
+            stdin: Mutex::new(stdin),
+            next_id: AtomicI64::new(1),
+            pending: std::sync::Mutex::new(HashMap::new()),
+            turn: std::sync::Mutex::new(None),
+            unanswered: std::sync::Mutex::new(HashMap::new()),
+            active_turn: std::sync::Mutex::new(None),
+            resumed_thread: std::sync::Mutex::new(None),
+            thread_model: std::sync::Mutex::new(None),
+            last_collab_mode: std::sync::Mutex::new(None),
+            native_store: NativeStore::Isolated,
+            session_id: String::new(),
+            turn_models: std::sync::Mutex::new(HashMap::new()),
+            last_active: std::sync::Mutex::new(last_active),
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_request_does_not_leave_the_child_busy() {
+        let client = idle_test_client(Instant::now());
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            client.try_request("thread/read", json!({})),
+        )
+        .await;
+
+        assert!(cancelled.is_err());
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert!(client.idle_since().is_some());
+        client.terminate().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_releases_an_exited_wrapper_instead_of_keeping_it_warm() {
+        let now = Instant::now();
+        let host = CodexHost::new();
+        let warm = idle_test_client(now - Duration::from_secs(60));
+        // The npm shape: the wrapper exits while its native child keeps running.
+        let exited = test_client_running("sleep 600 & exit 0", now - Duration::from_secs(40));
+        exited.child.lock().await.wait().await.unwrap();
+        for (session_id, client) in [("warm", &warm), ("exited", &exited)] {
+            host.inner
+                .lock()
+                .await
+                .insert(session_id.to_string(), client.clone());
+        }
+
+        host.reap_idle_at(now, IdlePolicy::LOW_MEMORY).await;
+
+        let live = host.inner.lock().await.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(live, ["warm"]);
+        assert!(exited.terminated.load(Ordering::Acquire));
+        let group = -(exited.process_group_id as i32);
+        let mut survivor = true;
+        for _ in 0..50 {
+            survivor = unsafe { libc::kill(group, 0) == 0 };
+            if !survivor {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!survivor, "the wrapper's native child survived the release");
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_releases_idle_children_and_spares_busy_ones() {
+        let now = Instant::now();
+        let host = CodexHost::new();
+        let expired = idle_test_client(now - IdlePolicy::DEFAULT.idle_timeout);
+        let recent = idle_test_client(now - Duration::from_secs(60));
+        let newest = idle_test_client(now - Duration::from_secs(40));
+        let in_turn = idle_test_client(now - Duration::from_secs(3600));
+        let in_request = idle_test_client(now - Duration::from_secs(3600));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _route = in_turn.register_turn(tx);
+        let (request_tx, _request_rx) = oneshot::channel();
+        in_request.pending.lock().unwrap().insert(1, request_tx);
+        for (session_id, client) in [
+            ("expired", &expired),
+            ("recent", &recent),
+            ("newest", &newest),
+            ("in-turn", &in_turn),
+            ("in-request", &in_request),
+        ] {
+            host.inner
+                .lock()
+                .await
+                .insert(session_id.to_string(), client.clone());
+        }
+
+        host.reap_idle_at(now, IdlePolicy::DEFAULT).await;
+
+        let mut live = host.inner.lock().await.keys().cloned().collect::<Vec<_>>();
+        live.sort();
+        assert_eq!(live, ["in-request", "in-turn", "newest", "recent"]);
+        assert!(expired.terminated.load(Ordering::Acquire));
+
+        host.reap_idle_at(now, IdlePolicy::LOW_MEMORY).await;
+        assert!(recent.terminated.load(Ordering::Acquire));
+        assert!(!newest.terminated.load(Ordering::Acquire));
+        assert!(!in_request.terminated.load(Ordering::Acquire));
+        assert!(!in_turn.terminated.load(Ordering::Acquire));
+        host.shutdown().await;
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -926,6 +1180,7 @@ mod tests {
             native_store: NativeStore::Isolated,
             session_id: String::new(),
             turn_models: std::sync::Mutex::new(HashMap::new()),
+            last_active: std::sync::Mutex::new(Instant::now()),
         };
 
         client.terminate().await;
