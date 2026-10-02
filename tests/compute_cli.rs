@@ -186,13 +186,28 @@ fn ssh_config_conflict_and_execution_target_checks() {
 #[cfg(unix)]
 #[test]
 fn slurm_supervisor_survives_connection_and_accounting_loss() {
+    supervisor_recovers_monitoring_and_logs(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_supervisor_survives_proxy_output_without_skipping_logs() {
+    supervisor_recovers_monitoring_and_logs(true);
+}
+
+#[cfg(unix)]
+fn supervisor_recovers_monitoring_and_logs(ssh_backend: bool) {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
     let sandbox = Sandbox::new();
     sandbox.json(&["projects", "--json"]);
     let db = rusqlite::Connection::open(sandbox.0.join("data/orx.db")).unwrap();
     db.execute("INSERT INTO local_experiments (id, project_id, slug, branch_name, run_command, created_at, updated_at) VALUES ('exp','project','exp','main','true',0,0)", []).unwrap();
-    let backend = json!({"kind":"slurm_job", "namespace":"lab", "jobId":"42", "timeoutSecs":86400});
+    let backend = if ssh_backend {
+        json!({"kind":"ssh_job", "namespace":"lab", "jobId":".orx/runs/run"})
+    } else {
+        json!({"kind":"slurm_job", "namespace":"lab", "jobId":"42", "timeoutSecs":86400})
+    };
     db.execute("INSERT INTO runs (id, experiment_id, project_id, status, backend_json, created_at, updated_at) VALUES ('run','exp','project','running',?1,0,0)", [backend.to_string()]).unwrap();
     let bin = sandbox.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -207,9 +222,14 @@ case "$*" in
     phase=$(cat "$HOME/phase")
     case "$phase" in
       outage) echo 'Permission denied (MFA expired)' >&2; exit 255;;
-      missing) echo GONE;;
-      running) echo 'SQ RUNNING';;
-      done) echo 'SA COMPLETED';;
+      missing) if [ "$SSH_BACKEND" = 1 ]; then echo 'cannot assign requested address'; else echo GONE; fi;;
+      running|log_failure) if [ "$SSH_BACKEND" = 1 ]; then echo RUNNING; else echo 'SQ RUNNING'; fi;;
+      done) if [ "$SSH_BACKEND" = 1 ]; then echo 'EXIT 0'; else echo 'SA COMPLETED'; fi;;
+    esac;;
+  *tail*)
+    case "$(cat "$HOME/phase")" in
+      missing|outage|log_failure) echo 'proxy dial error';;
+      *) printf '__ORX_LOG_START__\n'; case "$*" in *'tail -n +1 '*) printf 'first\nsecond\n';; esac;;
     esac;;
   *) exit 0;;
 esac
@@ -229,6 +249,7 @@ esac
     let mut child = ChildGuard(
         sandbox
             .command()
+            .env("SSH_BACKEND", if ssh_backend { "1" } else { "0" })
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .args(["supervise", "run"])
             .stdout(std::process::Stdio::null())
@@ -262,9 +283,13 @@ esac
     std::thread::sleep(Duration::from_secs(10));
     assert!(metadata()["monitoringError"].is_null());
     wait_for(Duration::from_secs(75), &|| {
-        metadata()["monitoringError"]
-            .as_str()
-            .is_some_and(|s| s.contains("scheduler record"))
+        metadata()["monitoringError"].as_str().is_some_and(|s| {
+            s.contains(if ssh_backend {
+                "unexpected inspect output"
+            } else {
+                "scheduler record"
+            })
+        })
     });
     std::fs::write(&phase, "outage").unwrap();
     wait(&|| {
@@ -276,7 +301,18 @@ esac
         .query_row("SELECT status FROM runs WHERE id='run'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(status, "running");
-    assert_eq!(metadata()["jobId"], "42");
+    assert_eq!(
+        metadata()["jobId"],
+        if ssh_backend { ".orx/runs/run" } else { "42" }
+    );
+    if ssh_backend {
+        std::fs::write(&phase, "log_failure").unwrap();
+        wait(&|| {
+            metadata()["monitoringError"]
+                .as_str()
+                .is_some_and(|s| s.contains("unexpected SSH log output"))
+        });
+    }
     std::fs::write(&phase, "running").unwrap();
     wait(&|| metadata()["monitoringError"].is_null());
     std::fs::write(&phase, "done").unwrap();
@@ -294,6 +330,10 @@ esac
     }
     let calls = std::fs::read_to_string(sandbox.0.join("calls")).unwrap();
     assert!(!calls.contains("sbatch") && !calls.contains("scancel"));
+    assert_eq!(
+        std::fs::read_to_string(sandbox.0.join("data/run-logs/run.log")).unwrap(),
+        "first\nsecond\n"
+    );
 }
 
 #[cfg(unix)]
