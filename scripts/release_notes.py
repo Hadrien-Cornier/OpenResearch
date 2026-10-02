@@ -75,6 +75,8 @@ def downloads(assets=()):
 def refresh_downloads(body, assets):
     before, start, rest = body.partition(DOWNLOAD_START)
     _, end, after = rest.partition(DOWNLOAD_END)
+    if not start and DOWNLOAD_END not in body:
+        return body
     if not start or not end:
         raise ValueError("Release has no managed desktop download section")
     return before + downloads(assets) + after
@@ -108,6 +110,9 @@ def main():
         tag = sys.argv[2]
         release = gh(f"repos/{repository}/releases/tags/{tag}")
         body = refresh_downloads(release["body"], release["assets"])
+        if body == release["body"]:
+            print("Desktop download section is unchanged; skipping refresh.")
+            return
         gh(f"repos/{repository}/releases/{release['id']}", "-X", "PATCH", "-f", f"body={body}")
         return
     tag, commit, output_file = sys.argv[1:]

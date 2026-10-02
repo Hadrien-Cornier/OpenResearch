@@ -49,8 +49,11 @@ class ReleaseNotesTest(unittest.TestCase):
         self.assertNotIn("https://openresearch.sh/", refreshed)
         self.assertTrue(refreshed.endswith("## Highlights\n\nHighlights.\n\n## What's Changed\n\nChanges.\n"))
         self.assertEqual(refresh_downloads(refreshed, assets), refreshed)
-        with self.assertRaises(ValueError):
-            refresh_downloads("Older notes without a managed section", assets)
+        legacy = "Older notes without a managed section"
+        self.assertEqual(refresh_downloads(legacy, assets), legacy)
+        for malformed in ("<!-- desktop-downloads:start -->", "<!-- desktop-downloads:end -->"):
+            with self.assertRaises(ValueError):
+                refresh_downloads(malformed, assets)
 
     def test_refresh_patches_only_the_selected_release_body(self):
         body = compose("## What's Changed\n\nChanges.", [], "", "")
@@ -65,6 +68,14 @@ class ReleaseNotesTest(unittest.TestCase):
             "repos/alphaXiv/OpenResearch/releases/123", "-X", "PATCH", "-f",
             "body=" + refresh_downloads(body, assets),
         ))
+
+    def test_refresh_does_not_patch_legacy_or_unchanged_notes(self):
+        for body in ("Older release notes", compose("Changes.", [], "", "")):
+            with patch.dict(os.environ, {"GITHUB_REPOSITORY": "alphaXiv/OpenResearch"}), \
+                    patch("sys.argv", ["release_notes.py", "--refresh-downloads", "v0.2.14"]), \
+                    patch("release_notes.gh", return_value={"id": 123, "body": body, "assets": []}) as api:
+                main()
+            self.assertEqual(api.call_count, 1)
 
     def test_remote_install_is_collapsed_and_versioned(self):
         remote = remote_install("alphaXiv/OpenResearch", "v0.2.14")
