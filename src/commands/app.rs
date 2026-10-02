@@ -742,7 +742,8 @@ mod imp {
             // The AppImage forces X11, where the window manager's own titlebar ignores
             // GTK styling; a header bar puts the titlebar in GTK's hands.
             let header = gtk::HeaderBar::new();
-            header.set_title(Some("OpenResearch"));
+            // Empty, so the page title the window still carries stays off the bar.
+            header.set_custom_title(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
             header.set_show_close_button(true);
             // Scopes titlebar_css to this window, not the save dialog's header bar.
             header.style_context().add_class("orx-titlebar");
@@ -1047,9 +1048,24 @@ mod imp {
         let _ = webview.evaluate_script(&script);
     }
 
+    /// A compact bar: the theme's header bar is sized for a title and toolbar buttons.
+    #[cfg(target_os = "linux")]
+    const TITLEBAR_LAYOUT_CSS: &str = ".orx-titlebar { min-height: 0; padding-top: 0; padding-bottom: 0; } \
+        .orx-titlebar button.titlebutton { min-height: 0; min-width: 0; padding: 4px; margin: 2px 0; }";
+
+    #[cfg(target_os = "linux")]
+    fn load_titlebar_css(css: &gtk::CssProvider, rules: &str) {
+        use gtk::prelude::*;
+
+        if let Err(err) = css.load_from_data(rules.as_bytes()) {
+            eprintln!("openresearch app: could not style the titlebar: {err}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn titlebar_css() -> gtk::CssProvider {
         let provider = gtk::CssProvider::new();
+        load_titlebar_css(&provider, TITLEBAR_LAYOUT_CSS);
         if let Some(screen) = gtk::gdk::Screen::default() {
             gtk::StyleContext::add_provider_for_screen(
                 &screen,
@@ -1064,8 +1080,6 @@ mod imp {
     /// what the page's "system" theme reads, so the appearance is left alone.
     #[cfg(target_os = "linux")]
     fn set_titlebar_color(css: &gtk::CssProvider, _appearance: Option<Theme>, [r, g, b]: [u8; 3]) {
-        use gtk::prelude::*;
-
         // The dashboard's --text for a light or dark surface.
         let luma = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
         let [tr, tg, tb] = if luma < 128_000 {
@@ -1073,14 +1087,13 @@ mod imp {
         } else {
             [0x1d, 0x1b, 0x1a]
         };
-        let rule = format!(
-            ".orx-titlebar, .orx-titlebar:backdrop {{ background: rgb({r}, {g}, {b}); \
+        let rules = format!(
+            "{TITLEBAR_LAYOUT_CSS} \
+             .orx-titlebar, .orx-titlebar:backdrop {{ background: rgb({r}, {g}, {b}); \
              border-color: transparent; box-shadow: none; }} \
              .orx-titlebar * {{ color: rgb({tr}, {tg}, {tb}); }}"
         );
-        if let Err(err) = css.load_from_data(rule.as_bytes()) {
-            eprintln!("openresearch app: could not style the titlebar: {err}");
-        }
+        load_titlebar_css(css, &rules);
     }
 
     #[cfg(target_os = "macos")]
