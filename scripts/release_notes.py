@@ -77,6 +77,7 @@ def downloads(assets=()):
         "## Download OpenResearch",
         "Install the desktop app to get everything you need. No separate installation or terminal setup required.",
         "\n\n".join(links),
+        "The desktop app updates automatically by default. You can manage updates in Settings.",
         DOWNLOAD_END,
     ))
 
@@ -99,6 +100,7 @@ def remote_install(repository, tag):
         "```sh\n"
         f"curl --proto '=https' --tlsv1.2 -LsSf {url} | sh\n"
         "```\n\n"
+        "To update an existing terminal installation, run `orx update`.\n\n"
         "</details>"
     )
 
