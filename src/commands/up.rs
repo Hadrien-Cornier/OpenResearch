@@ -5732,7 +5732,7 @@ async fn ssh_connect_socket(
     backend: SshConnectBackend,
     target: crate::jobs::ssh::SshTarget,
 ) {
-    let args = match crate::jobs::ssh::interactive_args(&target) {
+    let args = match crate::jobs::ssh::interactive_args(&target, None).await {
         Ok(args) => args,
         Err(error) => {
             send_ssh_connect_error(&mut socket, &host, backend, error.to_string()).await;
