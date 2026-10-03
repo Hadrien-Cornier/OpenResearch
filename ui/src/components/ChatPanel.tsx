@@ -9,9 +9,10 @@ import {
   setScopedQueryData,
   deletedSessionIds,
   queryClient,
+  workspaceKey,
 } from "../queries/client";
 import { LOCAL_PREFIX, SHELL_TOOL } from "../queries/chatState";
-import { useMutation, useQueries, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueries, useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useChatState } from "../queries/chatStore";
 
@@ -73,6 +74,8 @@ import {
 } from "react";
 import { BrandMark } from "./Wordmark";
 import {
+  listSidebarChatSessions,
+  type SidebarChatCursor,
   cancelQueuedMessage,
   chatAttachmentUrl,
   createChatSession,
@@ -4324,6 +4327,7 @@ export function ChatPanel({
       return Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : [];
     } catch { return []; }
   });
+  const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const railBodyRef = useRef<HTMLDivElement>(null);
   const [railHeight, setRailHeight] = useState(0);
@@ -4338,8 +4342,8 @@ export function ChatPanel({
     resize();
     return () => observer.disconnect();
   }, [railOpen, embedded, mainView]);
-  const recentActivity = new Map(projectActivity.map((activity) => [activity.projectId, activity.lastMessageAt]));
-  const sortedProjects = [...sidebarProjects].sort((a, b) => Number(pinnedProjects.includes(b.id)) - Number(pinnedProjects.includes(a.id)) || Math.max(recentActivity.get(b.id) ?? 0, b.createdAt) - Math.max(recentActivity.get(a.id) ?? 0, a.createdAt));
+  const recentActivity = new Map(projectActivity.map((activity) => [activity.projectId, activity.lastActivityAt]));
+  const sortedProjects = [...sidebarProjects].sort((a, b) => Number(pinnedProjects.includes(b.id)) - Number(pinnedProjects.includes(a.id)) || Math.max(recentActivity.get(b.id) ?? 0, b.updatedAt) - Math.max(recentActivity.get(a.id) ?? 0, a.updatedAt));
   const candidateLimit = sidebarGrouping === "list" || sidebarExpanded ? sortedProjects.length : Math.max(1, Math.ceil(railHeight / 36));
   let shownProjects = sortedProjects.slice(0, candidateLimit);
   const currentProject = sidebarProjects.find((project) => project.id === projectId);
@@ -4347,10 +4351,17 @@ export function ChatPanel({
     shownProjects = [...shownProjects.slice(0, candidateLimit - 1), currentProject];
   }
   const projectSessionsQueries = useQueries({
-    queries: shownProjects.map((project) => ({
+    queries: (sidebarGrouping === "projects" ? shownProjects : []).map((project) => ({
       ...listChatSessionsQuery(project.id),
       enabled: !embedded,
     })),
+  });
+  const flatSessions = useInfiniteQuery({
+    queryKey: workspaceKey("listSidebarChatSessions", sessionFilter),
+    queryFn: ({ pageParam, signal }: { pageParam: SidebarChatCursor | null; signal: AbortSignal }) => listSidebarChatSessions(sessionFilter, pageParam, signal),
+    initialPageParam: null,
+    getNextPageParam: (page): SidebarChatCursor | undefined => page.next ?? undefined,
+    enabled: !embedded && sidebarGrouping === "list",
   });
   const sessionsOptions = useMemo(() => listChatSessionsQuery(projectId), [projectId]);
   const { data: sessions = EMPTY_SESSIONS } = useQuery(sessionsOptions);
@@ -4373,7 +4384,6 @@ export function ChatPanel({
   const projectVisitRef = useRef({ projectId });
   if (projectVisitRef.current.projectId !== projectId) projectVisitRef.current = { projectId };
   const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
-  const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [draft, setDraft] = useState("");
   const [demoHintDismissed, setDemoHintDismissed] = useState(false);
   const [demoRunHintDismissed, setDemoRunHintDismissed] = useState(false);
@@ -6100,13 +6110,13 @@ export function ChatPanel({
   }, [startNewTask, embedded]);
 
   const sidebarRows: SidebarRow[] = [];
-  shownProjects.forEach((project, index) => {
+  if (sidebarGrouping === "projects") shownProjects.forEach((project, index) => {
     const query = projectSessionsQueries[index];
     const projectSessions = project.id === projectId ? sessions : query.data ?? EMPTY_SESSIONS;
     const matching = projectSessions
       .filter((session) => !session.sideParentSessionId && (matchesFilter(sessionFilter, session.archived) || session.id === activeId))
       .sort((a, b) => b.updatedAt - a.updatedAt);
-    const chatLimit = sidebarGrouping === "list" ? matching.length : chatLimits[project.id] ?? 6;
+    const chatLimit = chatLimits[project.id] ?? 6;
     let visible = matching.slice(0, chatLimit);
     const selected = matching.find((session) => session.id === activeId);
     if (selected && !visible.some((session) => session.id === activeId)) visible = [...visible.slice(0, chatLimit - 1), selected];
@@ -6116,11 +6126,18 @@ export function ChatPanel({
     if (!visible.length && (sidebarGrouping === "projects" || query.isPending || query.error)) sidebarRows.push({ kind: "status", project, pending: query.isPending, error: Boolean(query.error), retry: () => { void query.refetch(); } });
   });
   if (sidebarGrouping === "list") {
-    if (!sidebarRows.length && shownProjects[0]) {
-      const query = projectSessionsQueries[0];
-      sidebarRows.push({ kind: "status", project: shownProjects[0], pending: false, error: false, retry: () => { void query.refetch(); } });
+    const flat = flatSessions.data?.pages.flatMap((page) => page.sessions) ?? [];
+    const selected = sessions.find((session) => session.id === activeId);
+    if (selected && !flat.some((session) => session.id === selected.id)) flat.push(selected);
+    flat.filter((session) => !deletedSessionIds.has(session.id)).sort((a, b) => b.updatedAt - a.updatedAt).forEach((session) => {
+      const project = sidebarProjects.find((project) => project.id === session.projectId);
+      if (project) sidebarRows.push({ kind: "chat", project, session });
+    });
+    const project = currentProject ?? sidebarProjects[0];
+    if (project && (!sidebarRows.length || flatSessions.isFetchingNextPage || flatSessions.isError)) {
+      sidebarRows.push({ kind: "status", project, pending: flatSessions.isPending || flatSessions.isFetchingNextPage, error: flatSessions.isError,
+        retry: () => { void (flatSessions.isFetchNextPageError ? flatSessions.fetchNextPage() : flatSessions.refetch()); } });
     }
-    sidebarRows.sort((a, b) => a.kind === "chat" && b.kind === "chat" ? b.session.updatedAt - a.session.updatedAt : a.kind === "chat" ? -1 : b.kind === "chat" ? 1 : 0);
   }
   const sidebarScrollable = sidebarGrouping === "list" || sidebarExpanded;
   const initialRows = fitSidebarRows(sidebarRows, railHeight, activeId);
@@ -6143,6 +6160,15 @@ export function ChatPanel({
     },
     enabled: sidebarScrollable && railOpen && !embedded,
   });
+
+  const sidebarVirtualItems = sidebarVirtualizer.getVirtualItems();
+  const lastVisibleIndex = sidebarVirtualItems.at(-1)?.index ?? -1;
+  useEffect(() => {
+    if (sidebarGrouping === "list" && railOpen && !embedded && lastVisibleIndex >= sidebarRows.length - 6
+      && flatSessions.hasNextPage && !flatSessions.isFetching && !flatSessions.isError) {
+      void flatSessions.fetchNextPage();
+    }
+  }, [sidebarGrouping, railOpen, embedded, lastVisibleIndex, sidebarRows.length, flatSessions.hasNextPage, flatSessions.isFetching, flatSessions.isError, flatSessions.fetchNextPage]);
 
   const rail = (
     <aside className="session-rail w-75 shrink-0 flex flex-col mt-5 mac-titlebar:mt-8 me-3.5 mb-5 ms-0 bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:pt-0 [&_.rail-body]:pb-0 [&_.rail-body]:ps-2 [&_.rail-body]:pe-1 border border-border rounded-lg overflow-visible shadow-elevated">
@@ -6198,7 +6224,7 @@ export function ChatPanel({
       <div ref={railBodyRef} tabIndex={-1} className={`rail-body h-full overflow-x-hidden ${sidebarScrollable ? "overflow-y-auto" : "overflow-y-hidden"}`}>
         <div className="relative" style={{ height: (sidebarScrollable ? sidebarVirtualizer.getTotalSize() : defaultRowsHeight) + (showProjectMore ? 38 : 0) + (sidebarExpanded ? 46 : 0) }}>
           {(sidebarScrollable
-            ? sidebarVirtualizer.getVirtualItems().map((item) => ({ row: sidebarRows[item.index], top: item.start, index: item.index }))
+            ? sidebarVirtualItems.map((item) => ({ row: sidebarRows[item.index], top: item.start, index: item.index }))
             : defaultRows.map((row, index) => ({ row, top: 0, index }))
           ).map(({ row, top, index }) => {
             const project = row.project;
@@ -6709,6 +6735,7 @@ export function ChatPanel({
           {!embedded && !activeId && onNewProject && (
             <ComposerProjectPicker
               projects={sidebarProjects}
+              activity={projectActivity}
               projectId={projectId}
               projectName={projectName}
               onNewProject={onNewProject}

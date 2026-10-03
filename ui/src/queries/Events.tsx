@@ -70,15 +70,24 @@ export function QueryEvents() {
   });
   useEffect(() => {
     let activityTimer: ReturnType<typeof setTimeout> | undefined;
-    const offActivity = onProjectActivityEvent(() => {
+    let sidebarTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshSidebar = () => {
+      sidebarTimer ??= setTimeout(() => {
+        sidebarTimer = undefined;
+        invalidateFamilies(["listSidebarChatSessions"], scope);
+      }, 100);
+    };
+    const refreshActivity = () => {
       activityTimer ??= setTimeout(() => {
         activityTimer = undefined;
         invalidateFamilies(["listProjectActivity"], scope);
       }, 100);
-    });
+    };
+    const offActivity = onProjectActivityEvent(refreshActivity);
     const offMove = onDataDirMove((event) => { if (event.type === "done") invalidateFamilies(["getDataDir"], scope); });
     const offChat = onChatEvent((event) => {
       if (!isCurrentScope(scope)) return;
+      if (event.type === "session" || event.type === "sessionDeleted" || event.type === "busy") refreshSidebar();
       if (event.type === "session") markLiveUpdate(queryClient, listChatSessionsQuery(event.session.projectId).queryKey, event.session.id);
       else if (event.type === "busy" || event.type === "usage") markLiveUpdate(queryClient, [...scope, "listChatSessions"], event.sessionId);
       if (event.type === "message" || event.type === "queued" || event.type === "branch") {
@@ -110,7 +119,7 @@ export function QueryEvents() {
       markLiveUpdate(queryClient, getUpdateStatusQuery().queryKey);
       queryClient.setQueryData(getUpdateStatusQuery().queryKey, status);
     });
-    return () => { clearTimeout(activityTimer); offActivity(); offMove(); offChat(); offAuth(); offCatalog(); offUpdate(); };
+    return () => { clearTimeout(activityTimer); clearTimeout(sidebarTimer); offActivity(); offMove(); offChat(); offAuth(); offCatalog(); offUpdate(); };
   }, [scope[1]]);
   return null;
 }

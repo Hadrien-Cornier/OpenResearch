@@ -2028,6 +2028,28 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn list_sidebar_chat_sessions(
+        &self,
+        archived: Option<bool>,
+        before: Option<(i64, &str)>,
+    ) -> Result<Vec<StoredChatSession>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions
+             WHERE side_parent_session_id IS NULL AND (?1 IS NULL OR archived = ?1)
+               AND (?2 IS NULL OR updated_at < ?2 OR (updated_at = ?2 AND id < ?3))
+             ORDER BY updated_at DESC, id DESC LIMIT 51"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                archived,
+                before.map(|cursor| cursor.0),
+                before.map(|cursor| cursor.1)
+            ],
+            row_to_chat_session,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn side_chat_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -4580,6 +4602,45 @@ mod tests {
             2
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidebar_pages_across_projects_with_ties_and_archive_filter() {
+        let dir = std::env::temp_dir().join(format!("orx-store-sidebar-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        for n in 0..65 {
+            let mut session = chat_session_fixture(&format!("chat_{n:03}"));
+            session.project_id = format!("proj_{}", n % 3);
+            session.updated_at = 10;
+            session.archived = n >= 60;
+            store.create_chat_session(&session).unwrap();
+        }
+        let mut side = chat_session_fixture("side");
+        side.side_parent_session_id = Some("chat_000".into());
+        side.updated_at = 20;
+        store.create_chat_session(&side).unwrap();
+        let first = store.list_sidebar_chat_sessions(Some(false), None).unwrap();
+        assert_eq!(first.len(), 51);
+        assert_eq!(first[0].id, "chat_059");
+        let cursor = &first[49];
+        let second = store
+            .list_sidebar_chat_sessions(Some(false), Some((cursor.updated_at, &cursor.id)))
+            .unwrap();
+        assert_eq!(second.len(), 10);
+        assert_eq!(second[0].id, "chat_009");
+        assert_eq!(second.last().unwrap().id, "chat_000");
+        assert_eq!(
+            store
+                .list_sidebar_chat_sessions(Some(true), None)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            store.list_sidebar_chat_sessions(None, None).unwrap()[0].id,
+            "chat_064"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

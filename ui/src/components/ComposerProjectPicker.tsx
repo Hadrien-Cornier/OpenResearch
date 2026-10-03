@@ -1,18 +1,20 @@
 import { Check, ChevronDown, FolderOpen, Plus } from "lucide-react";
-import type { Project } from "../api";
+import type { Project, ProjectActivity } from "../api";
 import { m } from "../paraglide/messages.js";
 import { usePopover } from "./ModelPicker";
 import { Button, MenuItem } from "./ui";
 
-export function ComposerProjectPicker({ projects, projectId, projectName, onSelect, onNewProject }: {
+export function ComposerProjectPicker({ projects, activity, projectId, projectName, onSelect, onNewProject }: {
   projects: Project[];
+  activity: ProjectActivity[];
   projectId: string;
   projectName: string;
   onSelect: (id: string) => void;
   onNewProject: () => void;
 }) {
   const { open, setOpen, ref } = usePopover();
-  const recent = [...projects].sort((a, b) => Number(b.id === projectId) - Number(a.id === projectId) || b.updatedAt - a.updatedAt);
+  const lastActivity = new Map(activity.map((row) => [row.projectId, row.lastActivityAt]));
+  const recent = [...projects].sort((a, b) => Number(b.id === projectId) - Number(a.id === projectId) || Math.max(lastActivity.get(b.id) ?? 0, b.updatedAt) - Math.max(lastActivity.get(a.id) ?? 0, a.updatedAt));
   return <div ref={ref} className="relative mb-2 w-fit max-w-full">
     <Button className="max-w-full gap-2 rounded-lg px-3 text-sm font-normal text-text" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <FolderOpen size={15} className="shrink-0" /><span className="truncate">{projectName}</span><ChevronDown size={12} className="shrink-0 text-subtext" />

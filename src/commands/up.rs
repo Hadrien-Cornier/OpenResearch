@@ -6935,6 +6935,9 @@ struct SessionsQuery {
     /// `all` is the composer's `/resume` picker, which spans every project.
     /// Spelled out so a dropped `projectId` cannot silently widen the scope.
     scope: Option<String>,
+    archived: Option<bool>,
+    before_updated_at: Option<i64>,
+    before_id: Option<String>,
 }
 
 async fn list_chat_sessions(
@@ -6942,6 +6945,26 @@ async fn list_chat_sessions(
     Query(q): Query<SessionsQuery>,
 ) -> ApiResult {
     let store = Store::open()?;
+    if q.scope.as_deref() == Some("sidebar") {
+        let before = match (q.before_updated_at, q.before_id.as_deref()) {
+            (Some(at), Some(id)) => Some((at, id)),
+            (None, None) => None,
+            _ => return Err(bad_request("both cursor fields are required")),
+        };
+        let mut sessions = store.list_sidebar_chat_sessions(q.archived, before)?;
+        let has_more = sessions.len() > 50;
+        sessions.truncate(50);
+        let next = sessions
+            .last()
+            .filter(|_| has_more)
+            .map(|session| json!({ "updatedAt": session.updated_at, "id": session.id }));
+        let busy = state.chat.busy_sessions().await;
+        let sessions: Vec<Value> = sessions
+            .iter()
+            .map(|session| local::chat::session_json(session, busy.contains(&session.id)))
+            .collect();
+        return Ok(Json(json!({ "sessions": sessions, "next": next })));
+    }
     let sessions = match (q.project_id.as_deref(), q.scope.as_deref()) {
         (Some(project_id), _) => store.list_chat_sessions_by_project(project_id)?,
         (None, Some("all")) => store.list_all_chat_sessions()?,

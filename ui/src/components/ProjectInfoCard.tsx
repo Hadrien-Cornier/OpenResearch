@@ -6,6 +6,11 @@ import { m } from "../paraglide/messages.js";
 import { Button, IconButton, Input, MenuItem, Tooltip, showAlert } from "./ui";
 import { useDialogFocus } from "./useDialogFocus";
 
+function deleteExplanation(project: Project) {
+  const synced = project.githubEnabled && (project.githubUrl || (project.githubOwner && project.githubRepo));
+  return `${m.projects_delete_from_app({ name: project.name })}\n\n${synced ? m.projects_home_local_and_github_kept() : m.projects_home_local_folder_kept()}`;
+}
+
 export function ProjectInfoCard({ project, chatCount, onRemoved, onNewChat, pinned, onPin }: {
   project: Project;
   chatCount: number | undefined;
@@ -49,7 +54,7 @@ export function ProjectInfoCard({ project, chatCount, onRemoved, onNewChat, pinn
   }
   async function remove() {
     menuRef.current?.hidePopover();
-    if (deleting || !window.confirm(m.projects_delete_from_app({ name: project.name }))) return;
+    if (deleting || !window.confirm(deleteExplanation(project))) return;
     setDeleting(true);
     try { await deleteProject(project.id); onRemoved(); }
     catch (err) { showAlert(err instanceof Error ? err.message : String(err), "error"); }
@@ -118,7 +123,7 @@ function EditProjectDialog({ project, onClose, onRemoved }: { project: Project; 
   }
 
   async function remove() {
-    if (pending || !window.confirm(m.projects_delete_from_app({ name: project.name }))) return;
+    if (pending || !window.confirm(deleteExplanation(project))) return;
     setPending(true);
     setError("");
     try { await deleteProject(project.id); onClose(); onRemoved(); }

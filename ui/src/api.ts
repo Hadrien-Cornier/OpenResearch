@@ -1964,6 +1964,15 @@ export const importNativeChat = (projectId: string, chat: NativeChat) =>
 export const listAllChatSessions = (signal?: AbortSignal) =>
   get<{ sessions: ChatSession[] }>("/api/chat/sessions?scope=all", signal).then((r) => r.sessions);
 
+export interface SidebarChatCursor { updatedAt: number; id: string }
+export interface SidebarChatPage { sessions: ChatSession[]; next: SidebarChatCursor | null }
+export const listSidebarChatSessions = (filter: "active" | "archived" | "all", before: SidebarChatCursor | null, signal?: AbortSignal) => {
+  const params = new URLSearchParams({ scope: "sidebar" });
+  if (filter !== "all") params.set("archived", String(filter === "archived"));
+  if (before) { params.set("beforeUpdatedAt", String(before.updatedAt)); params.set("beforeId", before.id); }
+  return get<SidebarChatPage>(`/api/chat/sessions?${params}`, signal);
+};
+
 /** Per-session (and per-turn) composer selections beyond the harness itself. */
 export interface TurnOptions {
   model?: string | null;
