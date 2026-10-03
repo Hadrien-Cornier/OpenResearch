@@ -1334,6 +1334,7 @@ async fn list_project_activity(State(state): State<AppState>) -> ApiResult {
                     "runningExperiments": summary.running_experiments,
                     "totalExperiments": summary.total_experiments,
                     "lastMessageAt": summary.last_message_at,
+                    "lastActivityAt": summary.last_activity_at,
                 })
             })
             .collect::<Vec<_>>();
@@ -3431,7 +3432,15 @@ async fn reveal_project_file(
     Json(req): Json<OpenProjectFileReq>,
 ) -> ApiResult {
     blocking_api(move || {
-        let full = confined_checkout_file(&id, &req, "reveal")?;
+        let full = if req.path == "." {
+            let store = Store::open()?;
+            let project = store
+                .get_local_project(&id)?
+                .ok_or_else(|| not_found("project"))?;
+            resolve_checkout_root(&store, &project, req.session_id.as_deref())?.0
+        } else {
+            confined_checkout_file(&id, &req, "reveal")?
+        };
         crate::editors::reveal_in_file_manager(&full)
             .map_err(|e| ApiError::from(anyhow!("could not reveal file: {e}")))?;
         Ok(Json(json!({ "ok": true })))

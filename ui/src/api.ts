@@ -202,6 +202,7 @@ export interface ProjectActivity {
   runningExperiments: number;
   totalExperiments: number;
   lastMessageAt: number | null;
+  lastActivityAt: number;
 }
 
 export const listProjectActivity = (signal?: AbortSignal) =>
