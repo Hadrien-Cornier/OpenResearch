@@ -20,7 +20,7 @@ import {
   getHarnessesQuery,
   getSkillsQuery,
 } from "../queries/settings";
-import { listChatSessionsQuery, getChatMessagesQuery, listNativeChatsQuery } from "../queries/chat";
+import { listChatSessionsQuery, getChatMessagesQuery, listNativeChatsQuery, readSidebarChatPage } from "../queries/chat";
 import { getProjectStarterPromptsQuery, listProjectsQuery, listProjectActivityQuery } from "../queries/projects";
 import { m } from "../paraglide/messages.js";
 import { autoDir, ltr } from "../i18n";
@@ -74,7 +74,6 @@ import {
 } from "react";
 import { BrandMark } from "./Wordmark";
 import {
-  listSidebarChatSessions,
   type SidebarChatCursor,
   cancelQueuedMessage,
   chatAttachmentUrl,
@@ -4358,7 +4357,7 @@ export function ChatPanel({
   });
   const flatSessions = useInfiniteQuery({
     queryKey: workspaceKey("listSidebarChatSessions", sessionFilter),
-    queryFn: ({ pageParam, signal }: { pageParam: SidebarChatCursor | null; signal: AbortSignal }) => listSidebarChatSessions(sessionFilter, pageParam, signal),
+    queryFn: ({ pageParam, signal }: { pageParam: SidebarChatCursor | null; signal: AbortSignal }) => readSidebarChatPage(sessionFilter, pageParam, signal),
     initialPageParam: null,
     getNextPageParam: (page): SidebarChatCursor | undefined => page.next ?? undefined,
     enabled: !embedded && sidebarGrouping === "list",
