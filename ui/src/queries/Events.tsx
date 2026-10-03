@@ -1,4 +1,5 @@
-import type { ChatSession } from "../api";
+import type { InfiniteData } from "@tanstack/react-query";
+import type { ChatSession, SidebarChatPage } from "../api";
 import { markLiveUpdate } from "./live";
 import {
   refreshHarnesses,
@@ -87,7 +88,7 @@ export function QueryEvents() {
     const offMove = onDataDirMove((event) => { if (event.type === "done") invalidateFamilies(["getDataDir"], scope); });
     const offChat = onChatEvent((event) => {
       if (!isCurrentScope(scope)) return;
-      if (event.type === "session" || event.type === "sessionDeleted" || event.type === "busy") refreshSidebar();
+      if (event.type === "session" || event.type === "sessionDeleted") refreshSidebar();
       if (event.type === "session") markLiveUpdate(queryClient, listChatSessionsQuery(event.session.projectId).queryKey, event.session.id);
       else if (event.type === "busy" || event.type === "usage") markLiveUpdate(queryClient, [...scope, "listChatSessions"], event.sessionId);
       if (event.type === "message" || event.type === "queued" || event.type === "branch") {
@@ -106,7 +107,11 @@ export function QueryEvents() {
       } else if (event.type === "sessionDeleted") {
         removeSession(event.sessionId);
       } else if (event.type === "busy" || event.type === "usage") {
-        queryClient.setQueriesData<ChatSession[]>({ queryKey: [...scope, "listChatSessions"] }, (rows) => rows?.map((row) => row.id !== event.sessionId ? row : event.type === "busy" ? { ...row, busy: event.busy } : { ...row, contextUsage: event.usage }));
+        const update = (row: ChatSession) => row.id !== event.sessionId ? row : event.type === "busy" ? { ...row, busy: event.busy } : { ...row, contextUsage: event.usage };
+        queryClient.setQueriesData<ChatSession[]>({ queryKey: [...scope, "listChatSessions"] }, (rows) => rows?.map(update));
+        queryClient.setQueriesData<InfiniteData<SidebarChatPage>>({ queryKey: [...scope, "listSidebarChatSessions"] }, (data) => data && {
+          ...data, pages: data.pages.map((page) => ({ ...page, sessions: page.sessions.map(update) })),
+        });
       }
     });
     const offAuth = onHarnessAuth(() => { if (isCurrentScope(scope)) void refreshHarnesses(true).catch(() => {}); });
