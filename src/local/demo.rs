@@ -2,7 +2,6 @@
 //! history, and three curated harness-native conversations.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -1610,7 +1609,7 @@ fn commit(repo: &Path, message: &str) -> Result<()> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = super::git::git_command();
     // The prewarm's children yield to the catalog fill and to foreground work;
     // a click landing mid-build flips the rest back to normal priority.
     #[cfg(windows)]

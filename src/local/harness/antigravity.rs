@@ -554,7 +554,7 @@ Stop-TurnProcess ([uint32] $env:ORX_STOP_PID)
 
 fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
     std::fs::create_dir_all(repo)?;
-    let tracked = std::process::Command::new("git")
+    let tracked = crate::local::git::git_command()
         .args(["ls-files", "--error-unmatch", ".agents/hooks.json"])
         .current_dir(repo)
         .stdout(Stdio::null())
