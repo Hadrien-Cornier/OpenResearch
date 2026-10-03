@@ -6022,7 +6022,7 @@ export function ChatPanel({
   }, [startNewTask, embedded]);
 
   const rail = (
-    <aside className="session-rail w-68 shrink-0 flex flex-col mt-5 me-3.5 mb-5 ms-0 bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:overflow-y-auto [&_.rail-body]:pt-0 [&_.rail-body]:pb-1 [&_.rail-body]:px-2 border border-border rounded-lg overflow-visible shadow-elevated">
+    <aside className="session-rail w-68 shrink-0 flex flex-col mt-5 mac-titlebar:mt-8 me-3.5 mb-5 ms-0 bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:overflow-y-auto [&_.rail-body]:pt-0 [&_.rail-body]:pb-1 [&_.rail-body]:px-2 border border-border rounded-lg overflow-visible shadow-elevated">
       {railHeader}
       <nav className="rail-nav flex flex-col gap-0.5 p-2 shrink-0">
         <button
@@ -6116,6 +6116,7 @@ export function ChatPanel({
       title={m.chat_panel_show_sidebar()}
       aria-label={m.chat_panel_show_sidebar()}
       onClick={onShowRail}
+      className="mac-titlebar:ms-16"
     >
       <PanelLeft size={20} />
     </IconButton>
@@ -6139,7 +6140,7 @@ export function ChatPanel({
       <section data-side-chat={embedded || undefined} className={`chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0 ${embedded ? "" : "mt-5"}`}>
         {/* Header — session title on the left, end-pane view switchers on the
           right, fading into the chat below (sessions live in the rail). */}
-        <div className={railOpen || embedded ? "contents" : "grid shrink-0 grid-cols-[2rem_minmax(0,1fr)_2rem] items-center"}>
+        <div className={railOpen || embedded ? "contents" : "grid shrink-0 grid-cols-[2rem_minmax(0,1fr)_2rem] mac-titlebar:grid-cols-[6rem_minmax(0,1fr)_6rem] items-center"}>
           {railReopen}
           <div className={headerClass}>
           <PaperTitle variant="header"

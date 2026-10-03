@@ -1263,5 +1263,9 @@
   "side_chat_empty": "Los chats laterales se eliminan cuando los cierras o sales de la app.",
   "workspace_more_tools": "Más herramientas",
   "side_chat_nested": "Un chat lateral no puede abrir su propio chat lateral.",
-  "side_chat_close_failed": "No se pudo eliminar el chat lateral: {error}"
+  "side_chat_close_failed": "No se pudo eliminar el chat lateral: {error}",
+  "window_minimize": "Minimizar",
+  "window_maximize": "Maximizar",
+  "window_restore": "Restaurar",
+  "window_close": "Cerrar"
 }

@@ -1263,5 +1263,9 @@
   "side_chat_empty": "تُحذف المحادثات الجانبية عند إغلاقها أو الخروج من التطبيق.",
   "workspace_more_tools": "مزيد من الأدوات",
   "side_chat_nested": "لا يمكن للمحادثة الجانبية فتح محادثة جانبية خاصة بها.",
-  "side_chat_close_failed": "تعذّر حذف المحادثة الجانبية: {error}"
+  "side_chat_close_failed": "تعذّر حذف المحادثة الجانبية: {error}",
+  "window_minimize": "تصغير",
+  "window_maximize": "تكبير",
+  "window_restore": "استعادة",
+  "window_close": "إغلاق"
 }
