@@ -212,6 +212,7 @@ class ScholarCatalystLiveTest(unittest.TestCase):
 
     def test_parallel_queries_preserve_metering_cache_and_complete_rows(self):
         guard = threading.Lock()
+        first_wave = threading.Barrier(4)
         active, max_active = 0, 0
 
         def fake_request(body):
@@ -219,6 +220,8 @@ class ScholarCatalystLiveTest(unittest.TestCase):
             with guard:
                 active += 1
                 max_active = max(max_active, active)
+            if not body.get("tools") and "concurrent_" in body["messages"][1]["content"]:
+                first_wave.wait(timeout=10)
             time.sleep(0.01)
             if body.get("tools") and not any(message["role"] == "tool" for message in body["messages"]):
                 message = {"role": "assistant", "content": None, "tool_calls": [{"id": "c1",
@@ -237,6 +240,7 @@ class ScholarCatalystLiveTest(unittest.TestCase):
         runner = self.runner(lambda *args: records, fake_request, config(workers=4))
         for index in range(4):
             task = {**runner.tasks[0], "id": "extra_" + str(index)}
+            task["question"] += " concurrent_" + str(index)
             runner.tasks.append(task)
             runner.task_map[task["id"]] = dict(runner.task_map[self.tasks[0]["id"]])
             runner.labels[task["id"]] = set(runner.labels[self.tasks[0]["id"]])

@@ -6,7 +6,7 @@ Use the offline evaluator for results on the official frozen corpus. Live alphaX
 
 ## Controls
 
-The pilot selects 50 questions before any model call. It includes 25 core questions and 25 subfield questions. It selects one question per source paper. The model receives opaque task identifiers, research questions, and publication cutoffs. Source identifiers, source titles, benchmark labels, and corpus membership remain private.
+The pilot selects 50 questions before any model call. It includes 25 core questions and 25 subfield questions. It selects one question per source paper. The task files use opaque identifiers. The model receives research questions and publication cutoffs. Source identifiers, source titles, benchmark labels, and corpus membership remain private.
 
 All three arms use the same model, provider, temperature, and reasoning setting. Both tool arms use the same alphaXiv keyword and embedding tools. Each tool arm permits six searches and four model turns with tools, followed by one final turn. Each final list contains at most 15 papers.
 
@@ -26,7 +26,7 @@ The estimated model charge is $1–$3. The hard ceiling is $5. Each request rese
 
 Each task-arm has a cumulative cap of 80,000 input tokens and 24,000 output tokens. Each request permits 4,096 output tokens, including reasoning tokens. Input reservations use a conservative byte bound. The runner can stop a task before its actual token cap if that bound is too large.
 
-The first pilot stops 35 skill runs at that conservative input bound. The repeat uses `--arm-input-cap 320000` in all three arms. The byte reservation and price ceilings stay active. The repeat receives only the remaining portion of the combined $5 budget. Preserve the first run and its failures as a separate experiment.
+The first pilot stops 34 skill runs at that conservative input bound. One additional skill run has a search failure. The repeat after this correction uses `--arm-input-cap 320000` in all three arms. The byte reservation and price ceilings stay active. The repeat receives only the remaining portion of the combined $5 budget. Preserve the first run and its failures as a separate experiment.
 
 ## Run the diagnostic
 

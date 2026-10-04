@@ -31,6 +31,11 @@ def error_category(message):
     return "other_run_error"
 
 
+def nonnull_mean(values):
+    values = [value for value in values if value is not None]
+    return statistics.mean(values) if values else None
+
+
 def paired_interval(differences, seed=530, samples=10000):
     if not differences:
         return {"mean_delta": None, "interval_95": None, "n_pairs": 0}
@@ -40,6 +45,19 @@ def paired_interval(differences, seed=530, samples=10000):
     return {"mean_delta": statistics.mean(differences),
             "interval_95": [means[int(samples * 0.025)], means[min(samples - 1, int(samples * 0.975))]],
             "n_pairs": n, "bootstrap_samples": samples, "seed": seed}
+
+
+def stratified_interval(groups, seed=530, samples=10000):
+    groups = [values for values in groups if values]
+    if not groups:
+        return paired_interval([])
+    rng = random.Random(seed)
+    means = sorted(statistics.mean(statistics.mean(rng.choices(values, k=len(values)))
+                                   for values in groups) for _ in range(samples))
+    return {"mean_delta": statistics.mean(statistics.mean(values) for values in groups),
+            "interval_95": [means[int(samples * 0.025)], means[min(samples - 1, int(samples * 0.975))]],
+            "n_pairs": sum(len(values) for values in groups), "bootstrap_samples": samples,
+            "seed": seed, "strata": "question type; equal weight for each type"}
 
 
 def analyze(bench, evidence):
@@ -85,6 +103,14 @@ def analyze(bench, evidence):
         labels, _ = ev.load_relations(bench, kind, queries, corpus)
         positives.update(labels)
     labels = {task["id"]: positives[mapping[task["id"]]["query_id"]] for task in tasks}
+    label_audit = {}
+    for kind in ("core_query", "subfield_query"):
+        ids = [task["id"] for task in tasks if task["type"] == kind]
+        future_by_task = {task_id: sum(ev.is_after_cutoff(corpus[doc_id]["published"], doc_id,
+            mapping[task_id]["cutoff"]) for doc_id in labels[task_id]) for task_id in ids}
+        label_audit[kind] = {"positive_pairs": sum(len(labels[task_id]) for task_id in ids),
+                            "future_positive_pairs": sum(future_by_task.values()),
+                            "queries_with_future_positives": sum(count > 0 for count in future_by_task.values())}
     exposed = {}
     provider_counts = Counter()
     for capture in live.jsonl(evidence / "captures.private.jsonl"):
@@ -122,6 +148,9 @@ def analyze(bench, evidence):
                 if ids and arm != "closed_book" else None)
             scores["n_scored"] = len(ids)
             groups[kind] = scores
+        groups["balanced_pilot"] = {metric: nonnull_mean(groups[kind][metric]
+            for kind in ("core_query", "subfield_query"))
+            for metric in METRICS}
         missing = len(tasks) - sum(not row.get("missing") for row in arm_rows)
         summaries[arm] = {"metrics": groups, "failed_or_missing_rows": missing,
             "errors": dict(Counter(error_category(row.get("error", "missing result"))
@@ -144,6 +173,10 @@ def analyze(bench, evidence):
             ids = [task["id"] for task in tasks if task["type"] == kind and labels[task["id"]]]
             by_type[kind] = {metric: paired_interval([value(task_id, left, metric) - value(task_id, right, metric)
                 for task_id in ids]) for metric in METRICS}
+        by_type["balanced_pilot"] = {metric: stratified_interval([
+            [value(task["id"], left, metric) - value(task["id"], right, metric)
+             for task in tasks if task["type"] == kind and labels[task["id"]]]
+            for kind in ("core_query", "subfield_query")]) for metric in METRICS}
         comparisons[left + "_minus_" + right] = by_type
     return {"schema_version": 1, "protocol": "restricted_live_diagnostic", "official_benchmark_result": False,
         "model": raw_report["model"], "provider": raw_report["provider"], "settings": raw_report["settings"],
@@ -155,6 +188,7 @@ def analyze(bench, evidence):
         "budgeted_cost_usd": sum(state["actual_cost_usd"] for state in ledger["arms"].values()),
         "reserved_cost_usd": sum(state["reserved_cost_usd"] for state in ledger["arms"].values()),
         "provider_response_counts": dict(provider_counts), "arms": summaries, "paired_comparisons": comparisons,
+        "label_audit": label_audit, "gold_denominator": "retain official positives, including cutoff conflicts",
         "uncertainty_method": "paired percentile bootstrap over source papers; missing and failed final runs score zero",
         "candidate_method": "known-positive papers in tool payloads of confirmed model responses; includes failed final runs",
         "limits": ["Live corpus differs from the official frozen corpus.",

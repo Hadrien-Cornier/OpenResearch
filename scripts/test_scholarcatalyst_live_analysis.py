@@ -17,6 +17,10 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(interval["interval_95"], [1, 1])
         self.assertEqual(interval["n_pairs"], 25)
         self.assertIsNone(analysis.paired_interval([])["mean_delta"])
+        balanced = analysis.stratified_interval([[-1.0] * 25, [1.0] * 25], samples=100)
+        self.assertEqual(balanced["mean_delta"], 0)
+        self.assertEqual(balanced["interval_95"], [0, 0])
+        self.assertEqual(balanced["n_pairs"], 50)
 
     def test_complete_mock_run_exports_no_questions_or_source_ids(self):
         with tempfile.TemporaryDirectory() as directory:

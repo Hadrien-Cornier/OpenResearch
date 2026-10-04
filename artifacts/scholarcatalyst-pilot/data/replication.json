@@ -1,0 +1,499 @@
+{
+  "schema_version": 1,
+  "protocol": "restricted_live_diagnostic",
+  "official_benchmark_result": false,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "z-ai",
+  "settings": {
+    "model": "z-ai/glm-5.3-flash",
+    "provider": "z-ai",
+    "quantization": "fp8",
+    "input_price": 0.15,
+    "output_price": 0.5,
+    "total_budget": 4.71,
+    "arm_input_cap": 320000,
+    "arm_output_cap": 24000,
+    "max_output": 4096,
+    "max_tool_rounds": 4,
+    "max_discover_calls": 6,
+    "reasoning_enabled": true,
+    "reasoning_effort": "low",
+    "workers": 4
+  },
+  "data_revision": "ScholarCatalyst pinned revision a5a73467500ada90db4e7641e0697a9591e41a4e",
+  "verified_fingerprint": "37800d79b2fb3d13e33313f7670ed3fdbb7d4cb5489de39055bb762e3881cbd5",
+  "fingerprint_inputs": {
+    "model": "z-ai/glm-5.3-flash",
+    "provider": "z-ai",
+    "quantization": "fp8",
+    "input_price": 0.15,
+    "output_price": 0.5,
+    "total_budget": 4.71,
+    "arm_input_cap": 320000,
+    "arm_output_cap": 24000,
+    "max_output": 4096,
+    "max_tool_rounds": 4,
+    "max_discover_calls": 6,
+    "reasoning_enabled": true,
+    "reasoning_effort": "low",
+    "workers": 4,
+    "tasks_sha256": "79986210cf8998feb5fb613b9892d5aa5d9bfd74bc5fc11cbb0cafbf64acfd26",
+    "corpus_sha256": "2e39c3b1de07f2a5ffa3a5ce38bdea6f5d83d3f7036944715eef234594b35905",
+    "queries_sha256": "edf4995490ee2d9149c798ce43d9743727affe42748a0c73b73d155d1f4d5d5b",
+    "core_relations_sha256": "d9510718d997625d6a3ea7211806d75e5ccf0436486b0211d7f2a1bb18f3255b",
+    "subfield_relations_sha256": "4a3dcf0ac88046f492a8d3faabfee5292109e7db496b92d07b8cfbde101d21e5",
+    "manifest_sha256": "ca2f2fbd2102a730edae033fce50747a34fd5baa2db24f88857d814000f3d9f1",
+    "runner_sha256": "6cf681018da5dbd12cab4a8db455176b9c1f252ae72b3ba05963cedc1ef291b9",
+    "skill_sha256": "4f741a3e696f7e7d9d2a915be4e4522b96a27f28664bb6ac93e5f3cd0304f7ab"
+  },
+  "cohort_sha256": "79986210cf8998feb5fb613b9892d5aa5d9bfd74bc5fc11cbb0cafbf64acfd26",
+  "task_count": 50,
+  "completed_rows": 150,
+  "complete": true,
+  "metered_cost_usd": 0.24410101999999995,
+  "budgeted_cost_usd": 0.37217269999999975,
+  "reserved_cost_usd": 0.0,
+  "provider_response_counts": {
+    "Z.AI": 318
+  },
+  "arms": {
+    "closed_book": {
+      "metrics": {
+        "core_query": {
+          "recall@5": 0.23415873015873015,
+          "recall@15": 0.2852698412698413,
+          "ndcg@15": 0.27021645340183553,
+          "confirmed_exposed_candidate_recall": null,
+          "n_scored": 25
+        },
+        "subfield_query": {
+          "recall@5": 0.08653768453768454,
+          "recall@15": 0.11614374514374515,
+          "ndcg@15": 0.1423822617306991,
+          "confirmed_exposed_candidate_recall": null,
+          "n_scored": 25
+        },
+        "balanced_pilot": {
+          "recall@5": 0.16034820734820734,
+          "recall@15": 0.20070679320679322,
+          "ndcg@15": 0.20629935756626733
+        }
+      },
+      "failed_or_missing_rows": 1,
+      "errors": {
+        "response_schema": 1
+      },
+      "metered_cost_usd": 0.015791700000000002,
+      "budgeted_cost_usd": 0.015791700000000002,
+      "prompt_tokens": 10158,
+      "completion_tokens": 28536,
+      "model_requests": 50,
+      "mean_seconds_per_planned_row": 12.515979999999999,
+      "mean_ranked_slots": 14.7,
+      "invalid_selection_attempts": 378,
+      "unjudged_final_slots": 0,
+      "tool_payload_omitted_papers": 0
+    },
+    "plain_tools": {
+      "metrics": {
+        "core_query": {
+          "recall@5": 0.27476190476190476,
+          "recall@15": 0.3440952380952381,
+          "ndcg@15": 0.3307265848865435,
+          "confirmed_exposed_candidate_recall": 0.3622539682539683,
+          "n_scored": 25
+        },
+        "subfield_query": {
+          "recall@5": 0.10783682983682984,
+          "recall@15": 0.14118747918747918,
+          "ndcg@15": 0.1453894520153773,
+          "confirmed_exposed_candidate_recall": 0.14785414585414586,
+          "n_scored": 25
+        },
+        "balanced_pilot": {
+          "recall@5": 0.1912993672993673,
+          "recall@15": 0.24264135864135866,
+          "ndcg@15": 0.23805801845096042
+        }
+      },
+      "failed_or_missing_rows": 1,
+      "errors": {
+        "search_error": 1
+      },
+      "metered_cost_usd": 0.10410382,
+      "budgeted_cost_usd": 0.1397851,
+      "prompt_tokens": 838504,
+      "completion_tokens": 28019,
+      "model_requests": 133,
+      "mean_seconds_per_planned_row": 19.7211,
+      "mean_ranked_slots": 14.66,
+      "invalid_selection_attempts": 1,
+      "unjudged_final_slots": 450,
+      "tool_payload_omitted_papers": 99
+    },
+    "orx_skill": {
+      "metrics": {
+        "core_query": {
+          "recall@5": 0.28276190476190477,
+          "recall@15": 0.3330952380952381,
+          "ndcg@15": 0.29623164934067214,
+          "confirmed_exposed_candidate_recall": 0.3464285714285714,
+          "n_scored": 25
+        },
+        "subfield_query": {
+          "recall@5": 0.1441884781884782,
+          "recall@15": 0.19542313242313242,
+          "ndcg@15": 0.1874343523957157,
+          "confirmed_exposed_candidate_recall": 0.21275646575646576,
+          "n_scored": 25
+        },
+        "balanced_pilot": {
+          "recall@5": 0.21347519147519148,
+          "recall@15": 0.26425918525918524,
+          "ndcg@15": 0.24183300086819393
+        }
+      },
+      "failed_or_missing_rows": 1,
+      "errors": {
+        "search_error": 1
+      },
+      "metered_cost_usd": 0.12420549999999997,
+      "budgeted_cost_usd": 0.21659589999999998,
+      "prompt_tokens": 1342926,
+      "completion_tokens": 30314,
+      "model_requests": 135,
+      "mean_seconds_per_planned_row": 21.929160000000003,
+      "mean_ranked_slots": 14.68,
+      "invalid_selection_attempts": 0,
+      "unjudged_final_slots": 444,
+      "tool_payload_omitted_papers": 114
+    }
+  },
+  "paired_comparisons": {
+    "orx_skill_minus_plain_tools": {
+      "core_query": {
+        "recall@5": {
+          "mean_delta": 0.008000000000000002,
+          "interval_95": [
+            -0.11199999999999999,
+            0.128
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "recall@15": {
+          "mean_delta": -0.011000000000000001,
+          "interval_95": [
+            -0.136,
+            0.11200000000000003
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "ndcg@15": {
+          "mean_delta": -0.03449493554587135,
+          "interval_95": [
+            -0.14565453531755473,
+            0.06333870053442439
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        }
+      },
+      "subfield_query": {
+        "recall@5": {
+          "mean_delta": 0.03635164835164835,
+          "interval_95": [
+            -0.03266666666666666,
+            0.09904761904761905
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "recall@15": {
+          "mean_delta": 0.054235653235653235,
+          "interval_95": [
+            0.0044444444444444444,
+            0.1083125763125763
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "ndcg@15": {
+          "mean_delta": 0.04204490038033838,
+          "interval_95": [
+            -0.014675076240779438,
+            0.09437201188105507
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        }
+      },
+      "balanced_pilot": {
+        "recall@5": {
+          "mean_delta": 0.022175824175824175,
+          "interval_95": [
+            -0.04602930402930403,
+            0.09042857142857143
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        },
+        "recall@15": {
+          "mean_delta": 0.021617826617826616,
+          "interval_95": [
+            -0.04773015873015874,
+            0.08924358974358973
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        },
+        "ndcg@15": {
+          "mean_delta": 0.0037749824172335147,
+          "interval_95": [
+            -0.05765862826021531,
+            0.059620543486968644
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        }
+      }
+    },
+    "plain_tools_minus_closed_book": {
+      "core_query": {
+        "recall@5": {
+          "mean_delta": 0.040603174603174606,
+          "interval_95": [
+            -0.11377777777777778,
+            0.19704761904761905
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "recall@15": {
+          "mean_delta": 0.05882539682539683,
+          "interval_95": [
+            -0.10761904761904764,
+            0.21949206349206352
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "ndcg@15": {
+          "mean_delta": 0.060510131484707956,
+          "interval_95": [
+            -0.09791807174161488,
+            0.21648125616011463
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        }
+      },
+      "subfield_query": {
+        "recall@5": {
+          "mean_delta": 0.021299145299145297,
+          "interval_95": [
+            -0.052683760683760676,
+            0.10755555555555553
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "recall@15": {
+          "mean_delta": 0.025043734043734042,
+          "interval_95": [
+            -0.051759462759462777,
+            0.11268109668109666
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "ndcg@15": {
+          "mean_delta": 0.0030071902846782357,
+          "interval_95": [
+            -0.0869781712694417,
+            0.09929196498052828
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        }
+      },
+      "balanced_pilot": {
+        "recall@5": {
+          "mean_delta": 0.030951159951159952,
+          "interval_95": [
+            -0.05334798534798535,
+            0.1194041514041514
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        },
+        "recall@15": {
+          "mean_delta": 0.04193456543456543,
+          "interval_95": [
+            -0.04876029526029526,
+            0.13424875124875124
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        },
+        "ndcg@15": {
+          "mean_delta": 0.0317586608846931,
+          "interval_95": [
+            -0.057060905065212636,
+            0.12338720683913279
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        }
+      }
+    },
+    "orx_skill_minus_closed_book": {
+      "core_query": {
+        "recall@5": {
+          "mean_delta": 0.048603174603174606,
+          "interval_95": [
+            -0.10622222222222222,
+            0.19876190476190472
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "recall@15": {
+          "mean_delta": 0.047825396825396826,
+          "interval_95": [
+            -0.11266666666666665,
+            0.20509523809523814
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "ndcg@15": {
+          "mean_delta": 0.026015195938836604,
+          "interval_95": [
+            -0.1250452916820097,
+            0.17614311913279482
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        }
+      },
+      "subfield_query": {
+        "recall@5": {
+          "mean_delta": 0.05765079365079365,
+          "interval_95": [
+            -0.014366300366300369,
+            0.13691575091575092
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "recall@15": {
+          "mean_delta": 0.07927938727938727,
+          "interval_95": [
+            -0.0029743589743589744,
+            0.16912820512820514
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        },
+        "ndcg@15": {
+          "mean_delta": 0.04505209066501662,
+          "interval_95": [
+            -0.05249678812048698,
+            0.14676144863997692
+          ],
+          "n_pairs": 25,
+          "bootstrap_samples": 10000,
+          "seed": 530
+        }
+      },
+      "balanced_pilot": {
+        "recall@5": {
+          "mean_delta": 0.05312698412698413,
+          "interval_95": [
+            -0.03174358974358974,
+            0.13911111111111113
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        },
+        "recall@15": {
+          "mean_delta": 0.06355239205239205,
+          "interval_95": [
+            -0.028426129426129425,
+            0.15507692307692308
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        },
+        "ndcg@15": {
+          "mean_delta": 0.03553364330192661,
+          "interval_95": [
+            -0.05602763470733457,
+            0.12776664967246953
+          ],
+          "n_pairs": 50,
+          "bootstrap_samples": 10000,
+          "seed": 530,
+          "strata": "question type; equal weight for each type"
+        }
+      }
+    }
+  },
+  "label_audit": {
+    "core_query": {
+      "positive_pairs": 88,
+      "future_positive_pairs": 0,
+      "queries_with_future_positives": 0
+    },
+    "subfield_query": {
+      "positive_pairs": 170,
+      "future_positive_pairs": 0,
+      "queries_with_future_positives": 0
+    }
+  },
+  "gold_denominator": "retain official positives, including cutoff conflicts",
+  "uncertainty_method": "paired percentile bootstrap over source papers; missing and failed final runs score zero",
+  "candidate_method": "known-positive papers in tool payloads of confirmed model responses; includes failed final runs",
+  "limits": [
+    "Live corpus differs from the official frozen corpus.",
+    "Sparse labels do not establish relevance of unjudged papers.",
+    "The workflow uses alphaXiv discovery only and common rank validation.",
+    "Model knowledge can include the original source projects.",
+    "A pilot gives preliminary evidence."
+  ]
+}
