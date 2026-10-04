@@ -53,6 +53,7 @@ jobs:
         run: |
           python3 scripts/test_scholarcatalyst_eval.py
           python3 scripts/test_scholarcatalyst_live.py
+          python3 scripts/test_scholarcatalyst_live_analysis.py
 
       - uses: pnpm/action-setup@v4
         with:

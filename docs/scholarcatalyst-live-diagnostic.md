@@ -26,6 +26,37 @@ The estimated model charge is $1–$3. The hard ceiling is $5. Each request rese
 
 Each task-arm has a cumulative cap of 80,000 input tokens and 24,000 output tokens. Each request permits 4,096 output tokens, including reasoning tokens. Input reservations use a conservative byte bound. The runner can stop a task before its actual token cap if that bound is too large.
 
+The first pilot stops 35 skill runs at that conservative input bound. The repeat uses `--arm-input-cap 320000` in all three arms. The byte reservation and price ceilings stay active. The repeat receives only the remaining portion of the combined $5 budget. Preserve the first run and its failures as a separate experiment.
+
+## Run the diagnostic
+
+Set `OPENROUTER_API_KEY` in the process environment. Keep its value outside logs and files.
+
+Prepare the cohort before the model calls:
+
+```sh
+python3 scripts/scholarcatalyst_live.py prepare \
+  --bench-dir /path/to/benchmark --output-dir /path/to/private-evidence
+```
+
+Inspect the configuration without a paid call:
+
+```sh
+python3 scripts/scholarcatalyst_live.py run \
+  --bench-dir /path/to/benchmark --output-dir /path/to/private-evidence \
+  --arm-input-cap 320000
+```
+
+Add `--execute` to run that configuration. Export the aggregate after the run:
+
+```sh
+python3 scripts/scholarcatalyst_live_analysis.py \
+  --bench-dir /path/to/benchmark --evidence-dir /path/to/private-evidence \
+  --output /path/to/aggregate.json
+```
+
+The analysis verifies data, labels, cohort, source guards, runner code, skill, and settings against the ledger fingerprint. Use the same runner revision for later analysis. The aggregate contains fixed error categories and summary values. It excludes private questions and paper identifiers.
+
 ## Evidence
 
 Keep benchmark data and complete traces outside the source repository. The private evidence includes the cohort manifest, metadata guards, tool cache, requests without credentials, responses, failures, and budget ledger. Publish aggregate results and code versions.
