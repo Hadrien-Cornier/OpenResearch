@@ -50,7 +50,9 @@ jobs:
         run: python3 scripts/test_release_notes.py
 
       - name: Literature retrieval evaluation
-        run: python3 scripts/test_scholarcatalyst_eval.py
+        run: |
+          python3 scripts/test_scholarcatalyst_eval.py
+          python3 scripts/test_scholarcatalyst_live.py
 
       - uses: pnpm/action-setup@v4
         with:
