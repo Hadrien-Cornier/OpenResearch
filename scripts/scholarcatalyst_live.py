@@ -32,6 +32,9 @@ QUANTIZATION = "fp8"
 INPUT_PRICE = 0.15
 OUTPUT_PRICE = 0.50
 TOTAL_BUDGET = 5.00
+DEFAULT_COHORT_COUNT = 25
+COHORT_MODES = ("source-disjoint", "paired-projects", "all-project-questions")
+LIVE_ARMS = ("closed_book", "plain_tools", "orx_skill")
 ARM_INPUT_CAP = 80_000
 ARM_OUTPUT_CAP = 24_000
 MAX_OUTPUT = 4096
@@ -108,31 +111,124 @@ def private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
-def make_cohort(bench: Path, out: Path, seed: int) -> Dict[str, Any]:
+def _project_id(query: Dict[str, str]) -> str:
+    return query["paper_id"] or query["id"]
+
+
+def _excluded_projects(path: Optional[Path], queries: Sequence[Dict[str, str]],
+                       bench: Path) -> Tuple[Set[str], str]:
+    if path is None:
+        return set(), ""
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise LiveError("cannot read exclusion manifest {}: {}".format(path, error)) from error
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("queries"), list):
+        raise LiveError("exclusion manifest must contain a queries list")
+    hashes = manifest.get("data_sha256")
+    expected = {name: ev.sha256(bench / name) for name in ("queries.jsonl", "corpus.jsonl")}
+    if not isinstance(hashes, dict) or any(hashes.get(name) != digest for name, digest in expected.items()):
+        raise LiveError("exclusion manifest data hashes do not match this benchmark")
+    by_query = {query["id"]: _project_id(query) for query in queries}
+    known_projects = set(by_query.values())
+    excluded: Set[str] = set()
+    for row in manifest["queries"]:
+        if not isinstance(row, dict):
+            raise LiveError("exclusion manifest query rows must be objects")
+        query_id = row.get("query_id")
+        project = row.get("source_project_id") or row.get("source_id") or query_id
+        if not isinstance(query_id, str) or not query_id or not isinstance(project, str) or not project:
+            raise LiveError("exclusion manifest has an empty query or source project")
+        if query_id not in by_query or project not in known_projects or by_query[query_id] != project:
+            raise LiveError("exclusion manifest contains an unknown or mismatched source project")
+        excluded.add(project)
+    if not excluded:
+        raise LiveError("exclusion manifest has no source projects")
+    return excluded, ev.sha256(path)
+
+
+def make_cohort(bench: Path, out: Path, seed: int,
+                core_count: int = DEFAULT_COHORT_COUNT,
+                subfield_count: int = DEFAULT_COHORT_COUNT,
+                exclude_manifest: Optional[Path] = None,
+                cohort_mode: str = "source-disjoint") -> Dict[str, Any]:
     if (out / "tasks.jsonl").exists() or (out / "manifest.private.json").exists():
         raise LiveError("refuse to overwrite an existing cohort")
     queries, by_id = ev.load_queries(bench / "queries.jsonl")
     corpus = ev.load_corpus(bench / "corpus.jsonl")
+    if any(isinstance(count, bool) or not isinstance(count, int) or count <= 0
+           for count in (core_count, subfield_count)):
+        raise LiveError("core and subfield counts must be positive integers")
+    if cohort_mode not in COHORT_MODES:
+        raise LiveError("unknown cohort mode: {}".format(cohort_mode))
+    if cohort_mode == "paired-projects" and core_count != subfield_count:
+        raise LiveError("paired-projects requires equal core and subfield counts")
+    if cohort_mode == "all-project-questions" and (core_count, subfield_count) != (
+            DEFAULT_COHORT_COUNT, DEFAULT_COHORT_COUNT):
+        raise LiveError("all-project-questions does not accept custom counts")
+    excluded, exclusion_hash = _excluded_projects(exclude_manifest, queries, bench)
     rng = random.Random(seed)
-    groups = {kind: [q for q in queries if q["type"] == kind]
+    groups = {kind: [q for q in queries if q["type"] == kind and
+                      _project_id(q) not in excluded]
               for kind in ("core_query", "subfield_query")}
     for values in groups.values():
         rng.shuffle(values)
     selected: List[Dict[str, str]] = []
     project_ids: Set[str] = set()
-    quotas = (("core_query", 25), ("subfield_query", 25))
-    for kind, quota in quotas:
-        for query in groups[kind]:
-            # A source paper is the released dataset's project identifier.
-            project = query["paper_id"] or query["id"]
+    quotas = {"core_query": core_count, "subfield_query": subfield_count}
+    if cohort_mode == "all-project-questions":
+        selected = [query for query in queries if _project_id(query) not in excluded]
+        project_ids = {_project_id(query) for query in selected}
+    elif cohort_mode == "paired-projects":
+        core_by_project: Dict[str, List[Dict[str, str]]] = {}
+        sub_by_project: Dict[str, List[Dict[str, str]]] = {}
+        for query in groups["core_query"]:
+            core_by_project.setdefault(_project_id(query), []).append(query)
+        for query in groups["subfield_query"]:
+            sub_by_project.setdefault(_project_id(query), []).append(query)
+        paired = list(dict.fromkeys(_project_id(query) for query in groups["core_query"]
+                                    if _project_id(query) in sub_by_project))
+        rng.shuffle(paired)
+        if len(paired) < core_count:
+            raise LiveError("cannot select {} paired source projects; only {} remain after exclusions".format(
+                core_count, len(paired)))
+        for project in paired[:core_count]:
+            selected.extend((core_by_project[project][0], sub_by_project[project][0]))
+            project_ids.add(project)
+    else:
+        # Keep the existing seeded order while preserving enough subfield-only projects.
+        sub_projects = {_project_id(query) for query in groups["subfield_query"]}
+        if len({_project_id(query) for query in groups["core_query"]}) < core_count:
+            raise LiveError("cannot select {} distinct source projects for core_query".format(core_count))
+        if len(sub_projects) < subfield_count:
+            raise LiveError("cannot select {} distinct source projects for subfield_query; only {} remain".format(
+                subfield_count, len(sub_projects)))
+        for query in groups["core_query"]:
+            project = _project_id(query)
             if project in project_ids:
                 continue
-            project_ids.add(project)
+            future_sub = sub_projects - project_ids - {project}
+            if len(future_sub) < subfield_count:
+                continue
             selected.append(query)
-            if sum(item["type"] == kind for item in selected) == quota:
+            project_ids.add(project)
+            if sum(item["type"] == "core_query" for item in selected) == core_count:
                 break
-        if sum(item["type"] == kind for item in selected) != quota:
-            raise LiveError("cannot select {} distinct source projects for {}".format(quota, kind))
+        if sum(item["type"] == "core_query" for item in selected) != core_count:
+            raise LiveError("cannot select {} distinct source projects for core_query".format(core_count))
+        for query in groups["subfield_query"]:
+            project = _project_id(query)
+            if project in project_ids:
+                continue
+            selected.append(query)
+            project_ids.add(project)
+            if sum(item["type"] == "subfield_query" for item in selected) == subfield_count:
+                break
+        if sum(item["type"] == "subfield_query" for item in selected) != subfield_count:
+            raise LiveError("cannot select {} distinct source projects for subfield_query".format(
+                subfield_count))
+    if not selected:
+        raise LiveError("cohort has no queries after source-project exclusions")
     tasks = [ev.task_record(q) for q in selected]
     private_dir(out)
     ev.write_jsonl(out / "tasks.jsonl", tasks)
@@ -153,12 +249,22 @@ def make_cohort(bench: Path, out: Path, seed: int) -> Dict[str, Any]:
             "source_alias_ids": sorted(ev.source_aliases(q, corpus, titles)),
             "type": q["type"],
             "cutoff": q["cutoff"],
+            "source_project_id": _project_id(q),
         } for q in selected],
         "source_projects": len(project_ids),
+        "cohort_mode": cohort_mode,
+        "requested_counts": None if cohort_mode == "all-project-questions" else quotas,
+        "actual_counts": {kind: sum(query["type"] == kind for query in selected)
+                           for kind in quotas},
+        "excluded_source_projects": sorted(excluded),
+        "exclusion_manifest_sha256": exclusion_hash,
     }
     write_json(out / "manifest.private.json", manifest)
-    return {"task_count": len(tasks), "core_query": 25, "subfield_query": 25,
+    return {"task_count": len(tasks),
+            "core_query": sum(query["type"] == "core_query" for query in selected),
+            "subfield_query": sum(query["type"] == "subfield_query" for query in selected),
             "source_projects": len(project_ids), "seed": seed,
+            "cohort_mode": cohort_mode, "excluded_source_projects": len(excluded),
             "tasks": str(out / "tasks.jsonl"), "private_manifest": str(out / "manifest.private.json")}
 
 
@@ -302,10 +408,13 @@ class LiveRunner:
         default = {"schema_version": 1, "hard_budget_usd": self.config["total_budget"],
                    "model": self.config["model"], "provider": self.config["provider"],
                    "config_fingerprint": self.config_fingerprint(),
-                   "arms": {}, "inflight": {}, "halted": False}
+                   "arms": {}, "inflight": {}, "halted": False,
+                   "budget_exhausted": False, "stop_reason": None}
         if not self.ledger_path.exists():
             return default
         ledger = json.loads(self.ledger_path.read_text())
+        if ledger.get("budget_exhausted", False):
+            raise LiveError("hard global budget was exhausted; do not resume or repeat this run")
         if ledger.get("inflight") or ledger.get("halted"):
             raise LiveError("budget ledger has an uncertain request; do not resume or repeat it")
         if ledger.get("config_fingerprint") != self.config_fingerprint():
@@ -337,6 +446,8 @@ class LiveRunner:
       with self.lock:
         if self.ledger.get("halted"):
             raise LiveError("budget ledger halted after an uncertain or over-budget request")
+        if self.ledger.get("budget_exhausted", False):
+            raise LiveError(self.ledger.get("stop_reason") or "hard global budget was exhausted")
         state = self.arm_state(arm, task_id)
         encoded = json.dumps({"messages": body["messages"], "tools": body.get("tools", [])},
                              ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -348,7 +459,11 @@ class LiveRunner:
         cost = input_bound * self.config["input_price"] / 1_000_000 + max_tokens * self.config["output_price"] / 1_000_000
         committed = sum(row["actual_cost_usd"] + row["reserved_cost_usd"] for row in self.ledger["arms"].values())
         if committed + cost > self.config["total_budget"] + 1e-12:
-            raise LiveError("request reservation would exceed the hard global budget")
+            reason = "request reservation would exceed the hard global budget"
+            self.ledger["budget_exhausted"] = True
+            self.ledger["stop_reason"] = reason
+            self.save_ledger()
+            raise LiveError(reason)
         rid = "req_" + hashlib.sha256((arm + str(state["requests"]) + str(time.time_ns())).encode()).hexdigest()[:20]
         state["reserved_input_tokens"] += input_bound
         state["reserved_output_tokens"] += max_tokens
@@ -689,6 +804,8 @@ class LiveRunner:
         return values
 
     def execute(self) -> Dict[str, Any]:
+        if self.ledger.get("budget_exhausted", False):
+            raise LiveError("hard global budget was exhausted; do not resume or repeat this run")
         if self.ledger.get("halted") or self.ledger.get("inflight"):
             raise LiveError("ledger has an uncertain request; do not resume")
         lock_file = (self.out / ".live-run.lock").open("a+")
@@ -708,7 +825,7 @@ class LiveRunner:
     def _execute_locked(self) -> Dict[str, Any]:
         run_path = self.out / "live-results.private.jsonl"
         completed = {(r.get("task_id"), r.get("arm")) for r in jsonl(run_path)} if run_path.exists() else set()
-        arms = ("closed_book", "plain_tools", "orx_skill")
+        arms = tuple(self.config.get("selected_arms", LIVE_ARMS))
         pending = [task for task in self.tasks if any((task["id"], arm) not in completed for arm in arms)]
 
         def execute_task(task: Dict[str, Any]) -> None:
@@ -725,18 +842,29 @@ class LiveRunner:
                     append_jsonl(run_path, row)
                     completed.add((task["id"], arm))
                     cost = sum(state["actual_cost_usd"] for state in self.ledger["arms"].values())
-                    print(json.dumps({"completed_rows": len(completed), "planned_rows": len(self.tasks) * 3,
+                    print(json.dumps({"completed_rows": len(completed), "planned_rows": len(self.tasks) * len(arms),
                         "task_id": task["id"], "arm": arm, "failed": bool(row.get("missing")),
                         "model_charge_usd": round(cost, 6)}), file=sys.stderr, flush=True)
 
         # The first pending question checks the provider and tool path before concurrent requests.
         if pending:
             execute_task(pending[0])
-        if not self.ledger.get("halted"):
+        if not self.ledger.get("halted") and not self.ledger.get("budget_exhausted", False):
             with ThreadPoolExecutor(max_workers=self.config.get("workers", 4)) as pool:
                 futures = [pool.submit(execute_task, task) for task in pending[1:]]
                 for future in as_completed(futures):
                     future.result()
+        if self.ledger.get("halted") or self.ledger.get("budget_exhausted", False):
+            stop_reason = self.ledger.get("stop_reason") or (
+                "budget ledger halted after an uncertain or over-budget request")
+            for task in self.tasks:
+                for arm in arms:
+                    pair = (task["id"], arm)
+                    if pair in completed:
+                        continue
+                    row = self.zero_row(task, arm, stop_reason)
+                    append_jsonl(run_path, row)
+                    completed.add(pair)
         all_rows = list(jsonl(run_path))
         report = self.make_report(all_rows)
         write_json(self.out / "live-report.private.json", report)
@@ -753,7 +881,14 @@ class LiveRunner:
 
     def make_report(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         summaries: Dict[str, Any] = {}
-        for arm in ("closed_book", "plain_tools", "orx_skill"):
+        manifest = json.loads((self.out / "manifest.private.json").read_text(encoding="utf-8"))
+        cohort_mode = manifest.get("cohort_mode", "source-disjoint")
+        selection_notes = {
+            "source-disjoint": "one query per distinct source project across the cohort",
+            "paired-projects": "one core and one subfield query per selected source project",
+            "all-project-questions": "all benchmark queries from remaining source projects",
+        }
+        for arm in self.config.get("selected_arms", LIVE_ARMS):
             arm_rows = [r for r in rows if r.get("arm") == arm]
             rows_by_task = {r["task_id"]: r for r in arm_rows}
             by_type: Dict[str, Any] = {}
@@ -784,17 +919,35 @@ class LiveRunner:
                 "reserved_cost_usd": sum(state["reserved_cost_usd"] for state in state_rows),
                 "missing_rows": sum(bool(r.get("missing")) for r in arm_rows),
                 "successful_rows": sum(not r.get("missing", False) for r in arm_rows)}
+        planned_pairs = {(task["id"], arm) for task in self.tasks
+                         for arm in self.config.get("selected_arms", LIVE_ARMS)}
+        result_pairs = {(row.get("task_id"), row.get("arm")) for row in rows}
+        completed_pairs = len(planned_pairs & result_pairs)
+        budget_exhausted = bool(self.ledger.get("budget_exhausted", False))
+        uncertain_stop = bool(self.ledger.get("halted") or self.ledger.get("inflight"))
+        complete = completed_pairs == len(planned_pairs) and not budget_exhausted and not uncertain_stop
+        stop_reason = self.ledger.get("stop_reason")
+        if not stop_reason and self.ledger.get("halted"):
+            stop_reason = "budget ledger halted after an uncertain or over-budget request"
         return {"schema_version": 1, "protocol": "private_live_diagnostic",
             "official_benchmark_result": False, "model": self.config["model"],
             "provider": self.config["provider"], "quantization": self.config["quantization"],
             "reasoning_enabled": self.config["reasoning_enabled"],
             "settings": self.config,
+            "selected_arms": list(self.config.get("selected_arms", LIVE_ARMS)),
             "tool_payload_limits": {"papers": 15, "bytes": 18000, "abstract_characters": 700,
                                     "snippets": 2, "snippet_characters": 300},
             "final_validation": "retain invalid and unjudged slots in both arms; differs from native skill drop step",
             "task_count": len(self.tasks), "completed_rows": len(rows),
+            "planned_rows": len(planned_pairs), "completed_planned_rows": completed_pairs,
+            "complete": complete, "budget_exhausted": budget_exhausted,
+            "stop_reason": stop_reason,
             "source_title_unavailable": sum(not row.get("source_title") for row in self.task_map.values()),
-            "source_project_selection": "one query per source paper; repeated benchmark query generation may still share upstream project history",
+            "cohort_mode": cohort_mode,
+            "source_projects": manifest.get("source_projects", len(self.task_map)),
+            "cohort_actual_counts": manifest.get("actual_counts", {}),
+            "excluded_source_projects": len(manifest.get("excluded_source_projects", [])),
+            "source_project_selection": selection_notes.get(cohort_mode, "unknown cohort selection mode"),
             "data_revision": "ScholarCatalyst pinned revision a5a73467500ada90db4e7641e0697a9591e41a4e",
             "source_policy": "alphaXiv embedding and keyword only; this replays the restricted local orx source profile",
             "arms": summaries, "ledger": str(self.ledger_path)}
@@ -818,13 +971,18 @@ def parse_final(content: str) -> List[Dict[str, Any]]:
 
 
 def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    return {"model": args.model, "provider": args.provider, "quantization": args.quantization,
+    config = {"model": args.model, "provider": args.provider, "quantization": args.quantization,
         "input_price": args.input_price, "output_price": args.output_price,
         "total_budget": args.total_budget, "arm_input_cap": args.arm_input_cap,
         "arm_output_cap": args.arm_output_cap, "max_output": args.max_output,
         "max_tool_rounds": args.max_tool_rounds, "max_discover_calls": args.max_discover_calls,
         "reasoning_enabled": args.reasoning, "reasoning_effort": args.reasoning_effort,
         "workers": args.workers}
+    if args.arms is not None:
+        selected = [arm for arm in LIVE_ARMS if arm in args.arms]
+        if tuple(selected) != LIVE_ARMS:
+            config["selected_arms"] = selected
+    return config
 
 
 def validate_config(config: Dict[str, Any]) -> None:
@@ -832,26 +990,33 @@ def validate_config(config: Dict[str, Any]) -> None:
         value = config[key]
         if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
             raise LiveError("{} must be a finite positive number".format(key))
-    if config["total_budget"] > TOTAL_BUDGET:
-        raise LiveError("hard budget cannot exceed the $5 pilot ceiling")
     for key in ("arm_input_cap", "arm_output_cap", "max_output", "max_tool_rounds", "max_discover_calls"):
         value = config[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise LiveError("{} must be a positive integer".format(key))
     if config["max_output"] > 4096 or config["max_tool_rounds"] > 4 or config["max_discover_calls"] > 6:
         raise LiveError("output and tool limits cannot exceed the reviewed pilot limits")
-    if not isinstance(config.get("workers", 4), int) or not 1 <= config.get("workers", 4) <= 4:
-        raise LiveError("workers must be between one and four")
+    if not isinstance(config.get("workers", 4), int) or not 1 <= config.get("workers", 4) <= 16:
+        raise LiveError("workers must be between one and sixteen")
+    arms = config.get("selected_arms", LIVE_ARMS)
+    if (not isinstance(arms, (list, tuple)) or not arms or len(set(arms)) != len(arms) or
+            any(arm not in LIVE_ARMS for arm in arms)):
+        raise LiveError("selected_arms must contain unique supported arm names")
 
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="command", required=True)
-    prepare = sub.add_parser("prepare", help="select 25 core and 25 subfield questions")
+    prepare = sub.add_parser("prepare", help="select a private ScholarCatalyst cohort")
     prepare.add_argument("--bench-dir", type=Path, required=True)
     prepare.add_argument("--output-dir", type=Path, required=True)
     prepare.add_argument("--seed", type=int, default=530)
-    run = sub.add_parser("run", help="run the three-arm pilot; paid calls require --execute")
+    prepare.add_argument("--core-count", type=int, default=DEFAULT_COHORT_COUNT)
+    prepare.add_argument("--subfield-count", type=int, default=DEFAULT_COHORT_COUNT)
+    prepare.add_argument("--exclude-manifest", type=Path,
+                         help="exclude source projects in an earlier private cohort manifest")
+    prepare.add_argument("--cohort-mode", choices=COHORT_MODES, default="source-disjoint")
+    run = sub.add_parser("run", help="run the live evaluation; paid calls require --execute")
     run.add_argument("--bench-dir", type=Path, required=True)
     run.add_argument("--output-dir", type=Path, required=True)
     run.add_argument("--execute", action="store_true", help="send paid OpenRouter requests")
@@ -869,6 +1034,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--reasoning", action=argparse.BooleanOptionalAction, default=True)
     run.add_argument("--reasoning-effort", choices=("low", "high", "max"), default="low")
     run.add_argument("--workers", type=int, default=4)
+    run.add_argument("--arms", nargs="+", choices=LIVE_ARMS,
+                     help="run selected arms; default: all three arms")
     report = sub.add_parser("report", help="show the private live report")
     report.add_argument("--output-dir", type=Path, required=True)
     return root
@@ -878,7 +1045,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "prepare":
-            print(json.dumps(make_cohort(args.bench_dir, args.output_dir, args.seed), indent=2))
+            print(json.dumps(make_cohort(args.bench_dir, args.output_dir, args.seed,
+                args.core_count, args.subfield_count, args.exclude_manifest, args.cohort_mode), indent=2))
             return 0
         if args.command == "report":
             path = args.output_dir / "live-report.private.json"
@@ -890,8 +1058,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tasks = list(jsonl(args.output_dir / "tasks.jsonl"))
             max_per_arm_task = (args.arm_input_cap * args.input_price +
                                 args.arm_output_cap * args.output_price) / 1_000_000
-            worst_total = len(tasks) * 3 * max_per_arm_task
-            print(json.dumps({"paid_calls": False, "tasks": len(tasks), "arms": 3,
+            selected_arms = tuple(args.arms or LIVE_ARMS)
+            worst_total = len(tasks) * len(selected_arms) * max_per_arm_task
+            print(json.dumps({"paid_calls": False, "tasks": len(tasks), "arms": len(selected_arms),
+                "selected_arms": list(selected_arms),
                 "model": args.model, "provider": args.provider, "quantization": args.quantization,
                 "price_per_million": {"input": args.input_price, "output": args.output_price},
                 "hard_budget_usd": args.total_budget,
@@ -903,6 +1073,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         private_dir(args.output_dir)
         report = LiveRunner(args.bench_dir, args.output_dir, config).execute()
         print(json.dumps(report, indent=2))
+        if not report.get("complete", False):
+            return 2
     except (LiveError, ev.EvaluationError, OSError, ValueError) as error:
         print("error: {}".format(error), file=sys.stderr)
         return 2

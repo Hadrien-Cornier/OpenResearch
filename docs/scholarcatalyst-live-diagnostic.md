@@ -57,6 +57,30 @@ python3 scripts/scholarcatalyst_live_analysis.py \
 
 The analysis verifies data, labels, cohort, source guards, runner code, skill, and settings against the ledger fingerprint. Use the same runner revision for later analysis. The aggregate contains fixed error categories and summary values. It excludes private questions and paper identifiers.
 
+## Expand the comparison
+
+Use a separate evidence directory for the held-out experiment. Exclude every source project from the pilot, including its other questions.
+
+Prepare one core question and one seeded subfield question per held-out project:
+
+```sh
+python3 scripts/scholarcatalyst_live.py prepare \
+  --bench-dir /path/to/benchmark --output-dir /path/to/held-out-evidence \
+  --exclude-manifest /path/to/pilot/manifest.private.json \
+  --cohort-mode paired-projects --core-count 157 --subfield-count 157 \
+  --seed 531
+```
+
+Supply verified source titles for exclusion guards before execution. Keep those titles and their metadata records outside model context.
+
+Use `--arms plain_tools orx_skill` for the two-arm comparison. Keep the model, prompts, source policy, and tool limits fixed. Set a finite global request limit before execution.
+
+The final analysis resamples whole source projects. Each sampled project retains both questions and both arms. It gives the two question types equal weight. The declared primary result is balanced Recall@5 for the skill minus ordinary tools.
+
+Fix the cohort and stop rule before execution. Inspect progress and errors during the run. Analyze scores once after the fixed run. Do not extend the run based on the observed difference.
+
+Use `--public-report` when you export an aggregate for publication. This export preserves retrieval settings, verified hashes, counts, and uncertainty. Complete private settings remain in the evidence directory.
+
 ## Evidence
 
 Keep benchmark data and complete traces outside the source repository. The private evidence includes the cohort manifest, metadata guards, tool cache, requests without credentials, responses, failures, and budget ledger. Publish aggregate results and code versions.

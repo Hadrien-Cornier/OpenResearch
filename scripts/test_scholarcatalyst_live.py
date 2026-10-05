@@ -2,6 +2,8 @@
 
 import json
 import math
+import contextlib
+import io
 import sys
 import tempfile
 import threading
@@ -54,6 +56,26 @@ def make_fixture(root):
          "type": q["type"], "cutoff": q["cutoff"]} for q in queries]}
     live.write_json(out / "manifest.private.json", manifest)
     return bench, out, tasks, corpus_map
+
+
+def make_cohort_fixture(root):
+    bench = root / "cohort-bench"
+    bench.mkdir()
+    corpus, queries = [], []
+    for index in range(8):
+        project = "arxiv_2301.{:05d}".format(index + 1)
+        corpus.append({"id": project, "title": "Source Paper {}".format(index),
+                       "published": "2023-01-01"})
+        queries.append({"id": "core{}".format(index), "type": "core_query",
+            "question": "Core question {}?".format(index), "paper_id": project,
+            "paper_published": "2023-01-01", "paper_title": "Source Paper {}".format(index)})
+        if index < 5:
+            queries.append({"id": "sub{}".format(index), "type": "subfield_query",
+                "question": "Subfield question {}?".format(index), "paper_id": project,
+                "paper_published": "2023-01-01", "paper_title": "Source Paper {}".format(index)})
+    dump_jsonl(bench / "corpus.jsonl", corpus)
+    dump_jsonl(bench / "queries.jsonl", queries)
+    return bench
 
 
 def config(**overrides):
@@ -153,6 +175,37 @@ class ScholarCatalystLiveTest(unittest.TestCase):
         runner.reserve("closed_book", self.tasks[0]["id"], body, 100)
         with self.assertRaises(live.LiveError):
             runner.reserve("plain_tools", self.tasks[0]["id"], body, 100)
+        ledger = json.loads((self.out / "budget-ledger.private.json").read_text())
+        self.assertTrue(ledger["budget_exhausted"])
+        self.assertIn("hard global budget", ledger["stop_reason"])
+
+    def test_global_budget_stop_writes_all_planned_rows_and_blocks_resume(self):
+        calls = []
+        def fake_request(body):
+            calls.append(body)
+            message = {"role": "assistant", "content": json.dumps({"papers": []})}
+            encoded = json.dumps({"messages": body["messages"], "tools": body.get("tools", [])},
+                ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            return {"choices": [{"message": message, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": len(encoded) + 1024,
+                              "completion_tokens": body["max_tokens"], "cost": 0}}
+        cfg = config(total_budget=0.004, max_output=3000,
+                     selected_arms=["closed_book", "plain_tools"])
+        runner = self.runner(request_fn=fake_request, cfg=cfg)
+        report = runner.execute()
+        rows = list(live.jsonl(self.out / "live-results.private.jsonl"))
+        ledger = json.loads((self.out / "budget-ledger.private.json").read_text())
+        self.assertEqual(len(rows), len(self.tasks) * 2)
+        self.assertGreater(len(calls), 0)
+        self.assertLess(len(calls), len(self.tasks) * 2)
+        self.assertTrue(ledger["budget_exhausted"])
+        self.assertFalse(report["complete"])
+        self.assertTrue(report["budget_exhausted"])
+        self.assertEqual(report["planned_rows"], len(self.tasks) * 2)
+        self.assertEqual(report["completed_planned_rows"], len(self.tasks) * 2)
+        self.assertTrue(report["stop_reason"])
+        with self.assertRaisesRegex(live.LiveError, "do not resume or repeat"):
+            runner.execute()
 
     def test_missing_or_nonfinite_usage_halts_and_keeps_reservation(self):
         runner = self.runner()
@@ -209,6 +262,121 @@ class ScholarCatalystLiveTest(unittest.TestCase):
         self.assertTrue(all(body["provider"]["only"] == ["mock"] for body in request_bodies))
         self.assertTrue(all(body["provider"]["allow_fallbacks"] is False for body in request_bodies))
         self.assertTrue(all("max_price" in body["provider"] and "max_price" not in body for body in request_bodies))
+
+    def test_cohort_counts_exclude_prior_source_projects_and_record_actuals(self):
+        bench = make_cohort_fixture(self.root)
+        previous = self.root / "previous"
+        live.make_cohort(bench, previous, seed=531, core_count=1, subfield_count=1,
+                         cohort_mode="paired-projects")
+        out = self.root / "expanded"
+        result = live.make_cohort(bench, out, seed=532, core_count=2, subfield_count=3,
+                                  exclude_manifest=previous / "manifest.private.json")
+        manifest = json.loads((out / "manifest.private.json").read_text())
+        selected_projects = {row["source_project_id"] for row in manifest["queries"]}
+        excluded = set(manifest["excluded_source_projects"])
+        self.assertEqual(result["task_count"], 5)
+        self.assertEqual(result["core_query"], 2)
+        self.assertEqual(result["subfield_query"], 3)
+        self.assertEqual(manifest["actual_counts"], {"core_query": 2, "subfield_query": 3})
+        self.assertEqual(len(selected_projects), 5)
+        self.assertFalse(selected_projects & excluded)
+        self.assertEqual(manifest["seed"], 532)
+
+    def test_cohort_modes_and_insufficient_source_disjoint_capacity(self):
+        bench = make_cohort_fixture(self.root)
+        paired = self.root / "paired"
+        result = live.make_cohort(bench, paired, seed=1, core_count=2, subfield_count=2,
+                                  cohort_mode="paired-projects")
+        manifest = json.loads((paired / "manifest.private.json").read_text())
+        self.assertEqual(result["source_projects"], 2)
+        self.assertEqual(result["task_count"], 4)
+        self.assertEqual(len({row["source_project_id"] for row in manifest["queries"]}), 2)
+        with self.assertRaisesRegex(live.LiveError, "distinct source projects"):
+            live.make_cohort(bench, self.root / "too-large", seed=1, core_count=6,
+                             subfield_count=3)
+
+    def test_all_project_questions_uses_every_remaining_query_and_checks_counts(self):
+        bench = make_cohort_fixture(self.root)
+        out = self.root / "all"
+        result = live.make_cohort(bench, out, seed=1, cohort_mode="all-project-questions")
+        manifest = json.loads((out / "manifest.private.json").read_text())
+        self.assertEqual(result["task_count"], 13)
+        self.assertIsNone(manifest["requested_counts"])
+        with self.assertRaisesRegex(live.LiveError, "does not accept custom counts"):
+            live.make_cohort(bench, self.root / "all-custom", seed=1, core_count=10,
+                             cohort_mode="all-project-questions")
+
+    def test_exclusion_manifest_must_match_benchmark_hashes(self):
+        bench = make_cohort_fixture(self.root)
+        previous = self.root / "previous-valid"
+        live.make_cohort(bench, previous, seed=1, core_count=1, subfield_count=1,
+                         cohort_mode="paired-projects")
+        (bench / "queries.jsonl").write_text((bench / "queries.jsonl").read_text() + "\n")
+        with self.assertRaisesRegex(live.LiveError, "data hashes"):
+            live.make_cohort(bench, self.root / "excluded", seed=1, core_count=1,
+                subfield_count=1, exclude_manifest=previous / "manifest.private.json")
+
+    def test_exclusion_manifest_rejects_unknown_source_projects(self):
+        bench = make_cohort_fixture(self.root)
+        previous = self.root / "previous-project"
+        live.make_cohort(bench, previous, seed=1, core_count=1, subfield_count=1,
+                         cohort_mode="paired-projects")
+        manifest_path = previous / "manifest.private.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["queries"][0]["source_project_id"] = "unknown-project"
+        live.write_json(manifest_path, manifest)
+        with self.assertRaisesRegex(live.LiveError, "unknown or mismatched"):
+            live.make_cohort(bench, self.root / "excluded-project", seed=1, core_count=1,
+                subfield_count=1, exclude_manifest=manifest_path)
+
+    def test_all_project_questions_rejects_an_empty_remaining_cohort(self):
+        bench = make_cohort_fixture(self.root)
+        previous = self.root / "all-previous"
+        live.make_cohort(bench, previous, seed=1, cohort_mode="all-project-questions")
+        with self.assertRaisesRegex(live.LiveError, "no queries after"):
+            live.make_cohort(bench, self.root / "all-excluded", seed=1,
+                cohort_mode="all-project-questions", exclude_manifest=previous / "manifest.private.json")
+
+    def test_custom_arm_selection_and_larger_hard_budget_are_valid(self):
+        args = live.parser().parse_args(["run", "--bench-dir", str(self.bench), "--output-dir",
+            str(self.out), "--arms", "plain_tools", "orx_skill", "--total-budget", "12"])
+        cfg = live.config_from_args(args)
+        live.validate_config(cfg)
+        self.assertEqual(cfg["selected_arms"], ["plain_tools", "orx_skill"])
+        default_args = live.parser().parse_args(["run", "--bench-dir", str(self.bench),
+            "--output-dir", str(self.out)])
+        self.assertNotIn("selected_arms", live.config_from_args(default_args))
+
+    def test_dry_run_reports_requested_hard_budget_and_selected_arms(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = live.main(["run", "--bench-dir", str(self.bench), "--output-dir",
+                str(self.out), "--total-budget", "12", "--arms", "plain_tools", "orx_skill"])
+        report = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(report["hard_budget_usd"], 12.0)
+        self.assertEqual(report["arms"], 2)
+        self.assertEqual(report["selected_arms"], ["plain_tools", "orx_skill"])
+
+    def test_worker_limit_allows_sixteen_and_rejects_higher_values(self):
+        live.validate_config(config(workers=16))
+        with self.assertRaisesRegex(live.LiveError, "one and sixteen"):
+            live.validate_config(config(workers=17))
+
+    def test_selected_arms_bound_execution_and_report(self):
+        def fake_request(body):
+            message = {"role": "assistant", "content": json.dumps({"papers": [
+                {"title": "Positive Relevant Research Paper", "arxiv_id": "2202.00002"}]})}
+            return {"choices": [{"message": message, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0}}
+        selected = ["plain_tools", "orx_skill"]
+        runner = self.runner(request_fn=fake_request, cfg=config(selected_arms=selected))
+        report = runner.execute()
+        rows = list(live.jsonl(self.out / "live-results.private.jsonl"))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(set(report["arms"]), set(selected))
+        self.assertEqual(report["settings"]["selected_arms"], selected)
+        self.assertEqual(report["selected_arms"], selected)
 
     def test_parallel_queries_preserve_metering_cache_and_complete_rows(self):
         guard = threading.Lock()
