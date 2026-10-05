@@ -1382,8 +1382,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validate_config(config)
         if not args.execute:
             tasks = list(jsonl(args.output_dir / "tasks.jsonl"))
-            financial_input_cap = (args.endpoint_context_cap if config.get("uncertain_request_policy") ==
-                CONSUME_UNCERTAIN_POLICY else args.arm_input_cap)
+            consume_policy = config.get("uncertain_request_policy") == CONSUME_UNCERTAIN_POLICY
+            financial_input_cap = args.arm_input_cap + args.endpoint_context_cap if consume_policy else args.arm_input_cap
             max_per_arm_task = (financial_input_cap * args.input_price +
                                 args.arm_output_cap * args.output_price) / 1_000_000
             selected_arms = tuple(args.arms or LIVE_ARMS)
@@ -1394,10 +1394,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "price_per_million": {"input": args.input_price, "output": args.output_price},
                 "hard_budget_usd": args.total_budget,
                 "cap_based_maximum_usd": round(min(args.total_budget, worst_total), 4),
-                "cap_basis": ("per task and arm, using the endpoint context cap and the arm output cap"
-                    if config.get("uncertain_request_policy") == CONSUME_UNCERTAIN_POLICY else
+                "cap_basis": ("per task and arm, using the arm input cap plus one endpoint context cap, "
+                    "and the arm output cap" if consume_policy else
                     "per task and arm, using the arm input cap and arm output cap"),
-                "actual_request_reservations": "computed from each serialized prompt before sending",
+                "actual_request_reservations": ("each financial reservation uses the endpoint context cap plus output limit; "
+                    "input-token checks use serialized prompt bounds" if consume_policy else
+                    "computed from each serialized prompt before sending"),
                 "next_step": "add --execute to send requests"}, indent=2))
             return 0
         private_dir(args.output_dir)

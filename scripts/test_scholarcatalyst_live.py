@@ -508,6 +508,51 @@ class ScholarCatalystLiveTest(unittest.TestCase):
         self.assertEqual(report["arms"], 2)
         self.assertEqual(report["selected_arms"], ["plain_tools", "orx_skill"])
 
+    def test_consume_policy_dry_run_bounds_confirmed_and_unknown_usage(self):
+        task = self.tasks[0]
+        dump_jsonl(self.out / "tasks.jsonl", [task])
+        output = io.StringIO()
+        args = ["run", "--bench-dir", str(self.bench), "--output-dir", str(self.out),
+            "--arms", "closed_book", "--total-budget", "0.5", "--arm-input-cap", "320000",
+            "--arm-output-cap", "24000", "--max-output", "4096",
+            "--uncertain-request-policy", live.CONSUME_UNCERTAIN_POLICY,
+            "--endpoint-context-cap", "1048576"]
+        with contextlib.redirect_stdout(output):
+            status = live.main(args)
+        forecast = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(forecast["tasks"], 1)
+        self.assertEqual(forecast["arms"], 1)
+        self.assertEqual(forecast["cap_based_maximum_usd"], 0.2173)
+        self.assertGreater(forecast["cap_based_maximum_usd"], 0.1693)
+        self.assertEqual(forecast["cap_basis"],
+            "per task and arm, using the arm input cap plus one endpoint context cap, and the arm output cap")
+        self.assertEqual(forecast["actual_request_reservations"],
+            "each financial reservation uses the endpoint context cap plus output limit; input-token checks use serialized prompt bounds")
+
+        manifest_path = self.out / "manifest.private.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["tasks_sha256"] = live.ev.sha256(self.out / "tasks.jsonl")
+        live.write_json(manifest_path, manifest)
+        cfg = config(total_budget=0.5, arm_input_cap=320_000, arm_output_cap=24_000,
+            max_output=4096, selected_arms=["closed_book"],
+            uncertain_request_policy=live.CONSUME_UNCERTAIN_POLICY, endpoint_context_cap=1_048_576)
+        runner = self.runner(cfg=cfg)
+        body = {"messages": [{"role": "user", "content": "x" * 4000}]}
+        for _ in range(4):
+            request_id = runner.reserve("closed_book", task["id"], body, 4096)
+            runner.settle(request_id, {"prompt_tokens": 5000, "completion_tokens": 4096, "cost": 0})
+        request_id = runner.reserve("closed_book", task["id"], body, 4096)
+        runner._consume_uncertain_request(request_id, "http_429", http_status=429)
+        ledger = json.loads((self.out / "budget-ledger.private.json").read_text())
+        state = ledger["arms"]["closed_book|" + task["id"]]
+        actual_and_unknown = state["actual_cost_usd"] + state["unconfirmed_cost_usd"]
+        self.assertAlmostEqual(state["actual_cost_usd"], 4 * (5000 * 0.15 + 4096 * 0.50) / 1_000_000)
+        self.assertAlmostEqual(state["unconfirmed_cost_usd"],
+            (1_048_576 * 0.15 + 4096 * 0.50) / 1_000_000)
+        self.assertAlmostEqual(actual_and_unknown, 0.1705264)
+        self.assertLess(actual_and_unknown, 0.2172864)
+
     def test_worker_limit_allows_sixteen_and_rejects_higher_values(self):
         live.validate_config(config(workers=16))
         with self.assertRaisesRegex(live.LiveError, "one and sixteen"):
