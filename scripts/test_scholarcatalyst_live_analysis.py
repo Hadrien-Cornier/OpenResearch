@@ -218,6 +218,80 @@ class AnalysisTest(unittest.TestCase):
             self.assertNotIn("private unpublished question", json.dumps(report))
             self.assertNotIn(tasks[0]["question"], json.dumps(report))
 
+    def test_bounded_policy_completes_quality_without_inventing_observed_usage(self):
+        for failure in ("transport", "missing_usage"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                bench, out, tasks, _ = make_fixture(Path(directory))
+                attempts = []
+
+                def request(body):
+                    attempts.append(body)
+                    if len(attempts) == 1:
+                        if failure == "transport":
+                            raise TimeoutError("private question")
+                        response = self.mock_request(body)
+                        response["usage"] = {}
+                        return response
+                    if any(message.get("role") == "tool" for message in body["messages"]):
+                        return self.mock_request(body)
+                    return {"provider": "mock", "choices": [{"message": {"role": "assistant",
+                        "content": None, "tool_calls": [{"id": "lookup", "type": "function",
+                        "function": {"name": "orx_discover_embedding",
+                                     "arguments": '{"query":"prior work"}'}}]}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0}}
+
+                records = [{"id": "arxiv_2202.00002", "title": "Positive Relevant Research Paper",
+                            "publicationDate": "2022-02-01"}]
+                settings = config(workers=1, selected_arms=["plain_tools", "orx_skill"],
+                    uncertain_request_policy="consume-reservation-and-fail-arm", endpoint_context_cap=1048576)
+                live.validate_config(settings)
+                live.LiveRunner(bench, out, settings, discover_fn=lambda *args: records,
+                                request_fn=request).execute()
+                ledger = json.loads((out / "budget-ledger.private.json").read_text())
+                self.assertFalse(ledger["halted"])
+                self.assertFalse(ledger["inflight"])
+                self.assertEqual(len(ledger["terminal_unconfirmed"]), 1)
+                self.assertEqual(len(attempts), 7)
+                rows = list(live.jsonl(out / "live-results.private.jsonl"))
+                failed = [row for row in rows if row.get("missing")]
+                self.assertEqual(len(failed), 1)
+                self.assertEqual(failed[0]["arm"], "plain_tools")
+                self.assertEqual(failed[0]["task_id"], tasks[0]["id"])
+                self.assertEqual(failed[0]["metrics"]["recall@5"], 0)
+                self.assertTrue(all(row["metrics"]["recall@5"] == 1 for row in rows if not row.get("missing")))
+                report = analysis.analyze(bench, out)
+                self.assertTrue(report["complete"])
+                self.assertTrue(report["quality_complete"])
+                self.assertFalse(report["metering_complete"])
+                self.assertEqual(report["unconfirmed_request_count"], 1)
+                self.assertEqual(report["provider_response_counts"], {"mock": 6})
+                self.assertEqual(report["metered_cost_usd"], 0)
+                self.assertTrue(report["metered_cost_is_partial"])
+                self.assertIn("Confirmed responses only", report["metered_cost_scope"])
+                self.assertEqual(sum(arm["prompt_tokens"] for arm in report["arms"].values()), 6)
+                self.assertEqual(sum(arm["completion_tokens"] for arm in report["arms"].values()), 6)
+                terminal = next(iter(ledger["terminal_unconfirmed"].values()))
+                self.assertGreater(report["budgeted_cost_usd"], terminal["budgeted_cost_usd"])
+                self.assertEqual(report["arms"]["plain_tools"]["unconfirmed_input_token_bounds"], terminal["financial_input_bound"])
+                self.assertEqual(report["primary_comparison"]["result"]["mean_delta"], 0.5)
+                public = analysis.analyze(bench, out, public_report=True)
+                self.assertTrue(public["quality_complete"])
+                self.assertFalse(public["metering_complete"])
+                self.assertIn("The request is not retried", public["failure_policy"])
+                self.assertNotIn("metered_cost_usd", public)
+                self.assertNotIn(tasks[0]["question"], json.dumps(public))
+                terminal["financial_input_bound"] -= 1
+                live.write_json(out / "budget-ledger.private.json", ledger)
+                with self.assertRaisesRegex(ValueError, "financial input bound"):
+                    analysis.analyze(bench, out)
+                terminal["financial_input_bound"] += 1
+                live.write_json(out / "budget-ledger.private.json", ledger)
+                capture_path = out / "captures.private.jsonl"
+                captures = list(live.jsonl(capture_path))
+                ev.write_jsonl(capture_path, captures[1:])
+                with self.assertRaisesRegex(ValueError, "capture evidence"):
+                    analysis.analyze(bench, out)
+
 
 if __name__ == "__main__":
     unittest.main()

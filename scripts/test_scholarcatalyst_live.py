@@ -4,11 +4,14 @@ import json
 import math
 import contextlib
 import io
+import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -169,6 +172,26 @@ class ScholarCatalystLiveTest(unittest.TestCase):
         with self.assertRaises(live.LiveError):
             live.LiveRunner(self.bench, self.out, config(output_price=0.51))
 
+    def test_known_over_reservation_charge_saves_response_receipt_before_stop(self):
+        def overcharged(_body):
+            return {"choices": [{"message": {"role": "assistant", "content": '{"papers": []}'},
+                    "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 1.0}}
+        runner = self.runner(request_fn=overcharged,
+            cfg=config(selected_arms=["closed_book"]))
+        report = runner.execute()
+        captures = list(live.jsonl(self.out / "captures.private.jsonl"))
+        rows = list(live.jsonl(self.out / "live-results.private.jsonl"))
+        ledger = json.loads((self.out / "budget-ledger.private.json").read_text())
+        self.assertEqual(len(captures), 1)
+        self.assertTrue(captures[0]["usage"]["over_reservation"])
+        self.assertEqual(captures[0]["usage"]["reported_cost_usd"], 1.0)
+        self.assertEqual(len(rows), len(self.tasks))
+        self.assertTrue(ledger["halted"])
+        self.assertIn("metered cost exceeded", ledger["stop_reason"])
+        self.assertFalse(report["complete"])
+        self.assertGreaterEqual(ledger["arms"]["closed_book|" + self.tasks[0]["id"]]["actual_cost_usd"], 1.0)
+
     def test_two_inflight_reservations_obey_global_ceiling(self):
         runner = self.runner(cfg=config(total_budget=0.00025))
         body = {"messages": [{"role": "user", "content": "x"}]}
@@ -216,6 +239,133 @@ class ScholarCatalystLiveTest(unittest.TestCase):
         ledger = json.loads((self.out / "budget-ledger.private.json").read_text())
         self.assertTrue(ledger["halted"])
         self.assertIn(request_id, ledger["inflight"])
+
+    def test_strict_provider_error_log_is_private_allowlisted_and_bounded(self):
+        api_key = "sk-test-private-key-93841"
+        body = json.dumps({"error": {"message": "private text " + api_key,
+            "code": api_key, "provider_name": api_key,
+            "metadata": {"limit_source": api_key}}}).encode()
+        headers = {"Retry-After": api_key, "X-Generation-Id": api_key,
+            "X-Request-Id": api_key, "Authorization": api_key}
+        errors = [
+            urllib.error.HTTPError("https://openrouter.ai/api/v1/chat/completions", 429,
+                "private reason " + api_key, headers, io.BytesIO(body)),
+            TimeoutError("private timeout " + api_key),
+        ]
+        for index, error in enumerate(errors):
+            case = self.root / ("provider-error-" + str(index))
+            case.mkdir()
+            bench, out, _, _ = make_fixture(case)
+            def fail_request(_body, raised=error):
+                raise raised
+            runner = live.LiveRunner(bench, out, config(), request_fn=fail_request)
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": api_key}):
+                report = runner.execute()
+            log_path = out / "provider-errors.private.jsonl"
+            rows = list(live.jsonl(log_path))
+            payload = json.dumps(rows)
+            ledger = json.loads((out / "budget-ledger.private.json").read_text())
+            self.assertEqual(len(rows), 1)
+            self.assertNotIn(api_key, payload)
+            self.assertNotIn("private reason", payload)
+            self.assertNotIn("private text", payload)
+            self.assertNotIn("Authorization", payload)
+            self.assertTrue(ledger["halted"])
+            self.assertEqual(len(ledger["inflight"]), 1)
+            self.assertFalse(report["complete"])
+            if isinstance(error, urllib.error.HTTPError):
+                self.assertEqual(rows[0]["error_class"], "http_429")
+                self.assertEqual(rows[0]["exception_chain"][0]["http_status"], 429)
+
+    def test_consume_policy_continues_after_429_without_retry_and_accounts_upper_bound(self):
+        api_key = "sk-test-private-key-93841"
+        calls = []
+        error_body = json.dumps({"error": {"message": "private text " + api_key,
+            "code": 429, "provider_name": "Z.AI",
+            "metadata": {"limit_source": "openrouter_key_limit"}}}).encode()
+        error_headers = {"Retry-After": "0", "X-Generation-Id": "gen-1727282430-aBcDeFgHiJkLmNoPqRsT",
+            "X-Request-Id": "req-1727282430-aBcDeFgHiJkLmNoPqRsT", "Authorization": api_key}
+        def request(body):
+            calls.append(body)
+            if len(calls) == 2:
+                raise urllib.error.HTTPError("https://openrouter.ai/api/v1/chat/completions",
+                    429, "private reason " + api_key, error_headers, io.BytesIO(error_body))
+            return {"choices": [{"message": {"role": "assistant", "content": '{"papers": []}'},
+                    "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0}}
+        cfg = config(total_budget=0.02, max_output=500, arm_output_cap=500,
+            selected_arms=["closed_book", "plain_tools"],
+            uncertain_request_policy=live.CONSUME_UNCERTAIN_POLICY, endpoint_context_cap=10_000)
+        live.validate_config(cfg)
+        runner = self.runner(request_fn=request, cfg=cfg)
+        delays = []
+        runner.wait_fn = delays.append
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": api_key}):
+            report = runner.execute()
+        rows = list(live.jsonl(self.out / "live-results.private.jsonl"))
+        captures = list(live.jsonl(self.out / "captures.private.jsonl"))
+        error_rows = list(live.jsonl(self.out / "provider-errors.private.jsonl"))
+        ledger = json.loads((self.out / "budget-ledger.private.json").read_text())
+        terminal = list(ledger["terminal_unconfirmed"].values())
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len({row["request_id"] for row in captures + error_rows}), 4)
+        self.assertEqual(len(captures), 3)
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["error_class"], "http_429")
+        self.assertEqual(terminal[0]["financial_input_bound"], 10_000)
+        self.assertEqual(terminal[0]["budgeted_cost_usd"],
+            (10_000 * cfg["input_price"] + terminal[0]["max_output"] * cfg["output_price"]) / 1_000_000)
+        self.assertEqual(ledger["arms"]["plain_tools|" + self.tasks[0]["id"]]["unconfirmed_output_tokens"], 500)
+        with self.assertRaisesRegex(live.LiveError, "output-token cap"):
+            runner.reserve("plain_tools", self.tasks[0]["id"],
+                {"messages": [{"role": "user", "content": "next request"}]}, 1)
+        self.assertTrue(report["complete"])
+        self.assertFalse(report["metering_complete"])
+        self.assertEqual(report["unconfirmed_request_count"], 1)
+        committed = sum(state["actual_cost_usd"] + state["reserved_cost_usd"] +
+                        state["unconfirmed_cost_usd"] for state in ledger["arms"].values())
+        self.assertLessEqual(committed, cfg["total_budget"])
+        observed_charge = sum(state["actual_cost_usd"] for state in ledger["arms"].values())
+        self.assertAlmostEqual(observed_charge,
+            3 * (cfg["input_price"] + cfg["output_price"]) / 1_000_000)
+        safe_error = json.dumps(error_rows)
+        self.assertNotIn(api_key, safe_error)
+        self.assertNotIn("private reason", safe_error)
+        self.assertEqual(error_rows[0]["exception_chain"][0]["response_headers"]["Retry-After"], "0")
+        self.assertEqual(error_rows[0]["exception_chain"][0]["response_headers"]["X-Generation-Id"],
+                         "gen-1727282430-aBcDeFgHiJkLmNoPqRsT")
+        self.assertEqual(error_rows[0]["exception_chain"][0]["provider_error"],
+                         {"code": 429, "provider_name": "Z.AI", "limit_source": "openrouter_key_limit"})
+        self.assertEqual(delays, [])
+
+    def test_consume_policy_stops_on_auth_failure_and_excessive_cooldown(self):
+        cases = ((401, "0", "provider response requires a global stop"),
+                 (429, "301", "provider cooldown exceeds the permitted 300 seconds"))
+        for status, retry_after, expected_reason in cases:
+            case = self.root / ("global-stop-" + str(status) + "-" + retry_after)
+            case.mkdir()
+            bench, out, _, _ = make_fixture(case)
+            calls = []
+            def fail_request(body):
+                calls.append(body)
+                raise urllib.error.HTTPError("https://openrouter.ai/api/v1/chat/completions",
+                    status, "private response text", {"Retry-After": retry_after}, io.BytesIO(b"{}"))
+            cfg = config(selected_arms=["closed_book", "plain_tools"], max_output=100,
+                uncertain_request_policy=live.CONSUME_UNCERTAIN_POLICY, endpoint_context_cap=10_000)
+            runner = live.LiveRunner(bench, out, cfg, request_fn=fail_request)
+            delays = []
+            runner.wait_fn = delays.append
+            report = runner.execute()
+            rows = list(live.jsonl(out / "live-results.private.jsonl"))
+            ledger = json.loads((out / "budget-ledger.private.json").read_text())
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(rows), len(self.tasks) * 2)
+            self.assertTrue(ledger["halted"])
+            self.assertEqual(ledger["stop_reason"], expected_reason)
+            self.assertEqual(len(ledger["terminal_unconfirmed"]), 1)
+            self.assertFalse(report["complete"])
+            self.assertEqual(delays, [])
 
     def test_orx_skill_fallback_preserves_unjudged_observation_slot(self):
         calls = {"request": 0}

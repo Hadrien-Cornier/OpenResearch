@@ -22,7 +22,7 @@ Consult current Artificial Analysis results when you select an open model. Verif
 
 The October 4 pilot selects `z-ai/glm-5.3-flash` through the first-party Z.AI FP8 endpoint. It uses temperature zero and reasoning effort `low`. Provider fallback is disabled.
 
-The runner enforces a configured global request limit across concurrent calls. Missing or uncertain metering stops the run and preserves the reservation. The runner does not repeat an uncertain request.
+The runner enforces a configured global request limit across concurrent calls. The default policy stops on uncertain usage and preserves the reservation. The runner does not repeat an uncertain request.
 
 Each task-arm has a cumulative cap of 80,000 input tokens and 24,000 output tokens. Each request permits 4,096 output tokens, including reasoning tokens. Input reservations use a conservative byte bound. The runner can stop a task before its actual token cap if that bound is too large.
 
@@ -74,6 +74,10 @@ python3 scripts/scholarcatalyst_live.py prepare \
 Supply verified source titles for exclusion guards before execution. Keep those titles and their metadata records outside model context.
 
 Use `--arms plain_tools orx_skill` for the two-arm comparison. Keep the model, prompts, source policy, and tool limits fixed. Set a finite global request limit before execution.
+
+For a predetermined failure policy, use `--uncertain-request-policy consume-reservation-and-fail-arm`. Supply the verified endpoint limit with `--endpoint-context-cap`. This policy consumes the full reservation and gives the failed arm zero credit. It continues other planned questions without a retry. Authentication and configuration errors still stop the run.
+
+The aggregate separates `quality_complete` from `metering_complete`. The first field confirms a result for every planned question and arm. The second field confirms usage records for every model request. Upper bounds for unconfirmed requests remain separate from observed usage.
 
 The final analysis resamples whole source projects. Each sampled project retains both questions and both arms. It gives the two question types equal weight. The declared primary result is balanced Recall@5 for the skill minus ordinary tools.
 

@@ -24,7 +24,8 @@ def error_category(message):
     text = message.lower()
     for fragment, category in (("input-token cap", "input_reservation_limit"),
         ("output-token cap", "output_limit"), ("hard global budget", "global_budget_limit"),
-        ("metering", "uncertain_metering"), ("halted", "uncertain_metering"),
+        ("metering", "uncertain_metering"), ("metered", "uncertain_metering"),
+        ("unconfirmed", "uncertain_metering"), ("halted", "uncertain_metering"),
         ("reservation stays", "uncertain_metering"), ("discover", "search_error"),
         ("json", "response_schema"), ("tool arguments", "response_schema"),
         ("tool_calls", "response_schema"), ("assistant message", "response_schema")):
@@ -192,7 +193,72 @@ def analyze(bench, evidence, public_report=False):
     capture_path = evidence / "captures.private.jsonl"
     request_count = sum(state["requests"] for state in ledger["arms"].values())
     inflight_ids = set(ledger["inflight"])
-    all_requests_uncertain = ledger["halted"] and request_count == len(inflight_ids)
+    terminal = ledger.get("terminal_unconfirmed", {})
+    if not isinstance(terminal, dict):
+        raise ValueError("terminal unconfirmed requests must be a map")
+    terminal_ids = set(terminal)
+    if terminal_ids & inflight_ids:
+        raise ValueError("unconfirmed request remains both terminal and in flight")
+    policy = raw_report["settings"].get("uncertain_request_policy", "strict")
+    if terminal_ids and policy != "consume-reservation-and-fail-arm":
+        raise ValueError("terminal unconfirmed requests require the declared failure policy")
+    request_path = evidence / "requests.private.jsonl"
+    request_map = {}
+    if request_path.exists():
+        for request in live.jsonl(request_path):
+            request_id = request["request_id"]
+            if request_id in request_map:
+                raise ValueError("request evidence contains duplicate request IDs")
+            body = request["request"]
+            input_bound = len(json.dumps({"messages": body["messages"], "tools": body.get("tools", [])},
+                                        ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1024
+            request_map[request_id] = {"task_id": request["task_id"], "arm": request["arm"],
+                                       "input_bound": input_bound, "max_output": body["max_tokens"],
+                                       "sequence": len(request_map)}
+    terminal_keys = set()
+    for request_id, record in terminal.items():
+        key = (record["task_id"], record["arm"])
+        if key in terminal_keys:
+            raise ValueError("terminal unconfirmed arm contains a repeated failed request")
+        terminal_keys.add(key)
+        row = keyed.get(key)
+        request = request_map.get(request_id)
+        if (key[0] not in mapping or key[1] not in arms or not request
+                or (request["task_id"], request["arm"]) != key):
+            raise ValueError("terminal unconfirmed request does not match its request evidence")
+        if any((other["task_id"], other["arm"]) == key and other["sequence"] > request["sequence"]
+               for other in request_map.values()):
+            raise ValueError("failed unconfirmed arm contains a later request")
+        if not row or not (row.get("missing") or row.get("failed")) or not row.get("error"):
+            raise ValueError("terminal unconfirmed request requires a failed result row")
+        if error_category(row["error"]) != "uncertain_metering":
+            raise ValueError("terminal unconfirmed request does not match its failed result error")
+        if record["arm"] + "|" + record["task_id"] not in ledger["arms"]:
+            raise ValueError("terminal unconfirmed request has no matching arm counters")
+        if record.get("id") != request_id or not record.get("error_class"):
+            raise ValueError("terminal unconfirmed request has no matching ID or error class")
+        if record["input_bound"] != request["input_bound"] or record["max_output"] != request["max_output"]:
+            raise ValueError("terminal request bounds differ from its request evidence")
+        context_cap = raw_report["settings"].get("endpoint_context_cap")
+        if isinstance(context_cap, bool) or not isinstance(context_cap, int) or context_cap < 1:
+            raise ValueError("terminal unconfirmed requests require the explicit endpoint context cap")
+        if record.get("financial_input_bound") != context_cap:
+            raise ValueError("terminal financial input bound differs from the endpoint context cap")
+        reserved = (record["financial_input_bound"] * raw_report["settings"]["input_price"]
+                    + record["max_output"] * raw_report["settings"]["output_price"]) / 1_000_000
+        if not math.isclose(record["budgeted_cost_usd"], reserved, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError("terminal unconfirmed request does not consume its full reservation")
+    for state_key, state in ledger["arms"].items():
+        records = [record for record in terminal.values()
+                   if record["arm"] + "|" + record["task_id"] == state_key]
+        if (state.get("unconfirmed_input_tokens", 0) != sum(record["financial_input_bound"] for record in records)
+                or state.get("unconfirmed_output_tokens", 0) != sum(record["max_output"] for record in records)
+                or not math.isclose(state.get("unconfirmed_cost_usd", 0),
+                                    sum(record["budgeted_cost_usd"] for record in records),
+                                    rel_tol=1e-12, abs_tol=1e-12)):
+            raise ValueError("terminal reservations differ from the arm counters")
+    all_requests_uncertain = (request_count == len(inflight_ids) + len(terminal_ids)
+                             and (not inflight_ids or ledger["halted"]))
     if not capture_path.exists() and request_count and not all_requests_uncertain:
         raise ValueError("model requests have no capture evidence")
     captures = live.jsonl(capture_path) if capture_path.exists() else []
@@ -202,8 +268,11 @@ def analyze(bench, evidence, public_report=False):
         if key[0] not in mapping or key[1] not in arms:
             raise ValueError("capture is outside the planned cohort")
         request_id = capture["request_id"]
-        if request_id in captured_ids or request_id in inflight_ids:
+        if request_id in captured_ids or request_id in inflight_ids or request_id in terminal_ids:
             raise ValueError("capture request IDs are duplicate or still uncertain")
+        request = request_map.get(request_id)
+        if not request or (request["task_id"], request["arm"]) != key:
+            raise ValueError("capture request does not match its request evidence")
         captured_ids.add(request_id)
         provider_counts[capture["response"].get("provider", "unknown")] += 1
         candidates = exposed.setdefault(key, set())
@@ -218,10 +287,13 @@ def analyze(bench, evidence, public_report=False):
                     choices = by_title.get(ev.normalize_title(candidate.get("title", "")), [])
                 if len(choices) == 1:
                     candidates.add(choices[0])
-    if len(captured_ids) + len(inflight_ids) != request_count:
+    if len(captured_ids) + len(inflight_ids) + len(terminal_ids) != request_count:
         raise ValueError("capture evidence does not account for every model request")
+    if set(request_map) - captured_ids - inflight_ids - terminal_ids:
+        raise ValueError("request evidence contains an unaccounted request ID")
     if inflight_ids and not ledger["halted"]:
         raise ValueError("uncertain requests have no durable stop state")
+    unconfirmed_request_count = len(inflight_ids) + len(terminal_ids)
 
     def value(task_id, arm, metric):
         row = keyed.get((task_id, arm))
@@ -236,6 +308,8 @@ def analyze(bench, evidence, public_report=False):
     for arm in arms:
         arm_rows = [row for row in rows if row["arm"] == arm]
         states = [state for key, state in ledger["arms"].items() if key.startswith(arm + "|")]
+        arm_unconfirmed = sum(record["arm"] == arm for record in terminal.values()) + sum(
+            record["arm"] == arm for record in ledger["inflight"].values())
         groups = {}
         for kind in ("core_query", "subfield_query"):
             ids = [task["id"] for task in tasks if task["type"] == kind and labels[task["id"]]]
@@ -256,9 +330,15 @@ def analyze(bench, evidence, public_report=False):
             "errors": dict(Counter(error_category(row.get("error", "missing result"))
                                    for row in arm_rows if row.get("missing") or row.get("failed"))),
             "metered_cost_usd": sum(state.get("metered_cost_usd", 0) for state in states),
-            "budgeted_cost_usd": sum(state["actual_cost_usd"] for state in states),
+            "metered_cost_is_partial": bool(arm_unconfirmed),
+            "metering_complete": not arm_unconfirmed,
+            "unconfirmed_request_count": arm_unconfirmed,
+            "budgeted_cost_usd": sum(state["actual_cost_usd"] + state.get("unconfirmed_cost_usd", 0)
+                                     for state in states),
             "prompt_tokens": sum(state["prompt_tokens"] for state in states),
             "completion_tokens": sum(state["completion_tokens"] for state in states),
+            "unconfirmed_input_token_bounds": sum(state.get("unconfirmed_input_tokens", 0) for state in states),
+            "unconfirmed_output_token_bounds": sum(state.get("unconfirmed_output_tokens", 0) for state in states),
             "model_requests": sum(state["requests"] for state in states),
             "mean_seconds_per_planned_row": sum(row.get("elapsed_seconds", 0) for row in arm_rows) / len(tasks),
             "mean_ranked_slots": sum(len(row.get("ranking_slots", [])) for row in arm_rows) / len(tasks),
@@ -301,7 +381,12 @@ def analyze(bench, evidence, public_report=False):
                      and not ledger["halted"] and not ledger.get("budget_exhausted", False)
                      and raw_report.get("complete", True)),
         "metered_cost_usd": sum(state.get("metered_cost_usd", 0) for state in ledger["arms"].values()),
-        "budgeted_cost_usd": sum(state["actual_cost_usd"] for state in ledger["arms"].values()),
+        "metered_cost_is_partial": bool(unconfirmed_request_count),
+        "metered_cost_scope": "Confirmed responses only; the total excludes unconfirmed requests.",
+        "metering_complete": not unconfirmed_request_count,
+        "unconfirmed_request_count": unconfirmed_request_count,
+        "budgeted_cost_usd": sum(state["actual_cost_usd"] + state.get("unconfirmed_cost_usd", 0)
+                                 for state in ledger["arms"].values()),
         "reserved_cost_usd": sum(state["reserved_cost_usd"] for state in ledger["arms"].values()),
         "provider_response_counts": dict(provider_counts), "arms": summaries, "paired_comparisons": comparisons,
         "label_audit": label_audit, "gold_denominator": "retain official positives, including cutoff conflicts",
@@ -310,6 +395,11 @@ def analyze(bench, evidence, public_report=False):
             "role": "single final primary comparison",
             "result": comparisons.get("orx_skill_minus_plain_tools", {}).get("balanced_pilot", {}).get("recall@5")},
         "secondary_comparisons": "all other contrasts, metrics, and question-type estimates",
+        "failure_policy": (
+            "An unconfirmed request ends that arm with a zero score. "
+            "If no global stop occurs, other planned arms continue. The request is not retried."
+            if policy == "consume-reservation-and-fail-arm" else
+            "An unconfirmed request stops the run. Failed and remaining planned arms score zero."),
         "uncertainty_method": ("paired percentile bootstrap over source projects; all questions resample jointly; "
                                "equal weight for each question type; resamples with an empty type are rejected"
                                if grouped_sources else
@@ -321,6 +411,9 @@ def analyze(bench, evidence, public_report=False):
                    "The workflow uses alphaXiv discovery only and common rank validation.",
                    "Model knowledge can include the original source projects.",
                    "A pilot gives preliminary evidence."]}
+    report["quality_complete"] = report["complete"]
+    if unconfirmed_request_count:
+        report["limits"].append("Quality estimates include zero scores for unconfirmed requests.")
     if not report["complete"]:
         report["limits"].append(
             "The experiment is incomplete; intervals do not support a quality conclusion.")

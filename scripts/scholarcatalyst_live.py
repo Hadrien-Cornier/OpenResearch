@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timezone
+import email.utils
 import hashlib
 import json
 import math
 import os
 import random
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -35,6 +38,12 @@ TOTAL_BUDGET = 5.00
 DEFAULT_COHORT_COUNT = 25
 COHORT_MODES = ("source-disjoint", "paired-projects", "all-project-questions")
 LIVE_ARMS = ("closed_book", "plain_tools", "orx_skill")
+STRICT_UNCERTAIN_POLICY = "strict"
+CONSUME_UNCERTAIN_POLICY = "consume-reservation-and-fail-arm"
+UNCERTAIN_POLICIES = (STRICT_UNCERTAIN_POLICY, CONSUME_UNCERTAIN_POLICY)
+ERROR_CLASSES = ("http_429", "http_auth_config_failure", "http_error",
+                 "transport_error", "missing_usage", "usage_exceeded_reservation",
+                 "provider_error")
 ARM_INPUT_CAP = 80_000
 ARM_OUTPUT_CAP = 24_000
 MAX_OUTPUT = 4096
@@ -380,11 +389,12 @@ TOOL_DEFS = [{"type": "function", "function": {
 
 class LiveRunner:
     def __init__(self, bench: Path, out: Path, config: Dict[str, Any],
-                 discover_fn=None, request_fn=None):
+                 discover_fn=None, request_fn=None, wait_fn=None):
         self.bench, self.out, self.config = bench, out, config
         self.lock = threading.RLock()
         self.discover_fn = discover_fn or self.discover
         self.request_fn = request_fn or self.request
+        self.wait_fn = wait_fn or time.sleep
         self.corpus, self.by_arxiv, self.by_title = corpus_indexes(bench)
         self.tasks = list(jsonl(out / "tasks.jsonl"))
         self.task_map = read_map(out)
@@ -408,8 +418,8 @@ class LiveRunner:
         default = {"schema_version": 1, "hard_budget_usd": self.config["total_budget"],
                    "model": self.config["model"], "provider": self.config["provider"],
                    "config_fingerprint": self.config_fingerprint(),
-                   "arms": {}, "inflight": {}, "halted": False,
-                   "budget_exhausted": False, "stop_reason": None}
+                   "arms": {}, "inflight": {}, "terminal_unconfirmed": {}, "halted": False,
+                   "budget_exhausted": False, "stop_reason": None, "cooldown_until_unix": 0.0}
         if not self.ledger_path.exists():
             return default
         ledger = json.loads(self.ledger_path.read_text())
@@ -436,11 +446,223 @@ class LiveRunner:
     def save_ledger(self) -> None:
         write_json(self.ledger_path, self.ledger)
 
+    @staticmethod
+    def _safe_provider_value(value: Any, field: str, active_key: str) -> Optional[Any]:
+        if field == "code":
+            return value if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599 else None
+        if not isinstance(value, str) or (active_key and active_key in value):
+            return None
+        if field == "provider_name":
+            return value if value in ("z-ai", "Z.AI") else None
+        if field == "limit_source":
+            allowed = {"openrouter_in_flight_budget", "openrouter_key_limit", "openrouter_credits"}
+            return value if value in allowed else None
+        return None
+
+    @staticmethod
+    def _retry_after_seconds(value: Any, now: Optional[float] = None) -> Optional[int]:
+        if not isinstance(value, str) or len(value) > 160:
+            return None
+        clean = value.strip()
+        if re.fullmatch(r"\d+", clean):
+            return int(clean)
+        try:
+            parsed = email.utils.parsedate_to_datetime(clean)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, math.ceil(parsed.timestamp() - (time.time() if now is None else now)))
+
+    @staticmethod
+    def _error_class(error: BaseException) -> str:
+        current: Optional[BaseException] = error
+        seen: Set[int] = set()
+        for _ in range(6):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            if isinstance(current, urllib.error.HTTPError):
+                if current.code == 429:
+                    return "http_429"
+                if current.code in (400, 401, 402, 403, 404, 422):
+                    return "http_auth_config_failure"
+                return "http_error"
+            if isinstance(current, (TimeoutError, socket.timeout)):
+                return "transport_error"
+            if isinstance(current, OSError):
+                return "transport_error"
+            if isinstance(current, urllib.error.URLError) and isinstance(current.reason, BaseException):
+                current = current.reason
+                continue
+            current = current.__cause__ if current.__cause__ is not None else current.__context__
+        return "provider_error"
+
+    @staticmethod
+    def _http_status_and_retry(error: BaseException) -> Tuple[Optional[int], Optional[int]]:
+        current: Optional[BaseException] = error
+        seen: Set[int] = set()
+        for _ in range(6):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            if isinstance(current, urllib.error.HTTPError):
+                status = current.code if isinstance(current.code, int) and 100 <= current.code <= 599 else None
+                retry = None
+                if current.headers is not None:
+                    retry = LiveRunner._retry_after_seconds(current.headers.get("Retry-After"))
+                return status, retry
+            if isinstance(current, urllib.error.URLError) and isinstance(current.reason, BaseException):
+                current = current.reason
+            else:
+                current = current.__cause__ if current.__cause__ is not None else current.__context__
+        return None, None
+
+    @classmethod
+    def _provider_error_chain(cls, error: BaseException) -> List[Dict[str, Any]]:
+        chain: List[Dict[str, Any]] = []
+        seen: Set[int] = set()
+        current: Optional[BaseException] = error
+        active_key = os.environ.get("OPENROUTER_API_KEY", "")
+        for _ in range(6):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            item: Dict[str, Any] = {"error_type": cls._error_class(current)}
+            if isinstance(current, urllib.error.HTTPError):
+                status = getattr(current, "code", None) or getattr(current, "status", None)
+                if (isinstance(status, int) and 100 <= status <= 599 and
+                        not (active_key and active_key == str(status))):
+                    item["http_status"] = status
+                headers = getattr(current, "headers", None)
+                safe_headers: Dict[str, Any] = {}
+                if headers is not None:
+                    retry_seconds = cls._retry_after_seconds(headers.get("Retry-After"))
+                    if (retry_seconds is not None and retry_seconds <= 300 and
+                            not (active_key and active_key in str(retry_seconds))):
+                        safe_headers["Retry-After"] = str(retry_seconds)
+                    generation_id = headers.get("X-Generation-Id")
+                    if (isinstance(generation_id, str) and not (active_key and active_key in generation_id)
+                            and (re.fullmatch(r"gen-[A-Za-z0-9]{6,64}", generation_id) or
+                                 re.fullmatch(r"gen-\d{10,13}-[A-Za-z0-9]{6,32}", generation_id))):
+                        safe_headers["X-Generation-Id"] = generation_id
+                    request_id = headers.get("X-Request-Id")
+                    valid_request_id = (isinstance(request_id, str) and not
+                        (active_key and active_key in request_id) and (
+                            re.fullmatch(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", request_id) or
+                            re.fullmatch(r"req-\d{10}-[A-Za-z0-9]{8,32}", request_id)))
+                    if valid_request_id:
+                        safe_headers["X-Request-Id"] = request_id
+                if safe_headers:
+                    item["response_headers"] = safe_headers
+                try:
+                    payload = json.loads(current.read(65536).decode("utf-8", errors="replace"))
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    error_payload = payload.get("error")
+                    sources = [payload]
+                    if isinstance(error_payload, dict):
+                        sources.append(error_payload)
+                        metadata = error_payload.get("metadata")
+                        if isinstance(metadata, dict):
+                            sources.append(metadata)
+                    fields: Dict[str, Any] = {}
+                    for field in ("code", "provider_name", "limit_source"):
+                        for source in sources:
+                            value = cls._safe_provider_value(source.get(field), field, active_key)
+                            if value is not None:
+                                fields[field] = value
+                                break
+                    if fields:
+                        item["provider_error"] = fields
+            chain.append(item)
+            if isinstance(current, urllib.error.URLError) and isinstance(current.reason, BaseException):
+                current = current.reason
+            else:
+                current = current.__cause__ if current.__cause__ is not None else current.__context__
+        return chain
+
+    def _record_provider_error(self, error: BaseException, request_id: str,
+                               arm: str, task_id: str,
+                               error_class: Optional[str] = None) -> None:
+        safe_class = error_class if error_class in ERROR_CLASSES else self._error_class(error)
+        row = {"request_id": request_id, "arm": arm, "task_id": task_id,
+               "error_class": safe_class,
+               "timestamp_unix": time.time(), "exception_chain": self._provider_error_chain(error)}
+        with self.lock:
+            append_jsonl(self.out / "provider-errors.private.jsonl", row)
+
     def arm_state(self, arm: str, task_id: Optional[str] = None) -> Dict[str, Any]:
         state_key = arm + ("|" + task_id if task_id else "")
         return self.ledger["arms"].setdefault(state_key, {"prompt_tokens": 0, "completion_tokens": 0,
             "reserved_input_tokens": 0, "reserved_output_tokens": 0, "actual_cost_usd": 0.0,
-            "requests": 0, "reserved_cost_usd": 0.0})
+            "unconfirmed_input_tokens": 0, "unconfirmed_output_tokens": 0,
+            "observed_unconfirmed_input_tokens": 0, "observed_unconfirmed_output_tokens": 0,
+            "unconfirmed_cost_usd": 0.0, "requests": 0, "reserved_cost_usd": 0.0})
+
+    def _uncertain_policy_enabled(self) -> bool:
+        return self.config.get("uncertain_request_policy", STRICT_UNCERTAIN_POLICY) == CONSUME_UNCERTAIN_POLICY
+
+    def _consume_uncertain_request(self, rid: str, error_class: str,
+                                   halt: bool = False, retry_after_seconds: Optional[int] = None,
+                                   http_status: Optional[int] = None,
+                                   observed_prompt_tokens: Optional[int] = None,
+                                   observed_completion_tokens: Optional[int] = None,
+                                   reported_cost_usd: Optional[float] = None) -> None:
+        if error_class not in ERROR_CLASSES:
+            raise LiveError("uncertain request has an unknown error class")
+        with self.lock:
+            flight = self.ledger.get("inflight", {}).get(rid)
+            if not flight:
+                raise LiveError("uncertain request does not match the ledger")
+            state = self.arm_state(flight["arm"], flight["task_id"])
+            state["reserved_input_tokens"] -= flight["input_bound"]
+            state["reserved_output_tokens"] -= flight["max_output"]
+            state["reserved_cost_usd"] -= flight["reserved_cost_usd"]
+            state["unconfirmed_input_tokens"] += flight["financial_input_bound"]
+            state["unconfirmed_output_tokens"] += flight["max_output"]
+            state["unconfirmed_cost_usd"] += flight["reserved_cost_usd"]
+            terminal = {"id": rid, "arm": flight["arm"], "task_id": flight["task_id"],
+                "input_bound": flight["input_bound"],
+                "financial_input_bound": flight["financial_input_bound"],
+                "max_output": flight["max_output"],
+                "budgeted_cost_usd": flight["reserved_cost_usd"],
+                "error_class": error_class, "timestamp_unix": time.time()}
+            if isinstance(http_status, int) and 100 <= http_status <= 599:
+                terminal["http_status"] = http_status
+            if isinstance(observed_prompt_tokens, int) and observed_prompt_tokens >= 0:
+                terminal["observed_prompt_tokens"] = observed_prompt_tokens
+                state["observed_unconfirmed_input_tokens"] += observed_prompt_tokens
+            if isinstance(observed_completion_tokens, int) and observed_completion_tokens >= 0:
+                terminal["observed_completion_tokens"] = observed_completion_tokens
+                state["observed_unconfirmed_output_tokens"] += observed_completion_tokens
+            if (isinstance(reported_cost_usd, (int, float)) and not isinstance(reported_cost_usd, bool)
+                    and math.isfinite(reported_cost_usd) and reported_cost_usd >= 0):
+                terminal["reported_cost_usd"] = reported_cost_usd
+            self.ledger.setdefault("terminal_unconfirmed", {})[rid] = terminal
+            del self.ledger["inflight"][rid]
+            self.ledger["metering_complete"] = False
+            if retry_after_seconds is not None and retry_after_seconds <= 300:
+                until = time.time() + retry_after_seconds
+                self.ledger["cooldown_until_unix"] = max(
+                    float(self.ledger.get("cooldown_until_unix", 0.0)), until)
+            if halt:
+                self.ledger["halted"] = True
+                self.ledger["stop_reason"] = ("provider cooldown exceeds the permitted 300 seconds"
+                    if retry_after_seconds is not None and retry_after_seconds > 300 else
+                    "provider response requires a global stop")
+            self.save_ledger()
+
+    def _wait_for_cooldown(self) -> None:
+        while True:
+            with self.lock:
+                delay = float(self.ledger.get("cooldown_until_unix", 0.0)) - time.time()
+            if delay <= 0:
+                return
+            self.wait_fn(delay)
 
     def reserve(self, arm: str, task_id: str, body: Dict[str, Any], max_tokens: int) -> str:
       with self.lock:
@@ -452,12 +674,20 @@ class LiveRunner:
         encoded = json.dumps({"messages": body["messages"], "tools": body.get("tools", [])},
                              ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         input_bound = len(encoded) + 1024
-        if state["prompt_tokens"] + state["reserved_input_tokens"] + input_bound > self.config["arm_input_cap"]:
+        if state["prompt_tokens"] + state["reserved_input_tokens"] + \
+                state.get("unconfirmed_input_tokens", 0) + input_bound > self.config["arm_input_cap"]:
             raise LiveError("{} reached its input-token cap before the next request".format(arm))
-        if state["completion_tokens"] + state["reserved_output_tokens"] + max_tokens > self.config["arm_output_cap"]:
+        if state["completion_tokens"] + state["reserved_output_tokens"] + \
+                state.get("unconfirmed_output_tokens", 0) + max_tokens > self.config["arm_output_cap"]:
             raise LiveError("{} reached its output-token cap before the next request".format(arm))
-        cost = input_bound * self.config["input_price"] / 1_000_000 + max_tokens * self.config["output_price"] / 1_000_000
-        committed = sum(row["actual_cost_usd"] + row["reserved_cost_usd"] for row in self.ledger["arms"].values())
+        financial_input_bound = (self.config["endpoint_context_cap"] if self._uncertain_policy_enabled()
+                                 else input_bound)
+        if input_bound > self.config["arm_input_cap"]:
+            raise LiveError("{} request exceeds its arm input-token cap".format(arm))
+        cost = (financial_input_bound * self.config["input_price"] +
+                max_tokens * self.config["output_price"]) / 1_000_000
+        committed = sum(row["actual_cost_usd"] + row["reserved_cost_usd"] +
+                        row.get("unconfirmed_cost_usd", 0.0) for row in self.ledger["arms"].values())
         if committed + cost > self.config["total_budget"] + 1e-12:
             reason = "request reservation would exceed the hard global budget"
             self.ledger["budget_exhausted"] = True
@@ -471,6 +701,7 @@ class LiveRunner:
         state["requests"] += 1
         self.ledger["inflight"][rid] = {"id": rid, "arm": arm, "task_id": task_id,
                                          "input_bound": input_bound,
+                                         "financial_input_bound": financial_input_bound,
                                          "max_output": max_tokens, "reserved_cost_usd": cost}
         self.save_ledger()
         return rid
@@ -485,11 +716,17 @@ class LiveRunner:
         required = (usage.get("prompt_tokens"), usage.get("completion_tokens"), usage.get("cost"))
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) or
                not math.isfinite(value) or value < 0 for value in required):
-            self.ledger["halted"] = True
-            self.save_ledger()
+            if not self._uncertain_policy_enabled():
+                self.ledger["halted"] = True
+                self.save_ledger()
             raise LiveError("response lacks metered tokens or cost; budget remains reserved")
         prompt, completion, actual_cost = int(required[0]), int(required[1]), float(required[2])
         if prompt > flight["input_bound"] or completion > flight["max_output"]:
+            if self._uncertain_policy_enabled():
+                self._consume_uncertain_request(rid, "usage_exceeded_reservation", halt=True,
+                    observed_prompt_tokens=prompt, observed_completion_tokens=completion,
+                    reported_cost_usd=float(required[2]))
+                raise LiveError("metered usage exceeded its reservation; the global run stopped")
             self.ledger["halted"] = True
             self.save_ledger()
             raise LiveError("metered usage exceeded its pre-request reservation")
@@ -508,12 +745,11 @@ class LiveRunner:
         over_reservation = actual_cost > flight["reserved_cost_usd"] + 1e-9
         if over_reservation:
             self.ledger["halted"] = True
+            self.ledger["stop_reason"] = "metered cost exceeded its request reservation"
         self.save_ledger()
-        if over_reservation:
-            raise LiveError("metered cost exceeded its reservation; the ledger records the charge and halts")
         return {"prompt_tokens": prompt, "completion_tokens": completion,
                 "reported_cost_usd": float(required[2]), "price_estimate_usd": estimate,
-                "budgeted_cost_usd": actual_cost}
+                "budgeted_cost_usd": actual_cost, "over_reservation": over_reservation}
 
     def request(self, body: Dict[str, Any]) -> Dict[str, Any]:
         key = os.environ.get("OPENROUTER_API_KEY")
@@ -623,8 +859,10 @@ class LiveRunner:
     def run_model(self, arm: str, task: Dict[str, Any], seen: Dict[str, Dict[str, Any]],
                   counts: Dict[str, int], conversation: List[Dict[str, Any]],
                   allow_tools: bool) -> Tuple[str, Dict[str, Any]]:
+        self._wait_for_cooldown()
         arm_state = self.arm_state(arm, task["id"])
-        remaining_out = self.config["arm_output_cap"] - arm_state["completion_tokens"] - arm_state["reserved_output_tokens"]
+        remaining_out = (self.config["arm_output_cap"] - arm_state["completion_tokens"] -
+                         arm_state["reserved_output_tokens"] - arm_state.get("unconfirmed_output_tokens", 0))
         max_tokens = min(self.config["max_output"], remaining_out)
         if max_tokens <= 0:
             raise LiveError("{} reached its output-token cap".format(arm))
@@ -649,16 +887,59 @@ class LiveRunner:
                     "arm": arm, "timestamp_unix": time.time(), "request": body})
             response = self.request_fn(body)
         except Exception as error:
-            with self.lock:
-                self.ledger["halted"] = True
-                self.save_ledger()
+            error_class = self._error_class(error)
+            http_status, retry_after = self._http_status_and_retry(error)
+            if self._uncertain_policy_enabled():
+                if http_status in (400, 401, 402, 403, 404, 422):
+                    self._consume_uncertain_request(rid, error_class, halt=True,
+                        http_status=http_status)
+                else:
+                    if http_status == 429 and retry_after is None:
+                        retry_after = 5
+                    halt_for_cooldown = http_status == 429 and retry_after is not None and retry_after > 300
+                    self._consume_uncertain_request(rid, error_class,
+                        halt=halt_for_cooldown,
+                        retry_after_seconds=retry_after if http_status == 429 else None,
+                        http_status=http_status)
+            else:
+                with self.lock:
+                    self.ledger["halted"] = True
+                    self.ledger["stop_reason"] = "provider request ended without confirmed metering"
+                    self.save_ledger()
+            try:
+                self._record_provider_error(error, rid, arm, task["id"])
+            except Exception as log_error:
+                with self.lock:
+                    self.ledger["halted"] = True
+                    self.ledger["stop_reason"] = "private provider error log could not be saved"
+                    self.save_ledger()
+                raise LiveError(
+                    "provider request failed; the private error log could not be saved; "
+                    "the reservation stays active") from log_error
+            if self._uncertain_policy_enabled():
+                raise LiveError("provider request is unconfirmed; the request upper bound was consumed") from error
             raise LiveError("provider request ended without confirmed metering; the reservation stays active") from error
         usage = response.get("usage", {}) if isinstance(response, dict) else {}
-        charge = self.settle(rid, usage)
+        try:
+            charge = self.settle(rid, usage)
+        except LiveError as error:
+            if (self._uncertain_policy_enabled() and
+                    str(error) == "response lacks metered tokens or cost; budget remains reserved"):
+                self._consume_uncertain_request(rid, "missing_usage")
+                self._record_provider_error(error, rid, arm, task["id"], error_class="missing_usage")
+                raise LiveError("provider response metering is unconfirmed; the request upper bound was consumed") from error
+            if (self._uncertain_policy_enabled() and
+                    str(error) == "metered usage exceeded its reservation; the global run stopped"):
+                self._record_provider_error(error, rid, arm, task["id"],
+                                            error_class="usage_exceeded_reservation")
+                raise
+            raise
         with self.lock:
             append_jsonl(self.out / "captures.private.jsonl", {
                 "arm": arm, "task_id": task["id"], "request_id": rid,
                 "timestamp_unix": time.time(), "request": body, "response": response, "usage": charge})
+        if charge.get("over_reservation"):
+            raise LiveError("metered cost exceeded its reservation; the ledger records the charge and halts")
         try:
             choice = response["choices"][0]
             message = choice["message"]
@@ -826,6 +1107,15 @@ class LiveRunner:
         run_path = self.out / "live-results.private.jsonl"
         completed = {(r.get("task_id"), r.get("arm")) for r in jsonl(run_path)} if run_path.exists() else set()
         arms = tuple(self.config.get("selected_arms", LIVE_ARMS))
+        tasks_by_id = {task["id"]: task for task in self.tasks}
+        for terminal in self.ledger.get("terminal_unconfirmed", {}).values():
+            task_id, arm = terminal.get("task_id"), terminal.get("arm")
+            pair = (task_id, arm)
+            if task_id in tasks_by_id and arm in arms and pair not in completed:
+                row = self.zero_row(tasks_by_id[task_id], arm,
+                    "provider request is unconfirmed; the request upper bound was consumed")
+                append_jsonl(run_path, row)
+                completed.add(pair)
         pending = [task for task in self.tasks if any((task["id"], arm) not in completed for arm in arms)]
 
         def execute_task(task: Dict[str, Any]) -> None:
@@ -915,8 +1205,18 @@ class LiveRunner:
                 "cost_usd": sum(state["actual_cost_usd"] for state in state_rows),
                 "prompt_tokens": sum(state["prompt_tokens"] for state in state_rows),
                 "completion_tokens": sum(state["completion_tokens"] for state in state_rows),
+                "unconfirmed_input_tokens": sum(state.get("unconfirmed_input_tokens", 0)
+                                                 for state in state_rows),
+                "unconfirmed_output_tokens": sum(state.get("unconfirmed_output_tokens", 0)
+                                                  for state in state_rows),
+                "observed_unconfirmed_input_tokens": sum(
+                    state.get("observed_unconfirmed_input_tokens", 0) for state in state_rows),
+                "observed_unconfirmed_output_tokens": sum(
+                    state.get("observed_unconfirmed_output_tokens", 0) for state in state_rows),
                 "requests": sum(state["requests"] for state in state_rows),
                 "reserved_cost_usd": sum(state["reserved_cost_usd"] for state in state_rows),
+                "unconfirmed_cost_usd": sum(state.get("unconfirmed_cost_usd", 0.0)
+                                             for state in state_rows),
                 "missing_rows": sum(bool(r.get("missing")) for r in arm_rows),
                 "successful_rows": sum(not r.get("missing", False) for r in arm_rows)}
         planned_pairs = {(task["id"], arm) for task in self.tasks
@@ -929,6 +1229,8 @@ class LiveRunner:
         stop_reason = self.ledger.get("stop_reason")
         if not stop_reason and self.ledger.get("halted"):
             stop_reason = "budget ledger halted after an uncertain or over-budget request"
+        terminal = self.ledger.get("terminal_unconfirmed", {})
+        metering_complete = not terminal and not self.ledger.get("inflight") and not self.ledger.get("halted")
         return {"schema_version": 1, "protocol": "private_live_diagnostic",
             "official_benchmark_result": False, "model": self.config["model"],
             "provider": self.config["provider"], "quantization": self.config["quantization"],
@@ -941,7 +1243,13 @@ class LiveRunner:
             "task_count": len(self.tasks), "completed_rows": len(rows),
             "planned_rows": len(planned_pairs), "completed_planned_rows": completed_pairs,
             "complete": complete, "budget_exhausted": budget_exhausted,
-            "stop_reason": stop_reason,
+            "stop_reason": stop_reason, "metering_complete": metering_complete,
+            "unconfirmed_request_count": len(terminal),
+            "unconfirmed_input_token_bound": sum(
+                row.get("financial_input_bound", 0) for row in terminal.values()),
+            "unconfirmed_output_token_bound": sum(row.get("max_output", 0) for row in terminal.values()),
+            "unconfirmed_cost_upper_bound_usd": sum(
+                row.get("budgeted_cost_usd", 0.0) for row in terminal.values()),
             "source_title_unavailable": sum(not row.get("source_title") for row in self.task_map.values()),
             "cohort_mode": cohort_mode,
             "source_projects": manifest.get("source_projects", len(self.task_map)),
@@ -982,6 +1290,10 @@ def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         selected = [arm for arm in LIVE_ARMS if arm in args.arms]
         if tuple(selected) != LIVE_ARMS:
             config["selected_arms"] = selected
+    if args.uncertain_request_policy is not None:
+        config["uncertain_request_policy"] = args.uncertain_request_policy
+    if args.endpoint_context_cap is not None:
+        config["endpoint_context_cap"] = args.endpoint_context_cap
     return config
 
 
@@ -1002,6 +1314,16 @@ def validate_config(config: Dict[str, Any]) -> None:
     if (not isinstance(arms, (list, tuple)) or not arms or len(set(arms)) != len(arms) or
             any(arm not in LIVE_ARMS for arm in arms)):
         raise LiveError("selected_arms must contain unique supported arm names")
+    uncertain_policy = config.get("uncertain_request_policy", STRICT_UNCERTAIN_POLICY)
+    if uncertain_policy not in UNCERTAIN_POLICIES:
+        raise LiveError("uncertain_request_policy is not supported")
+    endpoint_cap = config.get("endpoint_context_cap")
+    if uncertain_policy == CONSUME_UNCERTAIN_POLICY:
+        if isinstance(endpoint_cap, bool) or not isinstance(endpoint_cap, int) or endpoint_cap <= 0:
+            raise LiveError("endpoint_context_cap must be a positive integer for the consume policy")
+    elif endpoint_cap is not None and (
+            isinstance(endpoint_cap, bool) or not isinstance(endpoint_cap, int) or endpoint_cap <= 0):
+        raise LiveError("endpoint_context_cap must be a positive integer")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1036,6 +1358,10 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--workers", type=int, default=4)
     run.add_argument("--arms", nargs="+", choices=LIVE_ARMS,
                      help="run selected arms; default: all three arms")
+    run.add_argument("--uncertain-request-policy", choices=UNCERTAIN_POLICIES,
+                     help="handle uncertain provider outcomes; the default stops the run")
+    run.add_argument("--endpoint-context-cap", type=int,
+                     help="provider input-token upper bound required by the consume policy")
     report = sub.add_parser("report", help="show the private live report")
     report.add_argument("--output-dir", type=Path, required=True)
     return root
@@ -1056,7 +1382,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validate_config(config)
         if not args.execute:
             tasks = list(jsonl(args.output_dir / "tasks.jsonl"))
-            max_per_arm_task = (args.arm_input_cap * args.input_price +
+            financial_input_cap = (args.endpoint_context_cap if config.get("uncertain_request_policy") ==
+                CONSUME_UNCERTAIN_POLICY else args.arm_input_cap)
+            max_per_arm_task = (financial_input_cap * args.input_price +
                                 args.arm_output_cap * args.output_price) / 1_000_000
             selected_arms = tuple(args.arms or LIVE_ARMS)
             worst_total = len(tasks) * len(selected_arms) * max_per_arm_task
@@ -1066,7 +1394,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "price_per_million": {"input": args.input_price, "output": args.output_price},
                 "hard_budget_usd": args.total_budget,
                 "cap_based_maximum_usd": round(min(args.total_budget, worst_total), 4),
-                "cap_basis": "per task and arm, using 80k input and 24k output defaults",
+                "cap_basis": ("per task and arm, using the endpoint context cap and the arm output cap"
+                    if config.get("uncertain_request_policy") == CONSUME_UNCERTAIN_POLICY else
+                    "per task and arm, using the arm input cap and arm output cap"),
                 "actual_request_reservations": "computed from each serialized prompt before sending",
                 "next_step": "add --execute to send requests"}, indent=2))
             return 0
