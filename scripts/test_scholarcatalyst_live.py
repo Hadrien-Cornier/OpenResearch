@@ -189,8 +189,8 @@ class ScholarCatalystLiveTest(unittest.TestCase):
             return {"choices": [{"message": message, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": len(encoded) + 1024,
                               "completion_tokens": body["max_tokens"], "cost": 0}}
-        cfg = config(total_budget=0.004, max_output=3000,
-                     selected_arms=["closed_book", "plain_tools"])
+        cfg = config(total_budget=0.004, max_output=500,
+                     selected_arms=["plain_tools", "orx_skill"])
         runner = self.runner(request_fn=fake_request, cfg=cfg)
         report = runner.execute()
         rows = list(live.jsonl(self.out / "live-results.private.jsonl"))
