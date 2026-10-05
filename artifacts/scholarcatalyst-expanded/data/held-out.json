@@ -1,0 +1,336 @@
+{
+  "schema_version": 2,
+  "protocol": "restricted_live_diagnostic",
+  "official_benchmark_result": false,
+  "selected_arms": [
+    "plain_tools",
+    "orx_skill"
+  ],
+  "source_project_count": 157,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "z-ai",
+  "settings": {
+    "model": "z-ai/glm-5.3-flash",
+    "provider": "z-ai",
+    "quantization": "fp8",
+    "arm_input_cap": 320000,
+    "arm_output_cap": 24000,
+    "max_output": 4096,
+    "max_tool_rounds": 4,
+    "max_discover_calls": 6,
+    "reasoning_enabled": true,
+    "reasoning_effort": "low",
+    "workers": 4,
+    "selected_arms": [
+      "plain_tools",
+      "orx_skill"
+    ],
+    "uncertain_request_policy": "consume-reservation-and-fail-arm",
+    "endpoint_context_cap": 1048576
+  },
+  "data_revision": "ScholarCatalyst pinned revision a5a73467500ada90db4e7641e0697a9591e41a4e",
+  "verified_fingerprint": "fbf1c262f9bfbea4e1213418b05bf647cc11316dd24d3cb1561c9addbca38ff1",
+  "fingerprint_inputs": {
+    "model": "z-ai/glm-5.3-flash",
+    "provider": "z-ai",
+    "quantization": "fp8",
+    "arm_input_cap": 320000,
+    "arm_output_cap": 24000,
+    "max_output": 4096,
+    "max_tool_rounds": 4,
+    "max_discover_calls": 6,
+    "reasoning_enabled": true,
+    "reasoning_effort": "low",
+    "workers": 4,
+    "selected_arms": [
+      "plain_tools",
+      "orx_skill"
+    ],
+    "uncertain_request_policy": "consume-reservation-and-fail-arm",
+    "endpoint_context_cap": 1048576,
+    "tasks_sha256": "5121c3849f1eb761a6356b5c4067f5614bc379269728edce1252b5e5f8a869b9",
+    "corpus_sha256": "2e39c3b1de07f2a5ffa3a5ce38bdea6f5d83d3f7036944715eef234594b35905",
+    "queries_sha256": "edf4995490ee2d9149c798ce43d9743727affe42748a0c73b73d155d1f4d5d5b",
+    "core_relations_sha256": "d9510718d997625d6a3ea7211806d75e5ccf0436486b0211d7f2a1bb18f3255b",
+    "subfield_relations_sha256": "4a3dcf0ac88046f492a8d3faabfee5292109e7db496b92d07b8cfbde101d21e5",
+    "manifest_sha256": "733ded707804d01c5d06af033dbc52d6889cd2d0fd5233f32a446ee553613ec7",
+    "runner_sha256": "d3724ecc7bf67698e9ec56592277b99d57753b6f253d58254838a6e308b83fb1",
+    "skill_sha256": "4f741a3e696f7e7d9d2a915be4e4522b96a27f28664bb6ac93e5f3cd0304f7ab"
+  },
+  "cohort_sha256": "5121c3849f1eb761a6356b5c4067f5614bc379269728edce1252b5e5f8a869b9",
+  "task_count": 314,
+  "completed_rows": 628,
+  "complete": true,
+  "metering_complete": false,
+  "unconfirmed_request_count": 4,
+  "provider_response_counts": {
+    "Z.AI": 1730
+  },
+  "arms": {
+    "plain_tools": {
+      "metrics": {
+        "core_query": {
+          "recall@5": 0.20749165908401576,
+          "recall@15": 0.24779597613992518,
+          "ndcg@15": 0.20725920739041415,
+          "confirmed_exposed_candidate_recall": 0.26520574259427765,
+          "n_scored": 157,
+          "n_planned": 157
+        },
+        "subfield_query": {
+          "recall@5": 0.15950873259790457,
+          "recall@15": 0.2330857571303431,
+          "ndcg@15": 0.21884138583974036,
+          "confirmed_exposed_candidate_recall": 0.25732128805377213,
+          "n_scored": 157,
+          "n_planned": 157
+        },
+        "balanced_pilot": {
+          "recall@5": 0.18350019584096017,
+          "recall@15": 0.24044086663513414,
+          "ndcg@15": 0.21305029661507724
+        }
+      },
+      "failed_or_missing_rows": 5,
+      "errors": {
+        "uncertain_metering": 2,
+        "search_error": 2,
+        "other_run_error": 1
+      },
+      "metering_complete": false,
+      "unconfirmed_request_count": 2,
+      "prompt_tokens": 5178034,
+      "completion_tokens": 178639,
+      "unconfirmed_input_token_bounds": 2097152,
+      "unconfirmed_output_token_bounds": 8192,
+      "model_requests": 846,
+      "mean_seconds_per_planned_row": 17.26281210191083,
+      "mean_ranked_slots": 14.710191082802547,
+      "invalid_selection_attempts": 22,
+      "unjudged_final_slots": 2665,
+      "tool_payload_omitted_papers": 599
+    },
+    "orx_skill": {
+      "metrics": {
+        "core_query": {
+          "recall@5": 0.20076079263977353,
+          "recall@15": 0.25327317763623497,
+          "ndcg@15": 0.20615492851842002,
+          "confirmed_exposed_candidate_recall": 0.2670736022646851,
+          "n_scored": 157,
+          "n_planned": 157
+        },
+        "subfield_query": {
+          "recall@5": 0.1829970454174276,
+          "recall@15": 0.2599722287620377,
+          "ndcg@15": 0.23940503767833837,
+          "confirmed_exposed_candidate_recall": 0.2806542360682488,
+          "n_scored": 157,
+          "n_planned": 157
+        },
+        "balanced_pilot": {
+          "recall@5": 0.19187891902860055,
+          "recall@15": 0.2566227031991363,
+          "ndcg@15": 0.2227799830983792
+        }
+      },
+      "failed_or_missing_rows": 5,
+      "errors": {
+        "search_error": 2,
+        "uncertain_metering": 2,
+        "response_schema": 1
+      },
+      "metering_complete": false,
+      "unconfirmed_request_count": 2,
+      "prompt_tokens": 9436390,
+      "completion_tokens": 201891,
+      "unconfirmed_input_token_bounds": 2097152,
+      "unconfirmed_output_token_bounds": 8192,
+      "model_requests": 888,
+      "mean_seconds_per_planned_row": 20.089165605095552,
+      "mean_ranked_slots": 14.707006369426752,
+      "invalid_selection_attempts": 19,
+      "unjudged_final_slots": 2612,
+      "tool_payload_omitted_papers": 972
+    }
+  },
+  "paired_comparisons": {
+    "orx_skill_minus_plain_tools": {
+      "core_query": {
+        "recall@5": {
+          "mean_delta": -0.006730866444242236,
+          "interval_95": [
+            -0.04613284804367608,
+            0.03355575775957941
+          ],
+          "n_pairs": 157,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0
+        },
+        "recall@15": {
+          "mean_delta": 0.0054772014963097755,
+          "interval_95": [
+            -0.03695784046102518,
+            0.04782377919320595
+          ],
+          "n_pairs": 157,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0
+        },
+        "ndcg@15": {
+          "mean_delta": -0.0011042788719941275,
+          "interval_95": [
+            -0.037274767398139334,
+            0.03433503659005231
+          ],
+          "n_pairs": 157,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0
+        }
+      },
+      "subfield_query": {
+        "recall@5": {
+          "mean_delta": 0.02348831281952301,
+          "interval_95": [
+            -0.010198117522958287,
+            0.05859294633179984
+          ],
+          "n_pairs": 157,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0
+        },
+        "recall@15": {
+          "mean_delta": 0.026886471631694553,
+          "interval_95": [
+            -0.008035594978270137,
+            0.06254478006070362
+          ],
+          "n_pairs": 157,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0
+        },
+        "ndcg@15": {
+          "mean_delta": 0.020563651838597995,
+          "interval_95": [
+            -0.009481774150699847,
+            0.051725668870323975
+          ],
+          "n_pairs": 157,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0
+        }
+      },
+      "balanced_pilot": {
+        "recall@5": {
+          "mean_delta": 0.008378723187640387,
+          "interval_95": [
+            -0.01913040957626945,
+            0.03572283166232211
+          ],
+          "n_pairs": 314,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0,
+          "strata": "question type; equal weight for each type"
+        },
+        "recall@15": {
+          "mean_delta": 0.016181836564002162,
+          "interval_95": [
+            -0.0127398079627379,
+            0.044430958284461475
+          ],
+          "n_pairs": 314,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0,
+          "strata": "question type; equal weight for each type"
+        },
+        "ndcg@15": {
+          "mean_delta": 0.009729686483301934,
+          "interval_95": [
+            -0.014762262938198304,
+            0.033765488411617264
+          ],
+          "n_pairs": 314,
+          "n_source_projects": 157,
+          "bootstrap_samples": 10000,
+          "seed": 531,
+          "resampling_unit": "source project; all questions remain together",
+          "rejected_empty_type_resamples": 0,
+          "strata": "question type; equal weight for each type"
+        }
+      }
+    }
+  },
+  "label_audit": {
+    "core_query": {
+      "positive_pairs": 482,
+      "future_positive_pairs": 3,
+      "queries_with_future_positives": 3
+    },
+    "subfield_query": {
+      "positive_pairs": 966,
+      "future_positive_pairs": 4,
+      "queries_with_future_positives": 4
+    }
+  },
+  "gold_denominator": "retain official positives, including cutoff conflicts",
+  "primary_comparison": {
+    "contrast": "orx_skill_minus_plain_tools",
+    "metric": "recall@5",
+    "statistic": "balanced_pilot",
+    "available": true,
+    "role": "single final primary comparison",
+    "result": {
+      "mean_delta": 0.008378723187640387,
+      "interval_95": [
+        -0.01913040957626945,
+        0.03572283166232211
+      ],
+      "n_pairs": 314,
+      "n_source_projects": 157,
+      "bootstrap_samples": 10000,
+      "seed": 531,
+      "resampling_unit": "source project; all questions remain together",
+      "rejected_empty_type_resamples": 0,
+      "strata": "question type; equal weight for each type"
+    }
+  },
+  "secondary_comparisons": "all other contrasts, metrics, and question-type estimates",
+  "failure_policy": "An unconfirmed request ends that arm with a zero score. If no global stop occurs, other planned arms continue. The request is not retried.",
+  "uncertainty_method": "paired percentile bootstrap over source projects; all questions resample jointly; equal weight for each question type; resamples with an empty type are rejected; missing and failed final runs score zero",
+  "candidate_method": "known-positive papers in tool payloads of confirmed model responses; includes failed final runs",
+  "limits": [
+    "Live corpus differs from the official frozen corpus.",
+    "Sparse labels do not establish relevance of unjudged papers.",
+    "The workflow uses alphaXiv discovery only and common rank validation.",
+    "Model knowledge can include the original source projects.",
+    "A pilot gives preliminary evidence.",
+    "Quality estimates include zero scores for unconfirmed requests."
+  ],
+  "quality_complete": true,
+  "private_accounting_fields_omitted": true,
+  "fingerprint_scope": "The verified hash identifies the complete private configuration. Public fingerprint inputs omit private accounting fields and cannot reproduce that hash."
+}
