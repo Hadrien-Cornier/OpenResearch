@@ -8,9 +8,6 @@
     "model": "z-ai/glm-5.3-flash",
     "provider": "z-ai",
     "quantization": "fp8",
-    "input_price": 0.15,
-    "output_price": 0.5,
-    "total_budget": 4.71,
     "arm_input_cap": 320000,
     "arm_output_cap": 24000,
     "max_output": 4096,
@@ -26,9 +23,6 @@
     "model": "z-ai/glm-5.3-flash",
     "provider": "z-ai",
     "quantization": "fp8",
-    "input_price": 0.15,
-    "output_price": 0.5,
-    "total_budget": 4.71,
     "arm_input_cap": 320000,
     "arm_output_cap": 24000,
     "max_output": 4096,
@@ -50,9 +44,6 @@
   "task_count": 50,
   "completed_rows": 150,
   "complete": true,
-  "metered_cost_usd": 0.24410101999999995,
-  "budgeted_cost_usd": 0.37217269999999975,
-  "reserved_cost_usd": 0.0,
   "provider_response_counts": {
     "Z.AI": 318
   },
@@ -83,8 +74,6 @@
       "errors": {
         "response_schema": 1
       },
-      "metered_cost_usd": 0.015791700000000002,
-      "budgeted_cost_usd": 0.015791700000000002,
       "prompt_tokens": 10158,
       "completion_tokens": 28536,
       "model_requests": 50,
@@ -120,8 +109,6 @@
       "errors": {
         "search_error": 1
       },
-      "metered_cost_usd": 0.10410382,
-      "budgeted_cost_usd": 0.1397851,
       "prompt_tokens": 838504,
       "completion_tokens": 28019,
       "model_requests": 133,
@@ -157,8 +144,6 @@
       "errors": {
         "search_error": 1
       },
-      "metered_cost_usd": 0.12420549999999997,
-      "budgeted_cost_usd": 0.21659589999999998,
       "prompt_tokens": 1342926,
       "completion_tokens": 30314,
       "model_requests": 135,

@@ -16,17 +16,17 @@ Unmatched and invalid selections retain their ranking positions. Duplicate posit
 
 This common scoring rule changes the skill's native final step, which removes unsupported selections. The replay retains those positions in both tool arms. The skill's fallback applies only when no supported selection survives.
 
-## Cost and model choice
+## Model choice and request limits
 
-Consult current Artificial Analysis results when you select an open model. Verify the exact model version and endpoint price before a paid run. A general model score does not predict performance on this experiment.
+Consult current Artificial Analysis results when you select an open model. Verify the exact model version and endpoint before a run. A general model score does not predict performance on this experiment.
 
-The October 4 pilot selects `z-ai/glm-5.3-flash` through the first-party Z.AI FP8 endpoint. It uses temperature zero and reasoning effort `low`. Price ceilings are $0.15 per million input tokens and $0.50 per million output tokens. Provider fallback is disabled.
+The October 4 pilot selects `z-ai/glm-5.3-flash` through the first-party Z.AI FP8 endpoint. It uses temperature zero and reasoning effort `low`. Provider fallback is disabled.
 
-The estimated model charge is $1–$3. The hard ceiling is $5. Each request reserves its maximum charge before transmission. Reservations include concurrent requests. Missing or uncertain metering stops the run and preserves the reservation. The runner does not repeat an uncertain request.
+The runner enforces a configured global request limit across concurrent calls. Missing or uncertain metering stops the run and preserves the reservation. The runner does not repeat an uncertain request.
 
 Each task-arm has a cumulative cap of 80,000 input tokens and 24,000 output tokens. Each request permits 4,096 output tokens, including reasoning tokens. Input reservations use a conservative byte bound. The runner can stop a task before its actual token cap if that bound is too large.
 
-The first pilot stops 34 skill runs at that conservative input bound. One additional skill run has a search failure. The repeat after this correction uses `--arm-input-cap 320000` in all three arms. The byte reservation and price ceilings stay active. The repeat receives only the remaining portion of the combined $5 budget. Preserve the first run and its failures as a separate experiment.
+The first pilot stops 34 skill runs at that conservative input bound. One additional skill run has a search failure. The repeat after this correction uses `--arm-input-cap 320000` in all three arms. The byte reservation stays active. Preserve the first run and its failures as a separate experiment.
 
 ## Run the diagnostic
 
@@ -61,6 +61,6 @@ The analysis verifies data, labels, cohort, source guards, runner code, skill, a
 
 Keep benchmark data and complete traces outside the source repository. The private evidence includes the cohort manifest, metadata guards, tool cache, requests without credentials, responses, failures, and budget ledger. Publish aggregate results and code versions.
 
-Report Recall@5, Recall@15, nDCG@15, exposed candidate recall, list depth, invalid selections, unmatched papers, failures, latency, and model charges. Compare the tool arms on the same questions. Resample source papers for uncertainty estimates.
+Report Recall@5, Recall@15, nDCG@15, exposed candidate recall, list depth, invalid selections, unmatched papers, failures, and latency. Compare the tool arms on the same questions. Resample source papers for uncertainty estimates.
 
 The live corpus, restricted tools, sparse labels, and possible model knowledge of source projects limit the interpretation. This experiment does not measure the full OpenResearch application or establish an official ScholarCatalyst score.
